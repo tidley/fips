@@ -364,6 +364,8 @@ pub struct Node {
     tun_reader_handle: Option<JoinHandle<()>>,
     /// TUN writer thread handle.
     tun_writer_handle: Option<JoinHandle<()>>,
+    /// Dup'd fd of the TUN device (closed on macOS to unblock the reader on shutdown).
+    tun_fd: Option<std::os::unix::io::RawFd>,
 
     // === DNS Responder ===
     /// Receiver for resolved identities from the DNS responder.
@@ -530,6 +532,7 @@ impl Node {
             tun_outbound_rx: None,
             tun_reader_handle: None,
             tun_writer_handle: None,
+            tun_fd: None,
             dns_identity_rx: None,
             dns_task: None,
             index_allocator: IndexAllocator::new(),
@@ -640,6 +643,7 @@ impl Node {
             tun_outbound_rx: None,
             tun_reader_handle: None,
             tun_writer_handle: None,
+            tun_fd: None,
             dns_identity_rx: None,
             dns_task: None,
             index_allocator: IndexAllocator::new(),
@@ -814,37 +818,39 @@ impl Node {
             ))
         })?;
 
-        // Find the Ethernet transport bound to this interface
-        let transport_id = self
-            .transports
-            .iter()
-            .find(|(_, handle)| {
-                handle.transport_type().name == "ethernet"
-                    && handle.is_operational()
-                    && handle.interface_name() == Some(iface)
-            })
-            .map(|(id, _)| *id)
-            .ok_or_else(|| {
-                NodeError::NoTransportForType(format!(
-                    "no operational Ethernet transport for interface '{}'",
-                    iface
-                ))
-            })?;
-
-        // Parse the MAC address
-        #[cfg(target_os = "linux")]
-        let mac = crate::transport::ethernet::parse_mac_string(mac_str).map_err(|e| {
-            NodeError::NoTransportForType(format!("invalid MAC in '{}': {}", addr_str, e))
-        })?;
         #[cfg(not(target_os = "linux"))]
-        let mac: [u8; 6] = {
-            let _ = mac_str;
+        {
+            let _ = (iface, mac_str);
             return Err(NodeError::NoTransportForType(
                 "Ethernet transport not available on this platform".into(),
             ));
-        };
+        }
 
-        Ok((transport_id, TransportAddr::from_bytes(&mac)))
+        #[cfg(target_os = "linux")]
+        {
+            // Find the Ethernet transport bound to this interface
+            let transport_id = self
+                .transports
+                .iter()
+                .find(|(_, handle)| {
+                    handle.transport_type().name == "ethernet"
+                        && handle.is_operational()
+                        && handle.interface_name() == Some(iface)
+                })
+                .map(|(id, _)| *id)
+                .ok_or_else(|| {
+                    NodeError::NoTransportForType(format!(
+                        "no operational Ethernet transport for interface '{}'",
+                        iface
+                    ))
+                })?;
+
+            let mac = crate::transport::ethernet::parse_mac_string(mac_str).map_err(|e| {
+                NodeError::NoTransportForType(format!("invalid MAC in '{}': {}", addr_str, e))
+            })?;
+
+            Ok((transport_id, TransportAddr::from_bytes(&mac)))
+        }
     }
 
     /// Resolve a BLE address string (`"adapter/AA:BB:CC:DD:EE:FF"`) to a

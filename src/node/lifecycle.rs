@@ -7,6 +7,7 @@ use crate::transport::{packet_channel, Link, LinkDirection, LinkId, TransportAdd
 use crate::upper::tun::{run_tun_reader, shutdown_tun_interface, TunDevice, TunState};
 use crate::node::wire::build_msg1;
 use crate::{NodeAddr, PeerIdentity};
+use std::os::unix::io::AsRawFd;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -587,6 +588,11 @@ impl Node {
                     info!("effective MTU: {} bytes", effective_mtu);
                     debug!("   max TCP MSS: {} bytes", max_mss);
 
+                    // Dup the fd before the device moves into the reader thread.
+                    // On macOS shutdown, we close this dup'd fd to unblock the
+                    // blocking read (Linux uses interface deletion via netlink).
+                    let tun_fd = unsafe { libc::dup(device.device().as_raw_fd()) };
+
                     // Create writer (dups the fd for independent write access)
                     let (writer, tun_tx) = device.create_writer(max_mss)?;
 
@@ -614,6 +620,7 @@ impl Node {
                     self.tun_outbound_rx = Some(outbound_rx);
                     self.tun_reader_handle = Some(reader_handle);
                     self.tun_writer_handle = Some(writer_handle);
+                    self.tun_fd = Some(tun_fd);
                 }
                 Err(e) => {
                     self.tun_state = TunState::Failed;
@@ -704,9 +711,16 @@ impl Node {
             // Drop the tun_tx to signal the writer to stop
             self.tun_tx.take();
 
-            // Delete the interface (causes reader to get EFAULT)
+            // Delete the interface (on Linux, causes reader to get EFAULT)
             if let Err(e) = shutdown_tun_interface(&name).await {
                 warn!(name = %name, error = %e, "Failed to shutdown TUN interface");
+            }
+
+            // On macOS, closing the fd is what unblocks the blocking reader thread.
+            // The interface is auto-destroyed when the fd is closed.
+            #[cfg(target_os = "macos")]
+            if let Some(fd) = self.tun_fd.take() {
+                unsafe { libc::close(fd); }
             }
 
             // Wait for threads to finish

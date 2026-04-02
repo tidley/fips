@@ -83,7 +83,12 @@ mod async_impl {
 }
 
 // =============================================================================
-// macOS: blocking I/O with tokio spawn_blocking for recv
+// macOS: dedicated reader thread with async channel
+//
+// BPF fds don't support kqueue, so we can't use AsyncFd. Instead of
+// spawn_blocking per packet (which was the bottleneck causing 84 Mbps),
+// we spawn a single dedicated reader thread that loops on blocking
+// read() and feeds frames through a tokio mpsc channel.
 // =============================================================================
 
 #[cfg(target_os = "macos")]
@@ -92,19 +97,56 @@ mod async_impl {
     use crate::transport::TransportError;
     use std::sync::Arc;
 
+    /// A received frame: (payload, source_mac).
+    type Frame = (Vec<u8>, [u8; 6]);
+
     pub struct AsyncPacketSocket {
         inner: Arc<PacketSocket>,
+        rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Frame>>,
+        _reader_thread: std::thread::JoinHandle<()>,
     }
 
     impl AsyncPacketSocket {
         pub fn new(socket: PacketSocket) -> Result<Self, TransportError> {
+            // Channel capacity: buffer up to 1024 frames to decouple
+            // the blocking reader from the async consumer.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(1024);
+            let inner = Arc::new(socket);
+            let reader_socket = Arc::clone(&inner);
+
+            let reader_thread = std::thread::Builder::new()
+                .name("bpf-reader".into())
+                .spawn(move || {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match reader_socket.recv_from(&mut buf) {
+                            Ok((n, mac)) => {
+                                let data = buf[..n].to_vec();
+                                if tx.blocking_send((data, mac)).is_err() {
+                                    break; // Channel closed, shutting down
+                                }
+                            }
+                            Err(e) => {
+                                // EBADF means fd was closed (shutdown)
+                                if e.raw_os_error() == Some(libc::EBADF) {
+                                    break;
+                                }
+                                // Other errors: brief pause to avoid spinning
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
+                    }
+                })
+                .map_err(|e| TransportError::StartFailed(format!("reader thread: {}", e)))?;
+
             Ok(Self {
-                inner: Arc::new(socket),
+                inner,
+                rx: tokio::sync::Mutex::new(rx),
+                _reader_thread: reader_thread,
             })
         }
 
         pub async fn send_to(&self, data: &[u8], dest_mac: &[u8; 6]) -> Result<usize, TransportError> {
-            // BPF writes don't block meaningfully; call directly.
             self.inner
                 .send_to(data, dest_mac)
                 .map_err(|e| TransportError::SendFailed(format!("{}", e)))
@@ -114,24 +156,14 @@ mod async_impl {
             &self,
             buf: &mut [u8],
         ) -> Result<(usize, [u8; 6]), TransportError> {
-            // BPF reads block until a packet arrives. Use spawn_blocking
-            // to avoid blocking the tokio runtime.
-            let socket = Arc::clone(&self.inner);
-            let buf_len = buf.len();
-
-            let result = tokio::task::spawn_blocking(move || {
-                let mut local_buf = vec![0u8; buf_len];
-                socket.recv_from(&mut local_buf).map(|(n, mac)| (local_buf, n, mac))
-            })
-            .await
-            .map_err(|e| TransportError::RecvFailed(format!("spawn_blocking: {}", e)))?;
-
-            match result {
-                Ok((local_buf, n, mac)) => {
-                    buf[..n].copy_from_slice(&local_buf[..n]);
+            let mut rx = self.rx.lock().await;
+            match rx.recv().await {
+                Some((data, mac)) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
                     Ok((n, mac))
                 }
-                Err(e) => Err(TransportError::RecvFailed(format!("{}", e))),
+                None => Err(TransportError::RecvFailed("reader thread stopped".into())),
             }
         }
 

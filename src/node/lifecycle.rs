@@ -588,10 +588,12 @@ impl Node {
                     info!("effective MTU: {} bytes", effective_mtu);
                     debug!("   max TCP MSS: {} bytes", max_mss);
 
-                    // Dup the fd before the device moves into the reader thread.
-                    // On macOS shutdown, we close this dup'd fd to unblock the
-                    // blocking read (Linux uses interface deletion via netlink).
-                    let tun_fd = unsafe { libc::dup(device.device().as_raw_fd()) };
+                    // Save the raw fd before the device moves into the reader thread.
+                    // On macOS shutdown, we close this fd to unblock the blocking
+                    // read (Linux uses interface deletion via netlink instead).
+                    // This is the same fd the reader uses; closing it causes EBADF
+                    // which breaks the reader loop before TunDevice::drop runs.
+                    let tun_fd = device.device().as_raw_fd();
 
                     // Create writer (dups the fd for independent write access)
                     let (writer, tun_tx) = device.create_writer(max_mss)?;

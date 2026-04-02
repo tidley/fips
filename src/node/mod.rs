@@ -33,7 +33,6 @@ use crate::transport::{
 use crate::transport::udp::UdpTransport;
 use crate::transport::tcp::TcpTransport;
 use crate::transport::tor::TorTransport;
-#[cfg(target_os = "linux")]
 use crate::transport::ethernet::EthernetTransport;
 use crate::tree::TreeState;
 use crate::upper::hosts::HostMap;
@@ -364,7 +363,7 @@ pub struct Node {
     tun_reader_handle: Option<JoinHandle<()>>,
     /// TUN writer thread handle.
     tun_writer_handle: Option<JoinHandle<()>>,
-    /// Dup'd fd of the TUN device (closed on macOS to unblock the reader on shutdown).
+    /// Raw fd of the TUN device (closed on macOS to unblock the reader on shutdown).
     tun_fd: Option<std::os::unix::io::RawFd>,
 
     // === DNS Responder ===
@@ -699,23 +698,19 @@ impl Node {
         }
 
         // Create Ethernet transport instances
-        #[cfg(target_os = "linux")]
-        {
-            let eth_instances: Vec<_> = self
-                .config
-                .transports
-                .ethernet
-                .iter()
-                .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
-                .collect();
-
-            let xonly = self.identity.pubkey();
-            for (name, eth_config) in eth_instances {
-                let transport_id = self.allocate_transport_id();
-                let mut eth = EthernetTransport::new(transport_id, name, eth_config, packet_tx.clone());
-                eth.set_local_pubkey(xonly);
-                transports.push(TransportHandle::Ethernet(eth));
-            }
+        let eth_instances: Vec<_> = self
+            .config
+            .transports
+            .ethernet
+            .iter()
+            .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
+            .collect();
+        let xonly = self.identity.pubkey();
+        for (name, eth_config) in eth_instances {
+            let transport_id = self.allocate_transport_id();
+            let mut eth = EthernetTransport::new(transport_id, name, eth_config, packet_tx.clone());
+            eth.set_local_pubkey(xonly);
+            transports.push(TransportHandle::Ethernet(eth));
         }
 
         // Create TCP transport instances
@@ -818,39 +813,28 @@ impl Node {
             ))
         })?;
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (iface, mac_str);
-            return Err(NodeError::NoTransportForType(
-                "Ethernet transport not available on this platform".into(),
-            ));
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            // Find the Ethernet transport bound to this interface
-            let transport_id = self
-                .transports
-                .iter()
-                .find(|(_, handle)| {
-                    handle.transport_type().name == "ethernet"
-                        && handle.is_operational()
-                        && handle.interface_name() == Some(iface)
-                })
-                .map(|(id, _)| *id)
-                .ok_or_else(|| {
-                    NodeError::NoTransportForType(format!(
-                        "no operational Ethernet transport for interface '{}'",
-                        iface
-                    ))
-                })?;
-
-            let mac = crate::transport::ethernet::parse_mac_string(mac_str).map_err(|e| {
-                NodeError::NoTransportForType(format!("invalid MAC in '{}': {}", addr_str, e))
+        // Find the Ethernet transport bound to this interface
+        let transport_id = self
+            .transports
+            .iter()
+            .find(|(_, handle)| {
+                handle.transport_type().name == "ethernet"
+                    && handle.is_operational()
+                    && handle.interface_name() == Some(iface)
+            })
+            .map(|(id, _)| *id)
+            .ok_or_else(|| {
+                NodeError::NoTransportForType(format!(
+                    "no operational Ethernet transport for interface '{}'",
+                    iface
+                ))
             })?;
 
-            Ok((transport_id, TransportAddr::from_bytes(&mac)))
-        }
+        let mac = crate::transport::ethernet::parse_mac_string(mac_str).map_err(|e| {
+            NodeError::NoTransportForType(format!("invalid MAC in '{}': {}", addr_str, e))
+        })?;
+
+        Ok((transport_id, TransportAddr::from_bytes(&mac)))
     }
 
     /// Resolve a BLE address string (`"adapter/AA:BB:CC:DD:EE:FF"`) to a

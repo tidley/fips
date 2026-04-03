@@ -1690,7 +1690,7 @@ async fn test_session_awaiting_msg3_timeout() {
     let identity_a = Identity::generate();
     let identity_b = Identity::generate();
 
-    let handshake = HandshakeState::new_xk_responder(
+    let handshake = HandshakeState::new_xx_responder(
         identity_b.keypair(),
     );
 

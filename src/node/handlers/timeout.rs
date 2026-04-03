@@ -97,6 +97,9 @@ impl Node {
 
         // Collect resend candidates: outbound, in SentMsg1, with stored msg1,
         // under max resends, and past the scheduled time.
+        // Skip resend if the target peer is already promoted — a cross-connection
+        // was resolved via the inbound path and resending msg1 would start a new
+        // handshake on the peer, creating a session mismatch.
         let candidates: Vec<(LinkId, Vec<u8>)> = self.connections.iter()
             .filter(|(_, conn)| {
                 conn.is_outbound()
@@ -104,6 +107,9 @@ impl Node {
                     && conn.resend_count() < max_resends
                     && conn.next_resend_at_ms() > 0
                     && now_ms >= conn.next_resend_at_ms()
+                    && !conn.expected_identity()
+                        .map(|id| self.peers.contains_key(id.node_addr()))
+                        .unwrap_or(false)
             })
             .filter_map(|(link_id, conn)| {
                 conn.handshake_msg1().map(|msg1| (*link_id, msg1.to_vec()))

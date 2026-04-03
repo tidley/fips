@@ -2,7 +2,7 @@
 //!
 //! Handles locally-delivered session payloads from SessionDatagram envelopes.
 //! Dispatches based on FSP common prefix phase to specific handlers for
-//! SessionSetup (Noise XK msg1), SessionAck (msg2), SessionMsg3 (msg3),
+//! SessionSetup (Noise XX msg1), SessionAck (msg2), SessionMsg3 (msg3),
 //! encrypted data, and error signals (CoordsRequired, PathBroken).
 
 use crate::node::session::{EndToEndState, SessionEntry};
@@ -15,7 +15,8 @@ use crate::node::session_wire::{
 use crate::protocol::{coords_wire_size, encode_coords};
 use crate::upper::icmp::FIPS_OVERHEAD;
 use crate::node::{Node, NodeError};
-use crate::noise::{HandshakeState, XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE, XK_HANDSHAKE_MSG3_SIZE};
+use crate::noise::{HandshakeState, XX_HANDSHAKE_MSG1_SIZE, XX_HANDSHAKE_MSG2_SIZE, XX_HANDSHAKE_MSG3_SIZE};
+use crate::protocol::NegotiationPayload;
 use crate::mmp::report::ReceiverReport;
 use crate::mmp::{MAX_SESSION_REPORT_INTERVAL_MS, MIN_SESSION_REPORT_INTERVAL_MS};
 use crate::protocol::{
@@ -35,7 +36,7 @@ impl Node {
     ///
     /// - Phase 0x1 → SessionSetup (handshake msg1)
     /// - Phase 0x2 → SessionAck (handshake msg2)
-    /// - Phase 0x3 → SessionMsg3 (XK handshake msg3)
+    /// - Phase 0x3 → SessionMsg3 (XX handshake msg3)
     /// - Phase 0x0 + U flag → plaintext error signal (CoordsRequired/PathBroken)
     /// - Phase 0x0 + !U → encrypted session message (data, reports, etc.)
     pub(in crate::node) async fn handle_session_payload(
@@ -353,7 +354,7 @@ impl Node {
         self.flush_pending_packets(src_addr).await;
     }
 
-    /// Handle an incoming SessionSetup (Noise XK msg1).
+    /// Handle an incoming SessionSetup (Noise XX msg1).
     ///
     /// The remote node wants to establish an end-to-end session with us.
     /// We create an XK responder handshake, process msg1, send SessionAck with msg2,
@@ -367,10 +368,10 @@ impl Node {
             }
         };
 
-        if setup.handshake_payload.len() != XK_HANDSHAKE_MSG1_SIZE {
+        if setup.handshake_payload.len() != XX_HANDSHAKE_MSG1_SIZE {
             debug!(
                 len = setup.handshake_payload.len(),
-                expected = XK_HANDSHAKE_MSG1_SIZE,
+                expected = XX_HANDSHAKE_MSG1_SIZE,
                 "Invalid handshake payload size in SessionSetup"
             );
             return;
@@ -442,19 +443,19 @@ impl Node {
                         return;
                     }
                     let our_keypair = self.identity.keypair();
-                    let mut handshake = HandshakeState::new_xk_responder(our_keypair);
+                    let mut handshake = HandshakeState::new_xx_responder(our_keypair);
                     handshake.set_local_epoch(self.startup_epoch);
 
-                    if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
-                        debug!(error = %e, "Failed to process rekey XK msg1");
+                    if let Err(e) = handshake.read_xx_message_1(&setup.handshake_payload) {
+                        debug!(error = %e, "Failed to process rekey XX msg1");
                         return;
                     }
 
                     // Generate msg2
-                    let msg2 = match handshake.write_xk_message_2() {
+                    let msg2 = match handshake.write_xx_message_2() {
                         Ok(m) => m,
                         Err(e) => {
-                            debug!(error = %e, "Failed to generate rekey XK msg2");
+                            debug!(error = %e, "Failed to generate rekey XX msg2");
                             return;
                         }
                     };
@@ -492,11 +493,11 @@ impl Node {
 
         // Create XK responder handshake and process msg1
         let our_keypair = self.identity.keypair();
-        let mut handshake = HandshakeState::new_xk_responder(our_keypair);
+        let mut handshake = HandshakeState::new_xx_responder(our_keypair);
         handshake.set_local_epoch(self.startup_epoch);
 
-        if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
-            debug!(error = %e, "Failed to process Noise XK msg1 in SessionSetup");
+        if let Err(e) = handshake.read_xx_message_1(&setup.handshake_payload) {
+            debug!(error = %e, "Failed to process Noise XX msg1 in SessionSetup");
             return;
         }
 
@@ -504,14 +505,24 @@ impl Node {
         // Use a placeholder pubkey from src_addr for the session entry.
         // The real pubkey will be registered when msg3 arrives.
 
-        // Generate msg2
-        let msg2 = match handshake.write_xk_message_2() {
+        // Generate msg2 with negotiation payload
+        let mut msg2 = match handshake.write_xx_message_2() {
             Ok(m) => m,
             Err(e) => {
-                debug!(error = %e, "Failed to generate Noise XK msg2 for SessionAck");
+                debug!(error = %e, "Failed to generate Noise XX msg2 for SessionAck");
                 return;
             }
         };
+
+        // Encrypt FSP negotiation payload (version [0,0], features=0)
+        let neg_payload = NegotiationPayload::new(0, 0, 0).encode();
+        match handshake.encrypt_payload(&neg_payload) {
+            Ok(encrypted) => msg2.extend_from_slice(&encrypted),
+            Err(e) => {
+                debug!(error = %e, "Failed to encrypt negotiation payload for SessionAck");
+                return;
+            }
+        }
 
         // Build and send SessionAck (include initiator's coords for return-path warming)
         let our_coords = self.tree_state.my_coords().clone();
@@ -537,10 +548,10 @@ impl Node {
         entry.set_handshake_payload(ack_payload, now_ms + resend_interval);
         self.sessions.insert(*src_addr, entry);
 
-        debug!(src = %self.peer_display_name(src_addr), "SessionSetup processed (XK), SessionAck sent, awaiting msg3");
+        debug!(src = %self.peer_display_name(src_addr), "SessionSetup processed (XX), SessionAck sent, awaiting msg3");
     }
 
-    /// Handle an incoming SessionAck (Noise XK msg2).
+    /// Handle an incoming SessionAck (Noise XX msg2).
     ///
     /// Processes msg2, generates and sends msg3, then transitions to Established.
     async fn handle_session_ack(&mut self, src_addr: &NodeAddr, inner: &[u8]) {
@@ -552,11 +563,11 @@ impl Node {
             }
         };
 
-        if ack.handshake_payload.len() != XK_HANDSHAKE_MSG2_SIZE {
+        if ack.handshake_payload.len() < XX_HANDSHAKE_MSG2_SIZE {
             debug!(
                 len = ack.handshake_payload.len(),
-                expected = XK_HANDSHAKE_MSG2_SIZE,
-                "Invalid handshake payload size in SessionAck"
+                min = XX_HANDSHAKE_MSG2_SIZE,
+                "Handshake payload too short in SessionAck"
             );
             return;
         }
@@ -581,18 +592,18 @@ impl Node {
             };
 
             // Process XK msg2
-            if let Err(e) = handshake.read_xk_message_2(&ack.handshake_payload) {
-                debug!(error = %e, "Failed to process rekey XK msg2");
+            if let Err(e) = handshake.read_xx_message_2(&ack.handshake_payload) {
+                debug!(error = %e, "Failed to process rekey XX msg2");
                 entry.abandon_rekey();
                 self.sessions.insert(*src_addr, entry);
                 return;
             }
 
             // Generate XK msg3
-            let msg3 = match handshake.write_xk_message_3() {
+            let msg3 = match handshake.write_xx_message_3() {
                 Ok(m) => m,
                 Err(e) => {
-                    debug!(error = %e, "Failed to generate rekey XK msg3");
+                    debug!(error = %e, "Failed to generate rekey XX msg3");
                     entry.abandon_rekey();
                     self.sessions.insert(*src_addr, entry);
                     return;
@@ -617,7 +628,7 @@ impl Node {
             let session = match handshake.into_session() {
                 Ok(s) => s,
                 Err(e) => {
-                    debug!(error = %e, "Failed to create session from rekey XK");
+                    debug!(error = %e, "Failed to create session from rekey XX");
                     entry.abandon_rekey();
                     self.sessions.insert(*src_addr, entry);
                     return;
@@ -646,20 +657,64 @@ impl Node {
             _ => unreachable!("checked is_initiating above"),
         };
 
-        // Process XK msg2: read_xk_message_2 (extracts responder's epoch)
-        if let Err(e) = handshake.read_xk_message_2(&ack.handshake_payload) {
-            debug!(error = %e, "Failed to process Noise XK msg2 in SessionAck");
-            return; // Entry was already removed, don't put back a broken session
+        // Split msg2 into base XX part and optional negotiation payload
+        let (base_msg2, neg_bytes) = if ack.handshake_payload.len() > XX_HANDSHAKE_MSG2_SIZE {
+            (&ack.handshake_payload[..XX_HANDSHAKE_MSG2_SIZE], Some(&ack.handshake_payload[XX_HANDSHAKE_MSG2_SIZE..]))
+        } else {
+            (ack.handshake_payload.as_slice(), None)
+        };
+
+        // Process XX msg2 (learns responder's identity and epoch)
+        if let Err(e) = handshake.read_xx_message_2(base_msg2) {
+            debug!(error = %e, "Failed to process Noise XX msg2 in SessionAck");
+            return;
         }
 
-        // Generate XK msg3: write_xk_message_3 (sends encrypted static + epoch)
-        let msg3 = match handshake.write_xk_message_3() {
+        // Decrypt negotiation payload from msg2 if present
+        if let Some(encrypted_neg) = neg_bytes {
+            match handshake.decrypt_payload(encrypted_neg) {
+                Ok(_negotiation) => {
+                    // FSP negotiation payload received — currently unused (version [0,0])
+                }
+                Err(e) => {
+                    debug!(error = %e, "Failed to decrypt negotiation payload from SessionAck");
+                    return;
+                }
+            }
+        }
+
+        // XX: verify responder's identity matches the target we intended to reach.
+        // Compare x-only keys to avoid parity mismatch: npub-derived keys always
+        // have even parity (0x02), but the Noise handshake reveals the real parity.
+        let expected_xonly = entry.remote_pubkey().x_only_public_key().0;
+        if let Some(remote_pk) = handshake.remote_static()
+            && remote_pk.x_only_public_key().0 != expected_xonly
+        {
+            debug!(
+                src = %self.peer_display_name(src_addr),
+                "Responder identity mismatch in SessionAck — disconnecting"
+            );
+            return;
+        }
+
+        // Generate XX msg3 with negotiation payload
+        let mut msg3 = match handshake.write_xx_message_3() {
             Ok(m) => m,
             Err(e) => {
-                debug!(error = %e, "Failed to generate Noise XK msg3");
+                debug!(error = %e, "Failed to generate Noise XX msg3");
                 return;
             }
         };
+
+        // Encrypt FSP negotiation payload for msg3
+        let neg_payload = NegotiationPayload::new(0, 0, 0).encode();
+        match handshake.encrypt_payload(&neg_payload) {
+            Ok(encrypted) => msg3.extend_from_slice(&encrypted),
+            Err(e) => {
+                debug!(error = %e, "Failed to encrypt negotiation payload for SessionMsg3");
+                return;
+            }
+        }
 
         // Send SessionMsg3 (phase 0x3)
         let msg3_wire = SessionMsg3::new(msg3);
@@ -698,7 +753,7 @@ impl Node {
         info!(src = %self.peer_display_name(src_addr), "Session established (initiator, XK)");
     }
 
-    /// Handle an incoming SessionMsg3 (Noise XK msg3).
+    /// Handle an incoming SessionMsg3 (Noise XX msg3).
     ///
     /// The initiator reveals their encrypted static key. The responder
     /// processes msg3, learns the initiator's identity, and transitions
@@ -712,11 +767,11 @@ impl Node {
             }
         };
 
-        if msg3.handshake_payload.len() != XK_HANDSHAKE_MSG3_SIZE {
+        if msg3.handshake_payload.len() < XX_HANDSHAKE_MSG3_SIZE {
             debug!(
                 len = msg3.handshake_payload.len(),
-                expected = XK_HANDSHAKE_MSG3_SIZE,
-                "Invalid handshake payload size in SessionMsg3"
+                min = XX_HANDSHAKE_MSG3_SIZE,
+                "Handshake payload too short in SessionMsg3"
             );
             return;
         }
@@ -741,8 +796,8 @@ impl Node {
             };
 
             // Process XK msg3
-            if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
-                debug!(error = %e, "Failed to process rekey XK msg3");
+            if let Err(e) = handshake.read_xx_message_3(&msg3.handshake_payload) {
+                debug!(error = %e, "Failed to process rekey XX msg3");
                 entry.abandon_rekey();
                 self.sessions.insert(*src_addr, entry);
                 return;
@@ -752,7 +807,7 @@ impl Node {
             let session = match handshake.into_session() {
                 Ok(s) => s,
                 Err(e) => {
-                    debug!(error = %e, "Failed to create session from rekey XK msg3");
+                    debug!(error = %e, "Failed to create session from rekey XX msg3");
                     entry.abandon_rekey();
                     self.sessions.insert(*src_addr, entry);
                     return;
@@ -780,10 +835,30 @@ impl Node {
             _ => unreachable!("checked is_awaiting_msg3 above"),
         };
 
-        // Process XK msg3: read_xk_message_3 (extracts initiator's static key and epoch)
-        if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
-            debug!(error = %e, "Failed to process Noise XK msg3");
-            return; // Entry was already removed
+        // Split msg3 into base XX part and optional negotiation payload
+        let (base_msg3, neg_bytes) = if msg3.handshake_payload.len() > XX_HANDSHAKE_MSG3_SIZE {
+            (&msg3.handshake_payload[..XX_HANDSHAKE_MSG3_SIZE], Some(&msg3.handshake_payload[XX_HANDSHAKE_MSG3_SIZE..]))
+        } else {
+            (msg3.handshake_payload.as_slice(), None)
+        };
+
+        // Process XX msg3 (learns initiator's identity and epoch)
+        if let Err(e) = handshake.read_xx_message_3(base_msg3) {
+            debug!(error = %e, "Failed to process Noise XX msg3");
+            return;
+        }
+
+        // Decrypt negotiation payload from msg3 if present
+        if let Some(encrypted_neg) = neg_bytes {
+            match handshake.decrypt_payload(encrypted_neg) {
+                Ok(_negotiation) => {
+                    // FSP negotiation payload received — currently unused (version [0,0])
+                }
+                Err(e) => {
+                    debug!(error = %e, "Failed to decrypt negotiation payload from SessionMsg3");
+                    return;
+                }
+            }
         }
 
         // Extract the initiator's static public key (now available after msg3)
@@ -1120,7 +1195,7 @@ impl Node {
 
     /// Initiate an end-to-end session with a remote node.
     ///
-    /// Creates a Noise XK handshake as initiator, wraps msg1 in a
+    /// Creates a Noise XX handshake as initiator, wraps msg1 in a
     /// SessionSetup, encapsulates in a SessionDatagram, and routes
     /// toward the destination.
     pub(in crate::node) async fn initiate_session(
@@ -1135,13 +1210,13 @@ impl Node {
             return Ok(());
         }
 
-        // Create Noise XK initiator handshake
+        // Create Noise XX initiator handshake
         let our_keypair = self.identity.keypair();
-        let mut handshake = HandshakeState::new_xk_initiator(our_keypair, dest_pubkey);
+        let mut handshake = HandshakeState::new_xx_initiator(our_keypair);
         handshake.set_local_epoch(self.startup_epoch);
-        let msg1 = handshake.write_xk_message_1().map_err(|e| NodeError::SendFailed {
+        let msg1 = handshake.write_xx_message_1().map_err(|e| NodeError::SendFailed {
             node_addr: dest_addr,
-            reason: format!("Noise XK msg1 generation failed: {}", e),
+            reason: format!("Noise XX msg1 generation failed: {}", e),
         })?;
 
         // Build SessionSetup with coordinates

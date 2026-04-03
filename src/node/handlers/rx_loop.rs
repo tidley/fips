@@ -4,7 +4,7 @@ use crate::control::{commands, ControlSocket};
 use crate::control::queries;
 use crate::node::{Node, NodeError};
 use crate::transport::ReceivedPacket;
-use crate::node::wire::{CommonPrefix, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2, FMP_VERSION, COMMON_PREFIX_SIZE};
+use crate::node::wire::{CommonPrefix, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2, PHASE_MSG3, FMP_VERSION, COMMON_PREFIX_SIZE};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -16,6 +16,7 @@ impl Node {
     /// - Phase 0x0: Encrypted frame (session data)
     /// - Phase 0x1: Handshake message 1 (initiator -> responder)
     /// - Phase 0x2: Handshake message 2 (responder -> initiator)
+    /// - Phase 0x3: Handshake message 3 (initiator -> responder, XX completion)
     ///
     /// Also processes outbound IPv6 packets from the TUN reader for session
     /// encapsulation and routing through the mesh.
@@ -171,6 +172,9 @@ impl Node {
             }
             PHASE_MSG2 => {
                 self.handle_msg2(packet).await;
+            }
+            PHASE_MSG3 => {
+                self.handle_msg3(packet).await;
             }
             _ => {
                 debug!(

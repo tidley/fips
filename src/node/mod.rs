@@ -380,6 +380,10 @@ pub struct Node {
     /// Pending outbound handshakes by our sender_idx.
     /// Tracks which LinkId corresponds to which session index.
     pending_outbound: HashMap<(TransportId, u32), LinkId>,
+    /// Pending inbound connections awaiting msg3 (XX pattern), keyed by
+    /// (transport_id, our_index). The responder stores the connection here
+    /// after sending msg2 and awaits msg3 to learn the initiator's identity.
+    pending_inbound: HashMap<(TransportId, u32), LinkId>,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -535,6 +539,7 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            pending_inbound: HashMap::new(),
             msg1_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
@@ -645,6 +650,7 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            pending_inbound: HashMap::new(),
             msg1_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),

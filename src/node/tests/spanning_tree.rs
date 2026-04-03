@@ -209,7 +209,7 @@ pub(super) fn print_tree_snapshot(label: &str, nodes: &[TestNode]) {
 ///
 /// Returns the number of packets processed.
 pub(super) async fn process_available_packets(nodes: &mut [TestNode]) -> usize {
-    use crate::node::wire::{CommonPrefix, FMP_VERSION, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2, COMMON_PREFIX_SIZE};
+    use crate::node::wire::{CommonPrefix, FMP_VERSION, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2, PHASE_MSG3, COMMON_PREFIX_SIZE};
 
     let mut count = 0;
     for node in nodes.iter_mut() {
@@ -224,6 +224,7 @@ pub(super) async fn process_available_packets(nodes: &mut [TestNode]) -> usize {
                 match prefix.phase {
                     PHASE_MSG1 => node.node.handle_msg1(packet).await,
                     PHASE_MSG2 => node.node.handle_msg2(packet).await,
+                    PHASE_MSG3 => node.node.handle_msg3(packet).await,
                     PHASE_ESTABLISHED => {
                         node.node.handle_encrypted_frame(packet).await
                     }

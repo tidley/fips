@@ -24,6 +24,7 @@ mod discovery;
 mod error;
 mod filter;
 mod link;
+mod negotiation;
 mod session;
 mod tree;
 
@@ -36,6 +37,7 @@ pub use link::{
 pub use tree::TreeAnnounce;
 pub use filter::FilterAnnounce;
 pub use discovery::{LookupRequest, LookupResponse};
+pub use negotiation::{NegotiationPayload, TlvEntry, NEGOTIATION_HEADER_SIZE};
 pub use session::{
     CoordsRequired, FspFlags, FspInnerFlags, MtuExceeded, PathBroken, PathMtuNotification,
     SessionAck, SessionFlags, SessionMessageType, SessionMsg3, SessionReceiverReport,

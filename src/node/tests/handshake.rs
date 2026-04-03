@@ -1,4 +1,4 @@
-//! Integration tests for end-to-end Noise IK handshake scenarios.
+//! Integration tests for end-to-end Noise XX handshake scenarios.
 
 use super::*;
 
@@ -94,7 +94,7 @@ async fn test_two_node_handshake_udp() {
         .await
         .expect("Failed to send msg1");
 
-    // === Phase 2: Node B receives msg1, sends msg2, promotes ===
+    // === Phase 2: Node B receives msg1, sends msg2 (XX: does NOT promote yet) ===
 
     let packet_b = timeout(Duration::from_secs(1), packet_rx_b.recv())
         .await
@@ -103,28 +103,16 @@ async fn test_two_node_handshake_udp() {
 
     node_b.handle_msg1(packet_b).await;
 
-    // Verify B promoted the inbound connection
     let peer_a_node_addr = *PeerIdentity::from_pubkey_full(
         node_a.identity.pubkey_full(),
     )
     .node_addr();
-    assert_eq!(node_b.peer_count(), 1, "Node B should have 1 peer after msg1");
-    let peer_a_on_b = node_b
-        .get_peer(&peer_a_node_addr)
-        .expect("Node B should have peer A");
-    assert!(
-        peer_a_on_b.has_session(),
-        "Peer A on B should have NoiseSession"
-    );
-    let our_index_b = peer_a_on_b.our_index().expect("B should have our_index");
-    assert!(
-        node_b
-            .peers_by_index
-            .contains_key(&(transport_id_b, our_index_b.as_u32())),
-        "Node B peers_by_index should be populated"
-    );
 
-    // === Phase 3: Node A receives msg2, completes handshake, promotes ===
+    // XX: B has NOT promoted yet (needs msg3)
+    assert_eq!(node_b.peer_count(), 0, "Node B should have 0 peers after msg1 (XX awaits msg3)");
+    assert_eq!(node_b.connections.len(), 1, "Node B should have 1 pending connection awaiting msg3");
+
+    // === Phase 3: Node A receives msg2, sends msg3, promotes ===
 
     let packet_a = timeout(Duration::from_secs(1), packet_rx_a.recv())
         .await
@@ -152,6 +140,32 @@ async fn test_two_node_handshake_udp() {
             .peers_by_index
             .contains_key(&(transport_id_a, our_index_a.as_u32())),
         "Node A peers_by_index should be populated"
+    );
+
+    // === Phase 4: Node B receives msg3, promotes ===
+
+    let packet_b_msg3 = timeout(Duration::from_secs(1), packet_rx_b.recv())
+        .await
+        .expect("Timeout waiting for msg3")
+        .expect("Channel closed");
+
+    node_b.handle_msg3(packet_b_msg3).await;
+
+    // Verify B promoted after msg3
+    assert_eq!(node_b.peer_count(), 1, "Node B should have 1 peer after msg3");
+    let peer_a_on_b = node_b
+        .get_peer(&peer_a_node_addr)
+        .expect("Node B should have peer A");
+    assert!(
+        peer_a_on_b.has_session(),
+        "Peer A on B should have NoiseSession"
+    );
+    let our_index_b = peer_a_on_b.our_index().expect("B should have our_index");
+    assert!(
+        node_b
+            .peers_by_index
+            .contains_key(&(transport_id_b, our_index_b.as_u32())),
+        "Node B peers_by_index should be populated"
     );
 
     // === Phase 4: Encrypted frame A → B ===
@@ -334,11 +348,16 @@ async fn test_run_rx_loop_handshake() {
     // Small delay to ensure msg1 is received by B's transport
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // === Phase 2: Run Node B's rx loop (processes msg1, sends msg2) ===
+    // === Phase 2: Run Node B's rx loop (processes msg1 and later msg3) ===
     //
     // This is the key difference from test_two_node_handshake_udp:
     // instead of calling handle_msg1() directly, we run the full rx loop
     // which dispatches based on the common prefix phase field.
+    //
+    // With XX, the rx loop will process msg1 (sending msg2) but NOT
+    // promote B yet (needs msg3). We run the rx loop once for msg1,
+    // then later use direct handler calls for msg3 (since run_rx_loop
+    // takes packet_rx and can't be called twice).
 
     tokio::select! {
         result = node_b.run_rx_loop() => {
@@ -349,36 +368,11 @@ async fn test_run_rx_loop_handshake() {
         }
     }
 
-    // Verify Node B promoted the inbound connection via rx loop dispatch
-    let peer_a_node_addr = *PeerIdentity::from_pubkey_full(
-        node_a.identity.pubkey_full(),
-    )
-    .node_addr();
+    // XX: Node B has NOT promoted yet (needs msg3)
+    assert_eq!(node_b.peer_count(), 0, "Node B should have 0 peers after rx loop processed msg1 (XX awaits msg3)");
+    assert_eq!(node_b.connections.len(), 1, "Node B should have 1 pending connection");
 
-    assert_eq!(node_b.peer_count(), 1, "Node B should have 1 peer after rx loop processed msg1");
-    let peer_a_on_b = node_b
-        .get_peer(&peer_a_node_addr)
-        .expect("Node B should have peer A");
-    assert!(
-        peer_a_on_b.has_session(),
-        "Peer A on B should have NoiseSession"
-    );
-    let our_index_b = peer_a_on_b.our_index().expect("B should have our_index");
-    assert!(
-        peer_a_on_b.their_index().is_some(),
-        "B should have their_index"
-    );
-    assert!(
-        node_b
-            .peers_by_index
-            .contains_key(&(transport_id_b, our_index_b.as_u32())),
-        "Node B peers_by_index should be populated"
-    );
-
-    // === Phase 3: Run Node A's rx loop (processes msg2) ===
-    //
-    // msg2 was sent by Node B during its rx loop processing of msg1.
-    // It arrived at A's UDP transport, which forwarded it to A's packet channel.
+    // === Phase 3: Run Node A's rx loop (processes msg2, sends msg3) ===
 
     tokio::select! {
         result = node_a.run_rx_loop() => {
@@ -389,7 +383,7 @@ async fn test_run_rx_loop_handshake() {
         }
     }
 
-    // Verify Node A promoted the outbound connection via rx loop dispatch
+    // Verify Node A promoted after processing msg2
     assert_eq!(node_a.peer_count(), 1, "Node A should have 1 peer after rx loop processed msg2");
     let peer_b_on_a = node_a
         .get_peer(&peer_b_node_addr)
@@ -413,6 +407,13 @@ async fn test_run_rx_loop_handshake() {
             .contains_key(&(transport_id_a, our_index_a.as_u32())),
         "Node A peers_by_index should be populated"
     );
+
+    // Note: Phase 4 (msg3 → B promotes) cannot be tested via run_rx_loop
+    // because it consumes packet_rx on first call. The msg3 dispatch is
+    // verified by test_two_node_handshake_udp which uses direct handler calls.
+    // This test verifies rx_loop correctly dispatches PHASE_MSG1 (Phase 2)
+    // and PHASE_MSG2 (Phase 3). B still has a pending connection awaiting msg3.
+    assert_eq!(node_b.connections.len(), 1, "Node B should still have pending connection awaiting msg3");
 
     // Clean up transports
     for (_, t) in node_a.transports.iter_mut() {
@@ -532,41 +533,54 @@ async fn test_cross_connection_both_initiate() {
     let transport = node_b.transports.get(&transport_id_b).unwrap();
     transport.send(&remote_addr_a, &wire_msg1_b).await.expect("B send msg1");
 
-    // === Phase 2: Both nodes receive the other's msg1 ===
-    // Before the fix, addr_to_link would reject these because outbound links
-    // already exist for these addresses.
+    // === Phase 2: Both nodes receive the other's msg1 (XX: no promotion yet) ===
 
     // B receives A's msg1
     let packet_at_b = timeout(Duration::from_secs(1), packet_rx_b.recv())
         .await.expect("Timeout").expect("Channel closed");
     node_b.handle_msg1(packet_at_b).await;
 
-    // B should have promoted the inbound connection
-    assert_eq!(node_b.peer_count(), 1, "Node B should have 1 peer after processing A's msg1");
-    assert!(node_b.get_peer(&peer_a_node_addr).is_some(), "Node B should have peer A");
+    // XX: B has NOT promoted yet (needs msg3 from A)
+    assert_eq!(node_b.peer_count(), 0, "Node B should have 0 peers after processing A's msg1 (XX)");
 
     // A receives B's msg1
     let packet_at_a = timeout(Duration::from_secs(1), packet_rx_a.recv())
         .await.expect("Timeout").expect("Channel closed");
     node_a.handle_msg1(packet_at_a).await;
 
-    // A should have promoted the inbound connection
-    assert_eq!(node_a.peer_count(), 1, "Node A should have 1 peer after processing B's msg1");
-    assert!(node_a.get_peer(&peer_b_node_addr).is_some(), "Node A should have peer B");
+    // XX: A has NOT promoted yet (needs msg3 from B)
+    assert_eq!(node_a.peer_count(), 0, "Node A should have 0 peers after processing B's msg1 (XX)");
 
-    // === Phase 3: Both nodes receive msg2 responses ===
-    // The msg2 was sent during handle_msg1 processing. When handle_msg2
-    // processes it, it will detect the cross-connection and resolve.
+    // === Phase 3: Both nodes receive msg2 + send msg3, initiator side promotes ===
 
-    // A receives B's msg2 (response to A's original msg1)
+    // A receives B's msg2 (response to A's original msg1) → A sends msg3, A promotes
     let msg2_at_a = timeout(Duration::from_secs(1), packet_rx_a.recv())
         .await.expect("Timeout waiting for msg2 at A").expect("Channel closed");
     node_a.handle_msg2(msg2_at_a).await;
 
-    // B receives A's msg2 (response to B's original msg1)
+    // A promoted as initiator
+    assert_eq!(node_a.peer_count(), 1, "Node A should have 1 peer after processing msg2");
+
+    // B receives A's msg2 (response to B's original msg1) → B sends msg3, B promotes
     let msg2_at_b = timeout(Duration::from_secs(1), packet_rx_b.recv())
         .await.expect("Timeout waiting for msg2 at B").expect("Channel closed");
     node_b.handle_msg2(msg2_at_b).await;
+
+    // B promoted as initiator
+    assert_eq!(node_b.peer_count(), 1, "Node B should have 1 peer after processing msg2");
+
+    // === Phase 4: Both nodes receive msg3, responder side completes ===
+    // Cross-connection resolution happens here (or in Phase 3 promotion).
+
+    // A receives B's msg3 (B completing A's inbound handshake)
+    let msg3_at_a = timeout(Duration::from_secs(1), packet_rx_a.recv())
+        .await.expect("Timeout waiting for msg3 at A").expect("Channel closed");
+    node_a.handle_msg3(msg3_at_a).await;
+
+    // B receives A's msg3 (A completing B's inbound handshake)
+    let msg3_at_b = timeout(Duration::from_secs(1), packet_rx_b.recv())
+        .await.expect("Timeout waiting for msg3 at B").expect("Channel closed");
+    node_b.handle_msg3(msg3_at_b).await;
 
     // === Verification ===
     // Both nodes should have exactly 1 peer each after cross-connection resolution
@@ -826,8 +840,8 @@ async fn test_duplicate_msg2_dropped() {
     let receiver_idx = SessionIndex::new(42);
     let sender_idx = SessionIndex::new(99);
 
-    // Build a fake msg2 packet
-    let fake_noise_msg2 = vec![0u8; 57]; // Noise IK msg2 is 57 bytes (33 ephem + 24 encrypted epoch)
+    // Build a fake msg2 packet (XX msg2 is at least 106 bytes)
+    let fake_noise_msg2 = vec![0u8; 106];
     let wire_msg2 = build_msg2(sender_idx, receiver_idx, &fake_noise_msg2);
 
     let packet = ReceivedPacket {

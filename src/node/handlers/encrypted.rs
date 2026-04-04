@@ -2,7 +2,7 @@
 
 use crate::noise::NoiseError;
 use crate::node::Node;
-use crate::node::wire::{EncryptedHeader, strip_inner_header, FLAG_CE, FLAG_KEY_EPOCH, FLAG_SP};
+use crate::node::wire::{EncryptedHeader, strip_inner_header, FLAG_CE, FLAG_KEY_EPOCH};
 use crate::transport::ReceivedPacket;
 use std::time::Instant;
 use tracing::{debug, info, trace, warn};
@@ -148,7 +148,6 @@ impl Node {
         // MMP per-frame processing and statistics
         let now = Instant::now();
         let ce_flag = header.flags & FLAG_CE != 0;
-        let sp_flag = header.flags & FLAG_SP != 0;
 
         if let Some(peer) = self.peers.get_mut(&node_addr) {
             if let Some(mmp) = peer.mmp_mut() {
@@ -159,7 +158,6 @@ impl Node {
                     ce_flag,
                     now,
                 );
-                let _spin_rtt = mmp.spin_bit.rx_observe(sp_flag, header.counter, now);
             }
             peer.set_current_addr(packet.transport_id, packet.remote_addr.clone());
             peer.link_stats_mut().record_recv(packet.data.len(), packet.timestamp_ms);

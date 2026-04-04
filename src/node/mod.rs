@@ -20,6 +20,7 @@ mod tree;
 mod tests;
 
 use crate::bloom::BloomState;
+use crate::protocol::NodeProfile;
 use crate::cache::CoordCache;
 use crate::utils::index::IndexAllocator;
 use crate::node::session::SessionEntry;
@@ -272,6 +273,9 @@ pub struct Node {
     /// Whether this is a leaf-only node.
     is_leaf_only: bool,
 
+    /// Node profile derived from config (Full, NonRouting, Leaf).
+    node_profile: NodeProfile,
+
     // === Spanning Tree ===
     /// Local spanning tree state.
     tree_state: TreeState,
@@ -444,6 +448,7 @@ impl Node {
         let identity = config.create_identity()?;
         let node_addr = *identity.node_addr();
         let is_leaf_only = config.is_leaf_only();
+        let node_profile = config.node_profile();
 
         let mut startup_epoch = [0u8; 8];
         rand::rng().fill_bytes(&mut startup_epoch);
@@ -506,6 +511,7 @@ impl Node {
             config,
             state: NodeState::Created,
             is_leaf_only,
+            node_profile,
             tree_state,
             bloom_state,
             coord_cache,
@@ -617,6 +623,7 @@ impl Node {
             config,
             state: NodeState::Created,
             is_leaf_only: false,
+            node_profile: NodeProfile::Full,
             tree_state,
             bloom_state,
             coord_cache,
@@ -674,6 +681,7 @@ impl Node {
     pub fn leaf_only(config: Config) -> Result<Self, NodeError> {
         let mut node = Self::new(config)?;
         node.is_leaf_only = true;
+        node.node_profile = NodeProfile::Leaf;
         node.bloom_state = BloomState::leaf_only(*node.identity.node_addr());
         Ok(node)
     }
@@ -991,6 +999,22 @@ impl Node {
     /// Check if this is a leaf-only node.
     pub fn is_leaf_only(&self) -> bool {
         self.is_leaf_only
+    }
+
+    /// Get the node's profile (Full, NonRouting, Leaf).
+    pub fn node_profile(&self) -> NodeProfile {
+        self.node_profile
+    }
+
+    /// Collect the set of peers that are not full nodes (non-routing/leaf).
+    ///
+    /// Used by tree and routing functions to skip non-transit peers.
+    fn non_full_peers(&self) -> std::collections::HashSet<NodeAddr> {
+        self.peers
+            .iter()
+            .filter(|(_, p)| p.peer_profile() != NodeProfile::Full)
+            .map(|(addr, _)| *addr)
+            .collect()
     }
 
     // === Tree State ===
@@ -1484,8 +1508,9 @@ impl Node {
             return self.select_best_candidate(&candidates, &dest_coords);
         }
 
-        // 4. Greedy tree routing fallback
-        let next_hop_id = self.tree_state.find_next_hop(&dest_coords)?;
+        // 4. Greedy tree routing fallback (skip non-routing/leaf peers)
+        let skip = self.non_full_peers();
+        let next_hop_id = self.tree_state.find_next_hop(&dest_coords, &skip)?;
 
         self.peers.get(&next_hop_id).filter(|p| p.can_send())
     }
@@ -1545,9 +1570,15 @@ impl Node {
         best.map(|(peer, _, _)| peer)
     }
 
-    /// Check if a destination is in any peer's bloom filter.
+    /// Check if a destination is in any full peer's bloom filter.
+    ///
+    /// Skips non-routing and leaf peers (defensive — they shouldn't have
+    /// filters claiming transit reachability, but guard against propagation bugs).
     pub fn destination_in_filters(&self, dest: &NodeAddr) -> Vec<&ActivePeer> {
-        self.peers.values().filter(|p| p.may_reach(dest)).collect()
+        self.peers
+            .values()
+            .filter(|p| p.peer_profile() == NodeProfile::Full && p.may_reach(dest))
+            .collect()
     }
 
     /// Get the TUN packet sender channel.

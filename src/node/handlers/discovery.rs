@@ -320,23 +320,32 @@ impl Node {
             return;
         }
 
-        // Collect tree peers whose bloom filter contains the target
+        // Leaf nodes don't forward discovery requests
+        if self.node_profile == crate::protocol::NodeProfile::Leaf {
+            return;
+        }
+
+        // Collect full tree peers whose bloom filter contains the target
         let forward_to: Vec<NodeAddr> = self
             .peers
             .iter()
             .filter(|(addr, peer)| {
-                self.is_tree_peer(addr) && peer.may_reach(&request.target)
+                peer.peer_profile() == crate::protocol::NodeProfile::Full
+                    && self.is_tree_peer(addr)
+                    && peer.may_reach(&request.target)
             })
             .map(|(addr, _)| *addr)
             .collect();
 
-        // Fallback: if no tree peer matches, try non-tree bloom-matching peers
+        // Fallback: if no tree peer matches, try non-tree full bloom-matching peers
         let (forward_to, used_fallback) = if forward_to.is_empty() {
             let fallback: Vec<NodeAddr> = self
                 .peers
                 .iter()
                 .filter(|(addr, peer)| {
-                    !self.is_tree_peer(addr) && peer.may_reach(&request.target)
+                    peer.peer_profile() == crate::protocol::NodeProfile::Full
+                        && !self.is_tree_peer(addr)
+                        && peer.may_reach(&request.target)
                 })
                 .map(|(addr, _)| *addr)
                 .collect();
@@ -398,12 +407,14 @@ impl Node {
         let origin_coords = self.tree_state().my_coords().clone();
         let request = LookupRequest::generate(*target, origin, origin_coords, ttl, 0);
 
-        // Send only to tree peers whose bloom filter contains the target
+        // Send only to full tree peers whose bloom filter contains the target
         let peer_addrs: Vec<NodeAddr> = self
             .peers
             .iter()
             .filter(|(addr, peer)| {
-                self.is_tree_peer(addr) && peer.may_reach(target)
+                peer.peer_profile() == crate::protocol::NodeProfile::Full
+                    && self.is_tree_peer(addr)
+                    && peer.may_reach(target)
             })
             .map(|(addr, _)| *addr)
             .collect();

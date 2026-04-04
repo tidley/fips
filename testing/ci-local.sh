@@ -14,7 +14,7 @@
 #   -h, --help           Show this help
 #
 # Integration suites:
-#   static-mesh, static-chain, rekey,
+#   static-mesh, static-chain, rekey, mixed-profile,
 #   chaos-smoke-10, chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-tcp-mesh, chaos-bottleneck-parent,
 #   chaos-cost-avoidance, chaos-cost-reeval, chaos-cost-stability,
@@ -249,6 +249,31 @@ run_rekey() {
     record "rekey" $rc
 }
 
+# Run the mixed-profile integration test (Full + NonRouting + Leaf)
+run_mixed_profile() {
+    local compose="testing/static/docker-compose.yml"
+    local rc=0
+
+    info "[mixed-profile] Generating configs"
+    bash testing/static/scripts/generate-configs.sh mixed-profile || { record "mixed-profile" 1; return; }
+    bash testing/static/scripts/mixed-profile-test.sh inject-config || { record "mixed-profile" 1; return; }
+
+    info "[mixed-profile] Starting containers"
+    docker compose -f "$compose" --profile mixed-profile up -d || { record "mixed-profile" 1; return; }
+
+    info "[mixed-profile] Running mixed-profile test"
+    if bash testing/static/scripts/mixed-profile-test.sh; then
+        rc=0
+    else
+        rc=1
+        info "[mixed-profile] Collecting failure logs"
+        docker compose -f "$compose" --profile mixed-profile logs --no-color 2>&1 | tail -100
+    fi
+
+    docker compose -f "$compose" --profile mixed-profile down --volumes --remove-orphans 2>/dev/null
+    record "mixed-profile" $rc
+}
+
 # Run a chaos scenario
 run_chaos() {
     local name="$1"
@@ -306,6 +331,9 @@ run_integration() {
 
     # Rekey
     run_rekey
+
+    # Mixed-profile (Full + NonRouting + Leaf)
+    run_mixed_profile
 
     # Chaos scenarios (parallel, throttled)
     if [[ "$SKIP_CHAOS" != true ]]; then
@@ -369,6 +397,8 @@ run_suite() {
             run_static "${suite#static-}" ;;
         rekey)
             run_rekey ;;
+        mixed-profile)
+            run_mixed_profile ;;
         chaos-*)
             local chaos_name="${suite#chaos-}"
             local found=false

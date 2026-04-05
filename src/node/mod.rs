@@ -1472,10 +1472,13 @@ impl Node {
             .unwrap_or(0);
         let dest_coords = self.coord_cache.get_and_touch(dest_node_addr, now_ms)?.clone();
 
-        // 3. Bloom filter candidates — requires dest_coords for loop-free selection
+        // 3. Bloom filter candidates — requires dest_coords for loop-free selection.
+        //    If no candidate is strictly closer, fall through to tree routing.
         let candidates: Vec<&ActivePeer> = self.destination_in_filters(dest_node_addr);
-        if !candidates.is_empty() {
-            return self.select_best_candidate(&candidates, &dest_coords);
+        if !candidates.is_empty()
+            && let Some(peer) = self.select_best_candidate(&candidates, &dest_coords)
+        {
+            return Some(peer);
         }
 
         // 4. Greedy tree routing fallback

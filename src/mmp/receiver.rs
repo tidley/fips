@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use crate::mmp::algorithms::{JitterEstimator, OwdTrendDetector};
 use crate::mmp::report::ReceiverReport;
-use crate::mmp::{DEFAULT_COLD_START_INTERVAL_MS, DEFAULT_OWD_WINDOW_SIZE,
-                  MAX_REPORT_INTERVAL_MS, MIN_REPORT_INTERVAL_MS};
+use crate::mmp::{COLD_START_SAMPLES, DEFAULT_COLD_START_INTERVAL_MS,
+                  DEFAULT_OWD_WINDOW_SIZE, MAX_REPORT_INTERVAL_MS,
+                  MIN_REPORT_INTERVAL_MS};
 
 /// Grace period after rekey before resuming jitter calculation.
 ///
@@ -179,6 +180,10 @@ pub struct ReceiverState {
     report_interval: Duration,
     /// Whether any frames have been received since the last report.
     interval_has_data: bool,
+
+    // --- Cold-start tracking ---
+    /// Number of SRTT-based interval updates received.
+    srtt_sample_count: u32,
 }
 
 impl ReceiverState {
@@ -209,6 +214,7 @@ impl ReceiverState {
             last_report_time: None,
             report_interval: Duration::from_millis(cold_start_ms),
             interval_has_data: false,
+            srtt_sample_count: 0,
         }
     }
 
@@ -363,9 +369,18 @@ impl ReceiverState {
 
     /// Update the report interval based on SRTT (link-layer defaults).
     ///
-    /// Receiver reports at 1× SRTT, clamped to [MIN, MAX].
+    /// Receiver reports at 1× SRTT clamped to [floor, MAX]. During cold-start
+    /// (first `COLD_START_SAMPLES` updates), the floor is the cold-start
+    /// interval (200ms) for fast SRTT convergence. After that, it rises to
+    /// `MIN_REPORT_INTERVAL_MS` (1000ms) for steady-state efficiency.
     pub fn update_report_interval_from_srtt(&mut self, srtt_us: i64) {
-        self.update_report_interval_with_bounds(srtt_us, MIN_REPORT_INTERVAL_MS, MAX_REPORT_INTERVAL_MS);
+        self.srtt_sample_count = self.srtt_sample_count.saturating_add(1);
+        let floor = if self.srtt_sample_count <= COLD_START_SAMPLES {
+            DEFAULT_COLD_START_INTERVAL_MS
+        } else {
+            MIN_REPORT_INTERVAL_MS
+        };
+        self.update_report_interval_with_bounds(srtt_us, floor, MAX_REPORT_INTERVAL_MS);
     }
 
     /// Update the report interval based on SRTT with custom bounds.
@@ -566,15 +581,34 @@ mod tests {
     }
 
     #[test]
-    fn test_update_report_interval() {
+    fn test_update_report_interval_cold_start() {
         let mut r = ReceiverState::new(32);
-        // 50ms SRTT → 100ms receiver interval (1× SRTT, clamped to min)
+        // During cold-start, floor is 200ms (DEFAULT_COLD_START_INTERVAL_MS)
+        // 50ms SRTT → 50ms receiver interval (1× SRTT), clamped to cold-start floor 200ms
         r.update_report_interval_from_srtt(50_000);
-        assert_eq!(r.report_interval(), Duration::from_millis(100));
+        assert_eq!(r.report_interval(), Duration::from_millis(200));
 
-        // 500ms SRTT → 500ms
+        // 500ms SRTT → 500ms (above cold-start floor)
         r.update_report_interval_from_srtt(500_000);
         assert_eq!(r.report_interval(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_update_report_interval_after_cold_start() {
+        let mut r = ReceiverState::new(32);
+        // Burn through cold-start samples
+        for _ in 0..COLD_START_SAMPLES {
+            r.update_report_interval_from_srtt(500_000);
+        }
+
+        // 6th sample: steady state, floor is MIN_REPORT_INTERVAL_MS (1000ms)
+        // 50ms SRTT → 50ms receiver interval (1× SRTT), clamped to 1000ms
+        r.update_report_interval_from_srtt(50_000);
+        assert_eq!(r.report_interval(), Duration::from_millis(MIN_REPORT_INTERVAL_MS));
+
+        // 3s SRTT → 3000ms, within [1000, 5000]
+        r.update_report_interval_from_srtt(3_000_000);
+        assert_eq!(r.report_interval(), Duration::from_millis(3000));
     }
 
     #[test]

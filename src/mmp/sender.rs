@@ -6,7 +6,8 @@
 use std::time::{Duration, Instant};
 
 use crate::mmp::report::SenderReport;
-use crate::mmp::{DEFAULT_COLD_START_INTERVAL_MS, MAX_REPORT_INTERVAL_MS, MIN_REPORT_INTERVAL_MS};
+use crate::mmp::{COLD_START_SAMPLES, DEFAULT_COLD_START_INTERVAL_MS,
+                  MAX_REPORT_INTERVAL_MS, MIN_REPORT_INTERVAL_MS};
 
 /// Per-peer sender-side MMP state.
 ///
@@ -35,6 +36,10 @@ pub struct SenderState {
     // --- Send failure backoff ---
     /// Consecutive send failure count for backoff calculation.
     consecutive_send_failures: u32,
+
+    // --- Cold-start tracking ---
+    /// Number of SRTT-based interval updates received.
+    srtt_sample_count: u32,
 }
 
 impl SenderState {
@@ -59,6 +64,7 @@ impl SenderState {
             last_report_time: None,
             report_interval: Duration::from_millis(cold_start_ms),
             consecutive_send_failures: 0,
+            srtt_sample_count: 0,
         }
     }
 
@@ -150,9 +156,18 @@ impl SenderState {
 
     /// Update the report interval based on SRTT (link-layer defaults).
     ///
-    /// Sender reports at 2× SRTT clamped to [MIN, MAX].
+    /// Sender reports at 2× SRTT clamped to [floor, MAX]. During cold-start
+    /// (first `COLD_START_SAMPLES` updates), the floor is the cold-start
+    /// interval (200ms) for fast SRTT convergence. After that, it rises to
+    /// `MIN_REPORT_INTERVAL_MS` (1000ms) for steady-state efficiency.
     pub fn update_report_interval_from_srtt(&mut self, srtt_us: i64) {
-        self.update_report_interval_with_bounds(srtt_us, MIN_REPORT_INTERVAL_MS, MAX_REPORT_INTERVAL_MS);
+        self.srtt_sample_count = self.srtt_sample_count.saturating_add(1);
+        let floor = if self.srtt_sample_count <= COLD_START_SAMPLES {
+            DEFAULT_COLD_START_INTERVAL_MS
+        } else {
+            MIN_REPORT_INTERVAL_MS
+        };
+        self.update_report_interval_with_bounds(srtt_us, floor, MAX_REPORT_INTERVAL_MS);
     }
 
     /// Update the report interval based on SRTT with custom bounds.
@@ -289,18 +304,33 @@ mod tests {
     }
 
     #[test]
-    fn test_update_report_interval() {
+    fn test_update_report_interval_cold_start() {
         let mut s = SenderState::new();
-        // 50ms RTT → 100ms sender interval (2× SRTT), clamped to min 100ms
+        // During cold-start, floor is 200ms (DEFAULT_COLD_START_INTERVAL_MS)
+        // 50ms RTT → 100ms sender interval (2× SRTT), clamped to cold-start floor 200ms
         s.update_report_interval_from_srtt(50_000);
-        assert_eq!(s.report_interval(), Duration::from_millis(100));
+        assert_eq!(s.report_interval(), Duration::from_millis(200));
 
-        // 500ms RTT → 1000ms sender interval
+        // 500ms RTT → 1000ms sender interval (above cold-start floor)
         s.update_report_interval_from_srtt(500_000);
         assert_eq!(s.report_interval(), Duration::from_millis(1000));
+    }
 
-        // 2s RTT → 4s, clamped to max 2s
-        s.update_report_interval_from_srtt(2_000_000);
+    #[test]
+    fn test_update_report_interval_after_cold_start() {
+        let mut s = SenderState::new();
+        // Burn through cold-start samples (COLD_START_SAMPLES = 5)
+        for _ in 0..COLD_START_SAMPLES {
+            s.update_report_interval_from_srtt(500_000);
+        }
+
+        // 6th sample: now in steady state, floor is MIN_REPORT_INTERVAL_MS (1000ms)
+        // 50ms RTT → 100ms sender interval (2× SRTT), clamped to 1000ms
+        s.update_report_interval_from_srtt(50_000);
+        assert_eq!(s.report_interval(), Duration::from_millis(MIN_REPORT_INTERVAL_MS));
+
+        // 3s RTT → 6s, clamped to max 5s
+        s.update_report_interval_from_srtt(3_000_000);
         assert_eq!(s.report_interval(), Duration::from_millis(MAX_REPORT_INTERVAL_MS));
     }
 

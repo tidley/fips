@@ -272,6 +272,7 @@ Ethernet, Tor, and Bluetooth (BLE) with a small live mesh of deployed nodes.
 ### Near-term priorities
 
 - Peer discovery via Nostr relays (bootstrap without static peer lists)
+- Experimental issue-37 traversal code now lives in [examples/nostr-bootstrap](examples/nostr-bootstrap/README.md)
 - Native API for FIPS-aware applications (npub:port addressing)
 - Security audit of cryptographic protocols
 

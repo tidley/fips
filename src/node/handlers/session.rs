@@ -5,25 +5,27 @@
 //! SessionSetup (Noise XK msg1), SessionAck (msg2), SessionMsg3 (msg3),
 //! encrypted data, and error signals (CoordsRequired, PathBroken).
 
-use crate::node::session::{EndToEndState, SessionEntry};
-use crate::node::session_wire::{
-    build_fsp_header, fsp_prepend_inner_header, fsp_strip_inner_header,
-    parse_encrypted_coords, FspCommonPrefix, FspEncryptedHeader, FSP_COMMON_PREFIX_SIZE,
-    FSP_FLAG_CP, FSP_FLAG_K, FSP_HEADER_SIZE, FSP_PHASE_ESTABLISHED, FSP_PHASE_MSG1,
-    FSP_PHASE_MSG2, FSP_PHASE_MSG3, FSP_PORT_HEADER_SIZE, FSP_PORT_IPV6_SHIM,
-};
-use crate::protocol::{coords_wire_size, encode_coords};
-use crate::upper::icmp::FIPS_OVERHEAD;
-use crate::node::{Node, NodeError};
-use crate::noise::{HandshakeState, XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE, XK_HANDSHAKE_MSG3_SIZE};
 use crate::mmp::report::ReceiverReport;
 use crate::mmp::{MAX_SESSION_REPORT_INTERVAL_MS, MIN_SESSION_REPORT_INTERVAL_MS};
+use crate::node::session::{EndToEndState, SessionEntry};
+use crate::node::session_wire::{
+    FSP_COMMON_PREFIX_SIZE, FSP_FLAG_CP, FSP_FLAG_K, FSP_HEADER_SIZE, FSP_PHASE_ESTABLISHED,
+    FSP_PHASE_MSG1, FSP_PHASE_MSG2, FSP_PHASE_MSG3, FSP_PORT_HEADER_SIZE, FSP_PORT_IPV6_SHIM,
+    FspCommonPrefix, FspEncryptedHeader, build_fsp_header, fsp_prepend_inner_header,
+    fsp_strip_inner_header, parse_encrypted_coords,
+};
+use crate::node::{Node, NodeError};
+use crate::noise::{
+    HandshakeState, XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE, XK_HANDSHAKE_MSG3_SIZE,
+};
 use crate::protocol::{
     CoordsRequired, FspInnerFlags, MtuExceeded, PathBroken, PathMtuNotification, SessionAck,
     SessionDatagram, SessionMessageType, SessionMsg3, SessionReceiverReport, SessionSenderReport,
     SessionSetup,
 };
-use crate::NodeAddr;
+use crate::protocol::{coords_wire_size, encode_coords};
+use crate::upper::icmp::FIPS_OVERHEAD;
+use crate::{NodeAddr, PeerIdentity};
 use secp256k1::PublicKey;
 use tracing::{debug, info, trace};
 
@@ -48,7 +50,10 @@ impl Node {
         let prefix = match FspCommonPrefix::parse(payload) {
             Some(p) => p,
             None => {
-                debug!(len = payload.len(), "Session payload too short for FSP prefix");
+                debug!(
+                    len = payload.len(),
+                    "Session payload too short for FSP prefix"
+                );
                 return;
             }
         };
@@ -89,7 +94,8 @@ impl Node {
                 }
             }
             FSP_PHASE_ESTABLISHED => {
-                self.handle_encrypted_session_msg(src_addr, payload, path_mtu, ce_flag).await;
+                self.handle_encrypted_session_msg(src_addr, payload, path_mtu, ce_flag)
+                    .await;
             }
             _ => {
                 debug!(phase = prefix.phase, "Unknown FSP phase");
@@ -106,12 +112,21 @@ impl Node {
     /// 4. AEAD decrypt with AAD = header_bytes
     /// 5. Strip FSP inner header → timestamp, msg_type, inner_flags
     /// 6. Dispatch by msg_type
-    async fn handle_encrypted_session_msg(&mut self, src_addr: &NodeAddr, payload: &[u8], path_mtu: u16, ce_flag: bool) {
+    async fn handle_encrypted_session_msg(
+        &mut self,
+        src_addr: &NodeAddr,
+        payload: &[u8],
+        path_mtu: u16,
+        ce_flag: bool,
+    ) {
         // Parse the 12-byte encrypted header (includes the 4-byte prefix)
         let header = match FspEncryptedHeader::parse(payload) {
             Some(h) => h,
             None => {
-                debug!(len = payload.len(), "Encrypted session message too short for FSP header");
+                debug!(
+                    len = payload.len(),
+                    "Encrypted session message too short for FSP header"
+                );
                 return;
             }
         };
@@ -166,8 +181,8 @@ impl Node {
         let received_k_bit = header.flags & FSP_FLAG_K != 0;
         {
             let entry = self.sessions.get(src_addr).unwrap();
-            let k_bit_flipped = received_k_bit != entry.current_k_bit()
-                && entry.pending_new_session().is_some();
+            let k_bit_flipped =
+                received_k_bit != entry.current_k_bit() && entry.pending_new_session().is_some();
 
             if k_bit_flipped {
                 let display_name = self.peer_display_name(src_addr);
@@ -234,7 +249,8 @@ impl Node {
         self.sessions.insert(*src_addr, entry);
 
         // Strip FSP inner header (6 bytes)
-        let (timestamp, msg_type, inner_flags_byte, rest) = match fsp_strip_inner_header(&plaintext) {
+        let (timestamp, msg_type, inner_flags_byte, rest) = match fsp_strip_inner_header(&plaintext)
+        {
             Some(parts) => parts,
             None => {
                 debug!(src = %self.peer_display_name(src_addr), "Decrypted payload too short for FSP inner header");
@@ -247,16 +263,15 @@ impl Node {
             && let Some(mmp) = entry.mmp_mut()
         {
             let now = std::time::Instant::now();
-            mmp.receiver.record_recv(
-                header.counter, timestamp, plaintext.len(), ce_flag, now,
-            );
+            mmp.receiver
+                .record_recv(header.counter, timestamp, plaintext.len(), ce_flag, now);
             // Spin bit: advance state machine for correct TX reflection.
             // RTT samples not fed into SRTT — timestamp-echo provides
             // accurate RTT; spin bit includes variable inter-frame delays.
             let inner_flags = FspInnerFlags::from_byte(inner_flags_byte);
-            let _spin_rtt = mmp.spin_bit.rx_observe(
-                inner_flags.spin_bit, header.counter, now,
-            );
+            let _spin_rtt = mmp
+                .spin_bit
+                .rx_observe(inner_flags.spin_bit, header.counter, now);
         }
 
         // Feed path_mtu from datagram envelope to MMP path MTU tracking.
@@ -276,6 +291,7 @@ impl Node {
                     debug!(len = rest.len(), "DataPacket too short for port header");
                     return;
                 }
+                let src_port = u16::from_le_bytes([rest[0], rest[1]]);
                 let dst_port = u16::from_le_bytes([rest[2], rest[3]]);
                 let service_payload = &rest[FSP_PORT_HEADER_SIZE..];
 
@@ -283,9 +299,15 @@ impl Node {
                     FSP_PORT_IPV6_SHIM => {
                         use crate::FipsAddress;
                         let src_ipv6 = FipsAddress::from_node_addr(src_addr).to_ipv6().octets();
-                        let dst_ipv6 = FipsAddress::from_node_addr(self.node_addr()).to_ipv6().octets();
+                        let dst_ipv6 = FipsAddress::from_node_addr(self.node_addr())
+                            .to_ipv6()
+                            .octets();
 
-                        match crate::upper::ipv6_shim::decompress_ipv6(service_payload, src_ipv6, dst_ipv6) {
+                        match crate::upper::ipv6_shim::decompress_ipv6(
+                            service_payload,
+                            src_ipv6,
+                            dst_ipv6,
+                        ) {
                             Some(mut packet) => {
                                 if ce_flag {
                                     mark_ipv6_ecn_ce(&mut packet);
@@ -312,10 +334,11 @@ impl Node {
                         }
                     }
                     _ => {
-                        debug!(
-                            src = %self.peer_display_name(src_addr),
+                        self.deliver_app_datagram(
+                            src_addr,
+                            src_port,
                             dst_port,
-                            "Unknown FSP service port, dropping DataPacket"
+                            service_payload.to_vec(),
                         );
                     }
                 }
@@ -351,6 +374,7 @@ impl Node {
         // Flush any pending outbound packets (e.g., simultaneous initiation
         // where responder also had queued outbound packets)
         self.flush_pending_packets(src_addr).await;
+        self.flush_pending_app_packets(src_addr).await;
     }
 
     /// Handle an incoming SessionSetup (Noise XK msg1).
@@ -533,7 +557,13 @@ impl Node {
         let placeholder_pubkey = self.identity.keypair().public_key();
         let now_ms = Self::now_ms();
         let resend_interval = self.config.node.rate_limit.handshake_resend_interval_ms;
-        let mut entry = SessionEntry::new(*src_addr, placeholder_pubkey, EndToEndState::AwaitingMsg3(handshake), now_ms, false);
+        let mut entry = SessionEntry::new(
+            *src_addr,
+            placeholder_pubkey,
+            EndToEndState::AwaitingMsg3(handshake),
+            now_ms,
+            false,
+        );
         entry.set_handshake_payload(ack_payload, now_ms + resend_interval);
         self.sessions.insert(*src_addr, entry);
 
@@ -694,6 +724,7 @@ impl Node {
 
         // Flush any queued outbound packets for this destination
         self.flush_pending_packets(src_addr).await;
+        self.flush_pending_app_packets(src_addr).await;
 
         info!(src = %self.peer_display_name(src_addr), "Session established (initiator, XK)");
     }
@@ -809,7 +840,13 @@ impl Node {
 
         let now_ms = Self::now_ms();
         // Replace the placeholder pubkey with the real one
-        let mut new_entry = SessionEntry::new(*src_addr, remote_pubkey, EndToEndState::Established(session), now_ms, false);
+        let mut new_entry = SessionEntry::new(
+            *src_addr,
+            remote_pubkey,
+            EndToEndState::Established(session),
+            now_ms,
+            false,
+        );
         new_entry.set_coords_warmup_remaining(self.config.node.session.coords_warmup_packets);
         new_entry.mark_established(now_ms);
         new_entry.init_mmp(&self.config.node.session_mmp);
@@ -818,6 +855,7 @@ impl Node {
 
         // Flush any pending packets
         self.flush_pending_packets(src_addr).await;
+        self.flush_pending_app_packets(src_addr).await;
 
         info!(src = %self.peer_display_name(src_addr), "Session established (responder, XK)");
     }
@@ -878,7 +916,8 @@ impl Node {
         };
 
         let now = std::time::Instant::now();
-        mmp.metrics.process_receiver_report(&rr, our_timestamp_ms, now);
+        mmp.metrics
+            .process_receiver_report(&rr, our_timestamp_ms, now);
 
         // Feed SRTT back to sender/receiver report interval tuning (session-layer bounds)
         if let Some(srtt_ms) = mmp.metrics.srtt_ms() {
@@ -900,7 +939,8 @@ impl Node {
         // Update reverse delivery ratio from our own receiver state, using per-interval deltas.
         let our_recv_packets = mmp.receiver.cumulative_packets_recv();
         let peer_highest = mmp.receiver.highest_counter();
-        mmp.metrics.update_reverse_delivery(our_recv_packets, peer_highest);
+        mmp.metrics
+            .update_reverse_delivery(our_recv_packets, peer_highest);
 
         trace!(
             src = %peer_name,
@@ -975,7 +1015,10 @@ impl Node {
         );
 
         // Send standalone CoordsWarmup immediately (rate-limited)
-        if self.coords_response_rate_limiter.should_send(&msg.dest_addr) {
+        if self
+            .coords_response_rate_limiter
+            .should_send(&msg.dest_addr)
+        {
             if let Some(entry) = self.sessions.get(&msg.dest_addr)
                 && entry.is_established()
                 && let Err(e) = self.send_coords_warmup(&msg.dest_addr).await
@@ -1033,7 +1076,10 @@ impl Node {
         );
 
         // Send standalone CoordsWarmup immediately (rate-limited)
-        if self.coords_response_rate_limiter.should_send(&msg.dest_addr) {
+        if self
+            .coords_response_rate_limiter
+            .should_send(&msg.dest_addr)
+        {
             if let Some(entry) = self.sessions.get(&msg.dest_addr)
                 && entry.is_established()
                 && let Err(e) = self.send_coords_warmup(&msg.dest_addr).await
@@ -1139,16 +1185,17 @@ impl Node {
         let our_keypair = self.identity.keypair();
         let mut handshake = HandshakeState::new_xk_initiator(our_keypair, dest_pubkey);
         handshake.set_local_epoch(self.startup_epoch);
-        let msg1 = handshake.write_xk_message_1().map_err(|e| NodeError::SendFailed {
-            node_addr: dest_addr,
-            reason: format!("Noise XK msg1 generation failed: {}", e),
-        })?;
+        let msg1 = handshake
+            .write_xk_message_1()
+            .map_err(|e| NodeError::SendFailed {
+                node_addr: dest_addr,
+                reason: format!("Noise XK msg1 generation failed: {}", e),
+            })?;
 
         // Build SessionSetup with coordinates
         let our_coords = self.tree_state.my_coords().clone();
         let dest_coords = self.get_dest_coords(&dest_addr);
-        let setup = SessionSetup::new(our_coords, dest_coords)
-            .with_handshake(msg1);
+        let setup = SessionSetup::new(our_coords, dest_coords).with_handshake(msg1);
         let setup_payload = setup.encode();
 
         // Wrap in SessionDatagram
@@ -1165,7 +1212,13 @@ impl Node {
         // Store session entry with handshake payload for potential resend
         let now_ms = Self::now_ms();
         let resend_interval = self.config.node.rate_limit.handshake_resend_interval_ms;
-        let mut entry = SessionEntry::new(dest_addr, dest_pubkey, EndToEndState::Initiating(handshake), now_ms, true);
+        let mut entry = SessionEntry::new(
+            dest_addr,
+            dest_pubkey,
+            EndToEndState::Initiating(handshake),
+            now_ms,
+            true,
+        );
         entry.set_handshake_payload(setup_payload, now_ms + resend_interval);
         self.sessions.insert(dest_addr, entry);
 
@@ -1192,10 +1245,13 @@ impl Node {
         let now_ms = Self::now_ms();
 
         // First borrow: read session metadata (NLL releases before coord decision)
-        let entry = self.sessions.get(dest_addr).ok_or_else(|| NodeError::SendFailed {
-            node_addr: *dest_addr,
-            reason: "no session".into(),
-        })?;
+        let entry = self
+            .sessions
+            .get(dest_addr)
+            .ok_or_else(|| NodeError::SendFailed {
+                node_addr: *dest_addr,
+                reason: "no session".into(),
+            })?;
         let wants_coords = entry.coords_warmup_remaining() > 0;
         let timestamp = entry.session_timestamp(now_ms);
         let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
@@ -1215,7 +1271,8 @@ impl Node {
         // Build inner plaintext (doesn't depend on counter)
         let msg_type = SessionMessageType::DataPacket.to_byte(); // 0x10
         let inner_flags = FspInnerFlags { spin_bit }.to_byte();
-        let inner_plaintext = fsp_prepend_inner_header(timestamp, msg_type, inner_flags, &port_payload);
+        let inner_plaintext =
+            fsp_prepend_inner_header(timestamp, msg_type, inner_flags, &port_payload);
 
         // Determine whether coords fit within transport MTU.
         // If not, send standalone CoordsWarmup before the data packet.
@@ -1223,7 +1280,8 @@ impl Node {
             let src = self.tree_state.my_coords().clone();
             let dst = self.get_dest_coords(dest_addr);
             let coords_size = coords_wire_size(&src) + coords_wire_size(&dst);
-            let total_wire = FIPS_OVERHEAD as usize + FSP_PORT_HEADER_SIZE + coords_size + payload.len();
+            let total_wire =
+                FIPS_OVERHEAD as usize + FSP_PORT_HEADER_SIZE + coords_size + payload.len();
             if total_wire <= self.transport_mtu() as usize {
                 (true, Some(src), Some(dst))
             } else {
@@ -1239,9 +1297,7 @@ impl Node {
         };
 
         // Decrement warmup counter if we sent coords (piggybacked or standalone)
-        if wants_coords
-            && let Some(entry) = self.sessions.get_mut(dest_addr)
-        {
+        if wants_coords && let Some(entry) = self.sessions.get_mut(dest_addr) {
             entry.set_coords_warmup_remaining(entry.coords_warmup_remaining() - 1);
         }
 
@@ -1254,10 +1310,13 @@ impl Node {
         }
 
         // Borrow session for counter + encryption (after potential standalone send)
-        let entry = self.sessions.get_mut(dest_addr).ok_or_else(|| NodeError::SendFailed {
-            node_addr: *dest_addr,
-            reason: "no session".into(),
-        })?;
+        let entry = self
+            .sessions
+            .get_mut(dest_addr)
+            .ok_or_else(|| NodeError::SendFailed {
+                node_addr: *dest_addr,
+                reason: "no session".into(),
+            })?;
         let session = match entry.state_mut() {
             EndToEndState::Established(s) => s,
             _ => {
@@ -1274,12 +1333,12 @@ impl Node {
         let header = build_fsp_header(counter, flags, payload_len);
 
         // Encrypt with AAD binding to the FSP header
-        let ciphertext = session.encrypt_with_aad(&inner_plaintext, &header).map_err(|e| {
-            NodeError::SendFailed {
+        let ciphertext = session
+            .encrypt_with_aad(&inner_plaintext, &header)
+            .map_err(|e| NodeError::SendFailed {
                 node_addr: *dest_addr,
                 reason: format!("session encrypt failed: {}", e),
-            }
-        })?;
+            })?;
 
         // Assemble: header(12) + [coords] + ciphertext
         let mut fsp_payload = Vec::with_capacity(FSP_HEADER_SIZE + ciphertext.len() + 200);
@@ -1308,6 +1367,69 @@ impl Node {
         Ok(())
     }
 
+    /// Send application data over an end-to-end session, establishing one if needed.
+    pub async fn send_app_data_to_npub(
+        &mut self,
+        peer_npub: &str,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Result<(), NodeError> {
+        let peer_identity =
+            PeerIdentity::from_npub(peer_npub).map_err(|e| NodeError::InvalidPeerNpub {
+                npub: peer_npub.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        self.send_app_data(
+            *peer_identity.node_addr(),
+            peer_identity.pubkey_full(),
+            src_port,
+            dst_port,
+            payload,
+        )
+        .await
+    }
+
+    /// Send application data to a known peer node address.
+    pub async fn send_app_data(
+        &mut self,
+        dest_addr: NodeAddr,
+        dest_pubkey: PublicKey,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Result<(), NodeError> {
+        if dst_port == FSP_PORT_IPV6_SHIM {
+            return Err(NodeError::AppPortReserved(dst_port));
+        }
+
+        if let Some(entry) = self.sessions.get(&dest_addr) {
+            if entry.is_established() {
+                return self
+                    .send_session_data(&dest_addr, src_port, dst_port, payload)
+                    .await;
+            }
+
+            self.queue_pending_app_packet(dest_addr, src_port, dst_port, payload.to_vec());
+            return Ok(());
+        }
+
+        if let Err(e) = self.initiate_session(dest_addr, dest_pubkey).await {
+            debug!(
+                dest = %self.peer_display_name(&dest_addr),
+                error = %e,
+                "Failed to initiate app session, trying discovery"
+            );
+            self.maybe_initiate_lookup(&dest_addr).await;
+            self.queue_pending_app_packet(dest_addr, src_port, dst_port, payload.to_vec());
+            return Ok(());
+        }
+
+        self.queue_pending_app_packet(dest_addr, src_port, dst_port, payload.to_vec());
+        Ok(())
+    }
+
     /// Send an IPv6 packet through the IPv6 shim (port 256) with header compression.
     ///
     /// Compresses the IPv6 header (format 0x00), then sends via `send_session_data`
@@ -1317,13 +1439,19 @@ impl Node {
         dest_addr: &NodeAddr,
         ipv6_packet: &[u8],
     ) -> Result<(), NodeError> {
-        let compressed = crate::upper::ipv6_shim::compress_ipv6(ipv6_packet)
-            .ok_or_else(|| NodeError::SendFailed {
+        let compressed = crate::upper::ipv6_shim::compress_ipv6(ipv6_packet).ok_or_else(|| {
+            NodeError::SendFailed {
                 node_addr: *dest_addr,
                 reason: "IPv6 header compression failed".into(),
-            })?;
-        self.send_session_data(dest_addr, FSP_PORT_IPV6_SHIM, FSP_PORT_IPV6_SHIM, &compressed)
-            .await
+            }
+        })?;
+        self.send_session_data(
+            dest_addr,
+            FSP_PORT_IPV6_SHIM,
+            FSP_PORT_IPV6_SHIM,
+            &compressed,
+        )
+        .await
     }
 
     /// Send a non-data session message (reports, notifications) over an established session.
@@ -1342,10 +1470,13 @@ impl Node {
         let now_ms = Self::now_ms();
 
         // Read spin bit and session timestamp from entry
-        let entry = self.sessions.get(dest_addr).ok_or_else(|| NodeError::SendFailed {
-            node_addr: *dest_addr,
-            reason: "no session".into(),
-        })?;
+        let entry = self
+            .sessions
+            .get(dest_addr)
+            .ok_or_else(|| NodeError::SendFailed {
+                node_addr: *dest_addr,
+                reason: "no session".into(),
+            })?;
         let timestamp = entry.session_timestamp(now_ms);
         let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
 
@@ -1353,10 +1484,13 @@ impl Node {
         let inner_flags = FspInnerFlags { spin_bit }.to_byte();
 
         // Get mutable access for encryption
-        let entry = self.sessions.get_mut(dest_addr).ok_or_else(|| NodeError::SendFailed {
-            node_addr: *dest_addr,
-            reason: "no session".into(),
-        })?;
+        let entry = self
+            .sessions
+            .get_mut(dest_addr)
+            .ok_or_else(|| NodeError::SendFailed {
+                node_addr: *dest_addr,
+                reason: "no session".into(),
+            })?;
 
         // Read K-bit before mutable borrow of session state
         let k_flags = if entry.current_k_bit() { FSP_FLAG_K } else { 0 };
@@ -1381,12 +1515,12 @@ impl Node {
         let header = build_fsp_header(counter, k_flags, payload_len);
 
         // Encrypt with AAD
-        let ciphertext = session.encrypt_with_aad(&inner_plaintext, &header).map_err(|e| {
-            NodeError::SendFailed {
+        let ciphertext = session
+            .encrypt_with_aad(&inner_plaintext, &header)
+            .map_err(|e| NodeError::SendFailed {
                 node_addr: *dest_addr,
                 reason: format!("session encrypt failed: {}", e),
-            }
-        })?;
+            })?;
 
         // Assemble: header(12) + ciphertext (no coords)
         let mut fsp_payload = Vec::with_capacity(FSP_HEADER_SIZE + ciphertext.len());
@@ -1416,28 +1550,31 @@ impl Node {
     /// coordinates via `try_warm_coord_cache()` (same as CP-flagged data
     /// packets). The encrypted inner payload is the 6-byte inner header
     /// with no application data.
-    async fn send_coords_warmup(
-        &mut self,
-        dest_addr: &NodeAddr,
-    ) -> Result<(), NodeError> {
+    async fn send_coords_warmup(&mut self, dest_addr: &NodeAddr) -> Result<(), NodeError> {
         let now_ms = Self::now_ms();
 
         let my_coords = self.tree_state.my_coords().clone();
         let dest_coords = self.get_dest_coords(dest_addr);
 
         // Read session metadata
-        let entry = self.sessions.get(dest_addr).ok_or_else(|| NodeError::SendFailed {
-            node_addr: *dest_addr,
-            reason: "no session".into(),
-        })?;
+        let entry = self
+            .sessions
+            .get(dest_addr)
+            .ok_or_else(|| NodeError::SendFailed {
+                node_addr: *dest_addr,
+                reason: "no session".into(),
+            })?;
         let timestamp = entry.session_timestamp(now_ms);
         let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
 
         // Get mutable access for encryption
-        let entry = self.sessions.get_mut(dest_addr).ok_or_else(|| NodeError::SendFailed {
-            node_addr: *dest_addr,
-            reason: "no session".into(),
-        })?;
+        let entry = self
+            .sessions
+            .get_mut(dest_addr)
+            .ok_or_else(|| NodeError::SendFailed {
+                node_addr: *dest_addr,
+                reason: "no session".into(),
+            })?;
         let session = match entry.state_mut() {
             EndToEndState::Established(s) => s,
             _ => {
@@ -1460,12 +1597,12 @@ impl Node {
         let header = build_fsp_header(counter, FSP_FLAG_CP, payload_len);
 
         // Encrypt with AAD
-        let ciphertext = session.encrypt_with_aad(&inner_plaintext, &header).map_err(|e| {
-            NodeError::SendFailed {
+        let ciphertext = session
+            .encrypt_with_aad(&inner_plaintext, &header)
+            .map_err(|e| NodeError::SendFailed {
                 node_addr: *dest_addr,
                 reason: format!("session encrypt failed: {}", e),
-            }
-        })?;
+            })?;
 
         // Assemble: header(12) + coords + ciphertext
         let coords_size = coords_wire_size(&my_coords) + coords_wire_size(&dest_coords);
@@ -1532,7 +1669,8 @@ impl Node {
         }
 
         let encoded = datagram.encode();
-        self.send_encrypted_link_message(&next_hop_addr, &encoded).await?;
+        self.send_encrypted_link_message(&next_hop_addr, &encoded)
+            .await?;
         self.stats_mut().forwarding.record_originated(encoded.len());
         Ok(())
     }
@@ -1639,19 +1777,20 @@ impl Node {
 
     /// Send ICMPv6 Destination Unreachable back through TUN.
     pub(in crate::node) fn send_icmpv6_dest_unreachable(&self, original_packet: &[u8]) {
-        use crate::upper::icmp::{build_dest_unreachable, should_send_icmp_error, DestUnreachableCode};
         use crate::FipsAddress;
+        use crate::upper::icmp::{
+            DestUnreachableCode, build_dest_unreachable, should_send_icmp_error,
+        };
 
         if !should_send_icmp_error(original_packet) {
             return;
         }
 
         let our_ipv6 = FipsAddress::from_node_addr(self.node_addr()).to_ipv6();
-        if let Some(response) = build_dest_unreachable(
-            original_packet,
-            DestUnreachableCode::NoRoute,
-            our_ipv6,
-        ) && let Some(tun_tx) = &self.tun_tx {
+        if let Some(response) =
+            build_dest_unreachable(original_packet, DestUnreachableCode::NoRoute, our_ipv6)
+            && let Some(tun_tx) = &self.tun_tx
+        {
             let _ = tun_tx.send(response);
         }
     }
@@ -1708,10 +1847,7 @@ impl Node {
             return;
         }
 
-        let queue = self
-            .pending_tun_packets
-            .entry(dest_addr)
-            .or_default();
+        let queue = self.pending_tun_packets.entry(dest_addr).or_default();
         if queue.len() >= self.config.node.session.pending_packets_per_dest {
             queue.pop_front(); // Drop oldest
         }
@@ -1729,6 +1865,91 @@ impl Node {
                 debug!(dest = %self.peer_display_name(dest_addr), error = %e, "Failed to send queued TUN packet");
                 break;
             }
+        }
+    }
+
+    /// Queue an application datagram while waiting for session establishment.
+    fn queue_pending_app_packet(
+        &mut self,
+        dest_addr: NodeAddr,
+        src_port: u16,
+        dst_port: u16,
+        payload: Vec<u8>,
+    ) {
+        let max_dests = self.config.node.session.pending_max_destinations;
+        if !self.pending_app_packets.contains_key(&dest_addr)
+            && self.pending_app_packets.len() >= max_dests
+        {
+            return;
+        }
+
+        let queue = self.pending_app_packets.entry(dest_addr).or_default();
+        if queue.len() >= self.config.node.session.pending_packets_per_dest {
+            queue.pop_front();
+        }
+        queue.push_back(crate::app::PendingAppPacket::new(
+            src_port, dst_port, payload,
+        ));
+    }
+
+    /// Flush pending application datagrams for a destination whose session just became established.
+    async fn flush_pending_app_packets(&mut self, dest_addr: &NodeAddr) {
+        let packets = match self.pending_app_packets.remove(dest_addr) {
+            Some(q) => q,
+            None => return,
+        };
+
+        for packet in packets {
+            if let Err(e) = self
+                .send_session_data(dest_addr, packet.src_port, packet.dst_port, &packet.payload)
+                .await
+            {
+                debug!(
+                    dest = %self.peer_display_name(dest_addr),
+                    error = %e,
+                    "Failed to send queued app packet"
+                );
+                break;
+            }
+        }
+    }
+
+    fn deliver_app_datagram(
+        &mut self,
+        src_addr: &NodeAddr,
+        src_port: u16,
+        dst_port: u16,
+        payload: Vec<u8>,
+    ) {
+        let sender = match self.app_ports.get(&dst_port) {
+            Some(sender) => sender.clone(),
+            None => {
+                debug!(
+                    src = %self.peer_display_name(src_addr),
+                    dst_port,
+                    "Unknown FSP service port, dropping DataPacket"
+                );
+                return;
+            }
+        };
+
+        let peer_npub = if let Some(entry) = self.sessions.get(src_addr) {
+            let (xonly, _) = entry.remote_pubkey().x_only_public_key();
+            PeerIdentity::from_pubkey(xonly).npub()
+        } else {
+            self.peer_display_name(src_addr)
+        };
+
+        let datagram =
+            crate::app::AppDatagram::new(peer_npub, *src_addr, src_port, dst_port, payload);
+
+        if let Err(e) = sender.send(datagram) {
+            debug!(
+                src = %self.peer_display_name(src_addr),
+                dst_port,
+                error = %e,
+                "Failed to deliver DataPacket to app port"
+            );
         }
     }
 

@@ -23,34 +23,48 @@ pub struct UdpRawSocket {
 }
 
 impl UdpRawSocket {
-    /// Create, bind, and configure a UDP socket.
-    ///
-    /// Enables `SO_RXQ_OVFL` for kernel drop counting (non-fatal if
-    /// unsupported). Sets non-blocking mode for async integration.
-    pub fn open(
-        bind_addr: SocketAddr,
+    fn configure_socket(
+        sock: &Socket,
         recv_buf_size: usize,
         send_buf_size: usize,
-    ) -> Result<Self, TransportError> {
-        let domain = if bind_addr.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-        let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-            .map_err(|e| TransportError::StartFailed(format!("socket create failed: {}", e)))?;
-
+    ) -> Result<(), TransportError> {
         sock.set_nonblocking(true)
             .map_err(|e| TransportError::StartFailed(format!("set nonblocking failed: {}", e)))?;
 
-        sock.bind(&bind_addr.into())
-            .map_err(|e| TransportError::StartFailed(format!("bind failed: {}", e)))?;
-
-        // Set socket buffer sizes
         sock.set_recv_buffer_size(recv_buf_size)
             .map_err(|e| TransportError::StartFailed(format!("set recv buffer: {}", e)))?;
         sock.set_send_buffer_size(send_buf_size)
             .map_err(|e| TransportError::StartFailed(format!("set send buffer: {}", e)))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let enable: libc::c_int = 1;
+            let ret = unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RXQ_OVFL,
+                    &enable as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if ret < 0 {
+                warn!(
+                    "setsockopt(SO_RXQ_OVFL) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn from_socket(
+        sock: Socket,
+        recv_buf_size: usize,
+        send_buf_size: usize,
+    ) -> Result<Self, TransportError> {
+        Self::configure_socket(&sock, recv_buf_size, send_buf_size)?;
 
         let actual_recv = sock
             .recv_buffer_size()
@@ -74,28 +88,6 @@ impl UdpRawSocket {
             );
         }
 
-        // Enable SO_RXQ_OVFL for kernel drop counter in recvmsg ancillary data.
-        // Non-fatal: older kernels or non-Linux platforms may not support it.
-        #[cfg(target_os = "linux")]
-        {
-            let enable: libc::c_int = 1;
-            let ret = unsafe {
-                libc::setsockopt(
-                    sock.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_RXQ_OVFL,
-                    &enable as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            };
-            if ret < 0 {
-                warn!(
-                    "setsockopt(SO_RXQ_OVFL) failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-
         let local_addr = sock
             .local_addr()
             .map_err(|e| TransportError::StartFailed(format!("get local addr: {}", e)))?
@@ -108,6 +100,41 @@ impl UdpRawSocket {
             inner: sock,
             local_addr,
         })
+    }
+
+    /// Create, bind, and configure a UDP socket.
+    ///
+    /// Enables `SO_RXQ_OVFL` for kernel drop counting (non-fatal if
+    /// unsupported). Sets non-blocking mode for async integration.
+    pub fn open(
+        bind_addr: SocketAddr,
+        recv_buf_size: usize,
+        send_buf_size: usize,
+    ) -> Result<Self, TransportError> {
+        let domain = if bind_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+            .map_err(|e| TransportError::StartFailed(format!("socket create failed: {}", e)))?;
+
+        sock.bind(&bind_addr.into())
+            .map_err(|e| TransportError::StartFailed(format!("bind failed: {}", e)))?;
+        Self::from_socket(sock, recv_buf_size, send_buf_size)
+    }
+
+    /// Adopt an existing bound UDP socket.
+    ///
+    /// This is used when another subsystem has already created and primed
+    /// the socket, such as a NAT traversal runtime that must preserve the
+    /// exact UDP mapping used during STUN and hole punching.
+    pub fn adopt(
+        socket: std::net::UdpSocket,
+        recv_buf_size: usize,
+        send_buf_size: usize,
+    ) -> Result<Self, TransportError> {
+        Self::from_socket(Socket::from(socket), recv_buf_size, send_buf_size)
     }
 
     /// Get the local bound address.
@@ -178,8 +205,7 @@ impl UdpRawSocket {
         unsafe {
             let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
             while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_SOCKET
-                    && (*cmsg).cmsg_type == libc::SO_RXQ_OVFL
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SO_RXQ_OVFL
                 {
                     let data = libc::CMSG_DATA(cmsg);
                     drops = std::ptr::read_unaligned(data as *const u32);
@@ -218,11 +244,7 @@ pub struct AsyncUdpSocket {
 
 impl AsyncUdpSocket {
     /// Send a payload to a destination address.
-    pub async fn send_to(
-        &self,
-        data: &[u8],
-        dest: &SocketAddr,
-    ) -> Result<usize, TransportError> {
+    pub async fn send_to(&self, data: &[u8], dest: &SocketAddr) -> Result<usize, TransportError> {
         loop {
             let mut guard = self
                 .inner
@@ -262,9 +284,7 @@ impl AsyncUdpSocket {
 }
 
 /// Convert a `libc::sockaddr_storage` to `std::net::SocketAddr`.
-fn sockaddr_to_socket_addr(
-    storage: &libc::sockaddr_storage,
-) -> std::io::Result<SocketAddr> {
+fn sockaddr_to_socket_addr(storage: &libc::sockaddr_storage) -> std::io::Result<SocketAddr> {
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
             let addr: &libc::sockaddr_in =

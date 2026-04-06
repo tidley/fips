@@ -8,10 +8,10 @@ use super::{
 };
 mod socket;
 mod stats;
-use socket::{AsyncUdpSocket, UdpRawSocket};
-use stats::UdpStats;
 use super::resolve_socket_addr;
 use crate::config::UdpConfig;
+use socket::{AsyncUdpSocket, UdpRawSocket};
+use stats::UdpStats;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -125,7 +125,11 @@ impl UdpTransport {
     /// Query transport-local congestion indicators.
     pub fn congestion(&self) -> super::TransportCongestion {
         super::TransportCongestion {
-            recv_drops: Some(self.stats.kernel_drops.load(std::sync::atomic::Ordering::Relaxed)),
+            recv_drops: Some(
+                self.stats
+                    .kernel_drops
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         }
     }
 
@@ -188,6 +192,65 @@ impl UdpTransport {
                 recv_buf = actual_recv,
                 send_buf = actual_send,
                 "UDP transport started"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Start the transport using an already-bound UDP socket.
+    ///
+    /// This preserves an existing NAT mapping established by another
+    /// subsystem, such as STUN or UDP hole punching.
+    pub async fn adopt_socket_async(
+        &mut self,
+        socket: std::net::UdpSocket,
+    ) -> Result<(), TransportError> {
+        if !self.state.can_start() {
+            return Err(TransportError::AlreadyStarted);
+        }
+
+        self.state = TransportState::Starting;
+
+        let raw_socket = UdpRawSocket::adopt(
+            socket,
+            self.config.recv_buf_size(),
+            self.config.send_buf_size(),
+        )?;
+
+        let actual_recv = raw_socket.recv_buffer_size()?;
+        let actual_send = raw_socket.send_buffer_size()?;
+        self.local_addr = Some(raw_socket.local_addr());
+
+        let async_socket = raw_socket.into_async()?;
+        self.socket = Some(async_socket.clone());
+
+        let transport_id = self.transport_id;
+        let packet_tx = self.packet_tx.clone();
+        let mtu = self.config.mtu();
+        let stats = self.stats.clone();
+
+        let recv_task = tokio::spawn(async move {
+            udp_receive_loop(async_socket, transport_id, packet_tx, mtu, stats).await;
+        });
+
+        self.recv_task = Some(recv_task);
+        self.state = TransportState::Up;
+
+        if let Some(ref name) = self.name {
+            info!(
+                name = %name,
+                local_addr = %self.local_addr.unwrap(),
+                recv_buf = actual_recv,
+                send_buf = actual_send,
+                "UDP transport adopted existing socket"
+            );
+        } else {
+            info!(
+                local_addr = %self.local_addr.unwrap(),
+                recv_buf = actual_recv,
+                send_buf = actual_send,
+                "UDP transport adopted existing socket"
             );
         }
 
@@ -367,7 +430,7 @@ async fn udp_receive_loop(
 mod tests {
     use super::*;
     use crate::transport::packet_channel;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn make_config(port: u16) -> UdpConfig {
         UdpConfig {
@@ -444,7 +507,10 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(packet.data, data);
-        assert_eq!(packet.remote_addr.as_str(), Some(addr1.to_string().as_str()));
+        assert_eq!(
+            packet.remote_addr.as_str(),
+            Some(addr1.to_string().as_str())
+        );
 
         t1.stop_async().await.unwrap();
         t2.stop_async().await.unwrap();
@@ -615,7 +681,10 @@ mod tests {
         // Send using IP string address
         let data = b"hello via ip string";
         let bytes_sent = t1
-            .send_async(&TransportAddr::from_string(&format!("127.0.0.1:{}", port2)), data)
+            .send_async(
+                &TransportAddr::from_string(&format!("127.0.0.1:{}", port2)),
+                data,
+            )
             .await
             .unwrap();
         assert_eq!(bytes_sent, data.len());

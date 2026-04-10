@@ -4,6 +4,7 @@
 //! connecting over arbitrary transports.
 
 pub mod bloom;
+pub mod bootstrap;
 pub mod cache;
 pub mod config;
 pub mod control;
@@ -30,6 +31,9 @@ pub use identity::{
 // Re-export config types
 pub use config::{Config, ConfigError, IdentityConfig, TorConfig, UdpConfig};
 pub use upper::config::{DnsConfig, TunConfig};
+
+// Re-export bootstrap types
+pub use bootstrap::{BootstrapHandoffResult, EstablishedTraversal};
 
 // Re-export tree types
 pub use tree::{CoordEntry, ParentDeclaration, TreeCoordinate, TreeError, TreeState};

@@ -10,6 +10,25 @@ node:
     #
     # Or set an explicit key (overrides persistent):
     # nsec: "nsec1..."
+  discovery:
+    # Optional Nostr/STUN NAT traversal bootstrap.
+    # Requires a build of fips compiled with the 'nostr-bootstrap' feature.
+    # nostr:
+    #   enabled: true
+    #   app: "fips.nat.traversal.v1"
+    #   advertise: true
+    #   advert_relays:
+    #     - "wss://offchain.pub"
+    #   dm_relays:
+    #     - "wss://nip17.com"
+    #   # Optional override. If omitted, FIPS uses the built-in STUN list.
+    #   # Built-in relay/STUN defaults are best-effort and should be
+    #   # overridden by operators for production use.
+    #   stun_servers:
+    #     - "stun:fips.tomdwyer.uk:3478"
+    #     - "stun:stun.l.google.com:19302"
+    #     - "stun:global.stun.twilio.com:3478"
+    #     - "stun:openrelay.metered.ca:80"
 
 tun:
   enabled: true
@@ -74,4 +93,6 @@ peers: []
   #   addresses:
   #     - transport: udp
   #       addr: "217.77.8.91:2121"  # IP or hostname (e.g., "peer.example.com:2121")
+  #     - transport: udp
+  #       addr: "nat"  # Use node.discovery.nostr for Nostr/STUN hole punching
   #   connect_policy: auto_connect

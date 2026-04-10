@@ -1,5 +1,7 @@
 use super::*;
 use crate::peer::PromotionResult;
+use crate::transport::udp::UdpTransport;
+use crate::transport::{TransportHandle, packet_channel};
 
 #[test]
 fn test_node_creation() {
@@ -30,6 +32,51 @@ fn test_node_leaf_only() {
 
     assert!(node.is_leaf_only());
     assert!(node.bloom_state().is_leaf_only());
+}
+
+#[tokio::test]
+async fn test_nat_bootstrap_failure_falls_back_to_direct_udp_address() {
+    let peer_identity = Identity::generate();
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.packet_tx = Some(packet_tx.clone());
+    node.packet_rx = Some(packet_rx);
+
+    let transport_id = TransportId::new(1);
+    let mut udp = UdpTransport::new(
+        transport_id,
+        Some("main".to_string()),
+        crate::config::UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        },
+        packet_tx,
+    );
+    udp.start_async().await.unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(udp));
+
+    let peer_config = crate::config::PeerConfig {
+        npub: peer_identity.npub(),
+        alias: None,
+        addresses: vec![
+            crate::config::PeerAddress::with_priority("udp", "nat", 1),
+            crate::config::PeerAddress::with_priority("udp", "127.0.0.1:9", 2),
+        ],
+        connect_policy: crate::config::ConnectPolicy::AutoConnect,
+        auto_reconnect: true,
+    };
+    let peer_identity = PeerIdentity::from_npub(&peer_config.npub).unwrap();
+
+    node.try_peer_addresses(&peer_config, peer_identity, false)
+        .await
+        .unwrap();
+
+    assert_eq!(node.connection_count(), 1);
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
 }
 
 #[tokio::test]

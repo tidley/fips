@@ -13,6 +13,7 @@ default = ["tui", "ble"]
 tui = ["dep:ratatui"]
 ble = ["dep:bluer"]
 gateway = ["dep:rustables"]
+nostr-bootstrap = ["dep:nostr", "dep:nostr-sdk"]
 
 [dependencies]
 ratatui = { version = "0.30", optional = true }
@@ -47,6 +48,8 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.20.0"
 bluer = { version = "0.17", features = ["bluetoothd", "l2cap"], optional = true }
+nostr = { version = "0.39", features = ["std", "nip59"], optional = true }
+nostr-sdk = { version = "0.39", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"

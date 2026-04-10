@@ -219,6 +219,9 @@ pub struct DiscoveryConfig {
     /// 1 = no retry, 2 = one retry, etc.
     #[serde(default = "DiscoveryConfig::default_max_attempts")]
     pub max_attempts: u8,
+    /// Nostr-based NAT traversal bootstrap.
+    #[serde(default = "DiscoveryConfig::default_nostr")]
+    pub nostr: NostrBootstrapConfig,
 }
 
 impl Default for DiscoveryConfig {
@@ -232,6 +235,7 @@ impl Default for DiscoveryConfig {
             forward_min_interval_secs: 2,
             retry_interval_secs: 5,
             max_attempts: 2,
+            nostr: NostrBootstrapConfig::default(),
         }
     }
 }
@@ -260,6 +264,145 @@ impl DiscoveryConfig {
     }
     fn default_max_attempts() -> u8 {
         2
+    }
+    fn default_nostr() -> NostrBootstrapConfig {
+        NostrBootstrapConfig::default()
+    }
+}
+
+/// Nostr-based NAT traversal bootstrap (`node.discovery.nostr.*`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NostrBootstrapConfig {
+    /// Enable Nostr-signaled traversal bootstrap.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Publish service advertisements so remote peers can bootstrap inbound.
+    #[serde(default = "NostrBootstrapConfig::default_advertise")]
+    pub advertise: bool,
+    /// Relay URLs used for service advertisements.
+    #[serde(default = "NostrBootstrapConfig::default_advert_relays")]
+    pub advert_relays: Vec<String>,
+    /// Relay URLs used for encrypted signaling events.
+    #[serde(default = "NostrBootstrapConfig::default_dm_relays")]
+    pub dm_relays: Vec<String>,
+    /// STUN servers used for local reflexive address discovery.
+    /// Outbound observation uses only this local list; peer-advertised STUN
+    /// values are informational and are not treated as egress targets.
+    #[serde(default = "NostrBootstrapConfig::default_stun_servers")]
+    pub stun_servers: Vec<String>,
+    /// Traversal application namespace and advert identifier suffix.
+    #[serde(default = "NostrBootstrapConfig::default_app")]
+    pub app: String,
+    /// Signaling TTL in seconds.
+    #[serde(default = "NostrBootstrapConfig::default_signal_ttl_secs")]
+    pub signal_ttl_secs: u64,
+    /// Overall punch attempt timeout in seconds.
+    #[serde(default = "NostrBootstrapConfig::default_attempt_timeout_secs")]
+    pub attempt_timeout_secs: u64,
+    /// Replay tracking retention window in seconds.
+    #[serde(default = "NostrBootstrapConfig::default_replay_window_secs")]
+    pub replay_window_secs: u64,
+    /// Delay before punch traffic starts.
+    #[serde(default = "NostrBootstrapConfig::default_punch_start_delay_ms")]
+    pub punch_start_delay_ms: u64,
+    /// Interval between punch packets.
+    #[serde(default = "NostrBootstrapConfig::default_punch_interval_ms")]
+    pub punch_interval_ms: u64,
+    /// How long to keep punching before failure.
+    #[serde(default = "NostrBootstrapConfig::default_punch_duration_ms")]
+    pub punch_duration_ms: u64,
+    /// Advert TTL in seconds.
+    #[serde(default = "NostrBootstrapConfig::default_advert_ttl_secs")]
+    pub advert_ttl_secs: u64,
+    /// How often adverts are refreshed in seconds.
+    #[serde(default = "NostrBootstrapConfig::default_advert_refresh_secs")]
+    pub advert_refresh_secs: u64,
+}
+
+impl Default for NostrBootstrapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            advertise: Self::default_advertise(),
+            advert_relays: Self::default_advert_relays(),
+            dm_relays: Self::default_dm_relays(),
+            stun_servers: Self::default_stun_servers(),
+            app: Self::default_app(),
+            signal_ttl_secs: Self::default_signal_ttl_secs(),
+            attempt_timeout_secs: Self::default_attempt_timeout_secs(),
+            replay_window_secs: Self::default_replay_window_secs(),
+            punch_start_delay_ms: Self::default_punch_start_delay_ms(),
+            punch_interval_ms: Self::default_punch_interval_ms(),
+            punch_duration_ms: Self::default_punch_duration_ms(),
+            advert_ttl_secs: Self::default_advert_ttl_secs(),
+            advert_refresh_secs: Self::default_advert_refresh_secs(),
+        }
+    }
+}
+
+impl NostrBootstrapConfig {
+    fn default_advertise() -> bool {
+        true
+    }
+
+    fn default_advert_relays() -> Vec<String> {
+        vec![
+            "wss://offchain.pub".to_string(),
+            "wss://strfry.bitsbytom.com".to_string(),
+        ]
+    }
+
+    fn default_dm_relays() -> Vec<String> {
+        vec![
+            "wss://nip17.com".to_string(),
+            "wss://offchain.pub".to_string(),
+        ]
+    }
+
+    fn default_stun_servers() -> Vec<String> {
+        vec![
+            "stun:fips.tomdwyer.uk:3478".to_string(),
+            "stun:stun.l.google.com:19302".to_string(),
+            "stun:global.stun.twilio.com:3478".to_string(),
+            "stun:openrelay.metered.ca:80".to_string(),
+        ]
+    }
+
+    fn default_app() -> String {
+        "fips.nat.traversal.v1".to_string()
+    }
+
+    fn default_signal_ttl_secs() -> u64 {
+        120
+    }
+
+    fn default_attempt_timeout_secs() -> u64 {
+        10
+    }
+
+    fn default_replay_window_secs() -> u64 {
+        300
+    }
+
+    fn default_punch_start_delay_ms() -> u64 {
+        2_000
+    }
+
+    fn default_punch_interval_ms() -> u64 {
+        200
+    }
+
+    fn default_punch_duration_ms() -> u64 {
+        10_000
+    }
+
+    fn default_advert_ttl_secs() -> u64 {
+        600
+    }
+
+    fn default_advert_refresh_secs() -> u64 {
+        300
     }
 }
 

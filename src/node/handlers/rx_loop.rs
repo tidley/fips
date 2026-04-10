@@ -112,12 +112,10 @@ impl Node {
                 }
                 _ = tick.tick() => {
                     self.check_timeouts();
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                    let now_ms = Self::now_ms();
                     self.reload_peer_acl();
                     self.poll_pending_connects().await;
+                    self.poll_nostr_bootstrap().await;
                     self.resend_pending_handshakes(now_ms).await;
                     self.resend_pending_rekeys(now_ms).await;
                     self.resend_pending_session_handshakes(now_ms).await;

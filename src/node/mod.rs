@@ -47,8 +47,10 @@ use crate::upper::tun::{TunError, TunOutboundRx, TunState, TunTx};
 use crate::utils::index::IndexAllocator;
 use crate::{Config, ConfigError, Identity, IdentityError, NodeAddr, PeerIdentity};
 use rand::Rng;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+#[cfg(target_os = "macos")]
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use thiserror::Error;
@@ -137,6 +139,9 @@ pub enum NodeError {
 
     #[error("transport error: {0}")]
     TransportError(String),
+
+    #[error("bootstrap handoff failed: {0}")]
+    BootstrapHandoff(String),
 }
 
 /// Node operational state.
@@ -339,7 +344,6 @@ pub struct Node {
     /// Packets queued while waiting for session establishment.
     /// Keyed by destination NodeAddr, bounded per-dest and total.
     pending_tun_packets: HashMap<NodeAddr, VecDeque<Vec<u8>>>,
-
     // === Pending Discovery Lookups ===
     /// Tracks in-flight discovery lookups. Maps target NodeAddr to the
     /// initiation timestamp (Unix ms). Prevents duplicate flood queries.
@@ -379,10 +383,9 @@ pub struct Node {
     tun_reader_handle: Option<JoinHandle<()>>,
     /// TUN writer thread handle.
     tun_writer_handle: Option<JoinHandle<()>>,
-    /// Shutdown pipe: writing to this fd unblocks the TUN reader thread on macOS.
-    /// On Linux, deleting the interface via netlink serves the same purpose.
+    /// macOS-only shutdown pipe write-end for the TUN reader thread.
     #[cfg(target_os = "macos")]
-    tun_shutdown_fd: Option<std::os::unix::io::RawFd>,
+    tun_reader_shutdown_fd: Option<RawFd>,
 
     // === DNS Responder ===
     /// Receiver for resolved identities from the DNS responder.
@@ -427,6 +430,12 @@ pub struct Node {
     /// or fails, and removed on successful promotion or when max retries
     /// are exhausted.
     retry_pending: HashMap<NodeAddr, retry::RetryState>,
+
+    /// Optional Nostr/STUN bootstrap coordinator for `udp:nat` peers.
+    #[cfg(feature = "nostr-bootstrap")]
+    nostr_bootstrap: Option<Arc<crate::bootstrap::nostr::NostrBootstrap>>,
+    /// Per-peer UDP transports adopted from NAT traversal handoff.
+    bootstrap_transports: HashSet<TransportId>,
 
     // === Periodic Parent Re-evaluation ===
     /// Timestamp of last periodic parent re-evaluation (for pacing).
@@ -569,7 +578,7 @@ impl Node {
             tun_reader_handle: None,
             tun_writer_handle: None,
             #[cfg(target_os = "macos")]
-            tun_shutdown_fd: None,
+            tun_reader_shutdown_fd: None,
             dns_identity_rx: None,
             dns_task: None,
             index_allocator: IndexAllocator::new(),
@@ -587,6 +596,9 @@ impl Node {
             ),
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
+            #[cfg(feature = "nostr-bootstrap")]
+            nostr_bootstrap: None,
+            bootstrap_transports: HashSet::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
             estimated_mesh_size: None,
@@ -692,7 +704,7 @@ impl Node {
             tun_reader_handle: None,
             tun_writer_handle: None,
             #[cfg(target_os = "macos")]
-            tun_shutdown_fd: None,
+            tun_reader_shutdown_fd: None,
             dns_identity_rx: None,
             dns_task: None,
             index_allocator: IndexAllocator::new(),
@@ -708,6 +720,9 @@ impl Node {
             discovery_forward_limiter: DiscoveryForwardRateLimiter::new(),
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
+            #[cfg(feature = "nostr-bootstrap")]
+            nostr_bootstrap: None,
+            bootstrap_transports: HashSet::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
             estimated_mesh_size: None,
@@ -749,8 +764,8 @@ impl Node {
             transports.push(TransportHandle::Udp(udp));
         }
 
-        // Create Ethernet transport instances (Unix only — requires raw sockets)
-        #[cfg(unix)]
+        // Create Ethernet transport instances
+        #[cfg(target_os = "linux")]
         {
             let eth_instances: Vec<_> = self
                 .config
@@ -1386,6 +1401,37 @@ impl Node {
         } else {
             None
         }
+    }
+
+    pub(crate) fn cleanup_bootstrap_transport_if_unused(&mut self, transport_id: TransportId) {
+        if !self.bootstrap_transports.contains(&transport_id) {
+            return;
+        }
+
+        let transport_in_use = self
+            .links
+            .values()
+            .any(|link| link.transport_id() == transport_id)
+            || self
+                .connections
+                .values()
+                .any(|conn| conn.transport_id() == Some(transport_id))
+            || self
+                .peers
+                .values()
+                .any(|peer| peer.transport_id() == Some(transport_id))
+            || self
+                .pending_connects
+                .iter()
+                .any(|pending| pending.transport_id == transport_id);
+
+        if transport_in_use {
+            return;
+        }
+
+        self.bootstrap_transports.remove(&transport_id);
+        self.transport_drops.remove(&transport_id);
+        self.transports.remove(&transport_id);
     }
 
     /// Iterate over all links.

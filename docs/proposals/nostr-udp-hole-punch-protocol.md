@@ -13,7 +13,19 @@ No WebRTC, DTLS, or ICE stack is required. The protocol operates at the raw UDP 
 - **Initiator**: The peer that discovers the responder's service advertisement and begins the connection process.
 - **Responder**: The peer running a UDP service, which has published a replaceable event advertising its availability.
 - **Reflexive address**: The public `IP:port` tuple as observed by a STUN server (i.e., the NAT's external mapping).
-- **Punch socket**: The single UDP socket a peer uses for both STUN queries and subsequent hole-punching traffic. This socket **must not** change between phases.
+- **Punch socket**: The single UDP socket a peer uses for both STUN queries and subsequent hole-punching traffic within one connection attempt. This socket **must not** change between phases of that attempt.
+
+### Socket lifecycle
+
+This protocol assumes **per-peer, per-attempt punch sockets**:
+
+- Each outbound traversal attempt creates a fresh UDP socket bound to `0.0.0.0:0`.
+- That socket is owned by exactly one remote peer and exactly one traversal session.
+- STUN, offer/answer metadata, punch packets, and the eventual adopted UDP transport all use that same socket for the lifetime of the attempt.
+- If the attempt fails, the socket is discarded. A retry allocates a new socket and obtains a fresh reflexive address.
+- The long-lived application UDP listener (for example, a fixed port such as `2121`) is **not** reused as the punch socket.
+
+This choice avoids cross-peer state coupling and keeps NAT mappings, retry state, and adopted traversal transports isolated per peer.
 
 ---
 
@@ -85,7 +97,12 @@ If the responder's pubkey is not known in advance, the initiator can discover pe
 }]
 ```
 
-Upon receiving the advertisement, the initiator extracts the relay list and STUN server preferences.
+Upon receiving the advertisement, the initiator extracts the relay list and any
+advertised STUN metadata. In the current in-tree implementation, advertised
+STUN entries are informational only; outbound STUN is driven by the initiator's
+own configured allowlist.
+The current in-tree STUN parser handles IPv4 and IPv6 mapped-address
+responses, though local interface discovery remains best-effort.
 
 ---
 
@@ -93,12 +110,12 @@ Upon receiving the advertisement, the initiator extracts the relay list and STUN
 
 Before sending any signaling message, the initiator binds a UDP socket and performs a STUN Binding Request:
 
-1. Bind a UDP socket to `0.0.0.0:0` (OS-assigned port). This becomes the **punch socket**.
-2. Send a STUN Binding Request (RFC 8489) to one of the STUN servers listed in the responder's advertisement.
+1. Bind a fresh UDP socket to `0.0.0.0:0` (OS-assigned port). This becomes the **punch socket** for this peer and this traversal attempt.
+2. Send a STUN Binding Request (RFC 8489) to one of the initiator's locally configured STUN servers.
 3. Parse the Binding Response and extract the `XOR-MAPPED-ADDRESS` attribute — this is the initiator's reflexive address.
 4. Record the local socket address and the reflexive address.
 
-**Critical**: The punch socket must remain open and must be reused for all subsequent protocol phases. Closing or rebinding it invalidates the NAT mapping.
+**Critical**: The punch socket must remain open and must be reused for all subsequent protocol phases of the same attempt. Closing or rebinding it invalidates the NAT mapping.
 
 ---
 
@@ -176,8 +193,8 @@ Upon receiving and decrypting an offer, the responder:
 
 1. Validates the timestamp (rejects if older than 60 seconds).
 2. Validates the `session_id` is not a replay of a previously seen session.
-3. Binds its own **punch socket** to `0.0.0.0:0`.
-4. Performs a STUN Binding Request (preferably using the same STUN server the initiator used).
+3. Binds its own fresh **punch socket** to `0.0.0.0:0`.
+4. Performs a STUN Binding Request using one of the responder's locally configured STUN servers.
 5. Extracts its own reflexive address.
 6. Constructs and sends an answer:
 
@@ -196,6 +213,10 @@ Upon receiving and decrypting an offer, the responder:
 ```
 
 This is encrypted and gift-wrapped identically to the offer, but addressed to the initiator's pubkey and published to the same relay(s).
+
+Implementations should also bind the JSON sender/recipient identity fields to
+the actual Nostr pubkeys that delivered the gift-wrapped events, rather than
+treating those JSON fields as independently trustworthy.
 
 **Immediately after publishing the answer**, the responder begins Phase 5 (punching) without waiting for confirmation that the initiator received it. Time is critical — the NAT mappings are decaying.
 
@@ -228,7 +249,7 @@ Bytes 8–23:  first 16 bytes of SHA-256(session_id)
 
 ### Timeout
 
-If no valid punch packet is received within **10 seconds**, the attempt has failed. Possible causes include symmetric NAT on one or both sides, firewall interference, or stale reflexive addresses. The initiator may retry with a fresh STUN query and new offer, or fall back to an application-level relay.
+If no valid punch packet is received within **10 seconds**, the attempt has failed. Possible causes include symmetric NAT on one or both sides, firewall interference, or stale reflexive addresses. The initiator may retry with a fresh STUN query, a fresh punch socket, and a new offer, or fall back to an application-level relay.
 
 ### LAN optimization
 
@@ -238,7 +259,7 @@ If both peers' `local_addr` values are in the same private subnet (e.g., both `1
 
 ## Phase 6: Application Protocol Handoff
 
-Once both peers have exchanged acknowledgments, the connection is established. The punch socket is now a live UDP channel between the two peers. From this point:
+Once both peers have exchanged acknowledgments, the connection is established. The punch socket for that attempt is now a live UDP channel between the two peers. From this point:
 
 - The application protocol takes over the socket.
 - The Nostr signaling channel is no longer needed for this session.

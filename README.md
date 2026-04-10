@@ -399,10 +399,12 @@ Ethernet, Tor, and Bluetooth (BLE) with a small live mesh of deployed nodes.
 - Reproducible builds with toolchain pinning and SOURCE_DATE_EPOCH
 - Linux (Debian, systemd tarball, OpenWrt, AUR), macOS (`.pkg`), and Windows (ZIP, service) packaging
 - Docker-based integration and chaos testing
+- Optional Nostr-signaled `udp:nat` bootstrap when compiled with the `nostr-bootstrap` feature
 
 ### Near-term priorities
 
 - Peer discovery via Nostr relays (bootstrap without static peer lists)
+- Issue-37 traversal support now exists as an optional in-tree bootstrap plus the supporting [examples/nostr-bootstrap](examples/nostr-bootstrap/README.md) helper crate
 - Native API for FIPS-aware applications (npub:port addressing)
 - Security audit of cryptographic protocols
 

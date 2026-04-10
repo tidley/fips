@@ -34,8 +34,8 @@ use thiserror::Error;
 pub use gateway::{ConntrackConfig, GatewayConfig, GatewayDnsConfig, PortForward, Proto};
 pub use node::{
     BloomConfig, BuffersConfig, CacheConfig, ControlConfig, DiscoveryConfig, LimitsConfig,
-    NodeConfig, RateLimitConfig, RekeyConfig, RetryConfig, SessionConfig, SessionMmpConfig,
-    TreeConfig,
+    NodeConfig, NostrBootstrapConfig, RateLimitConfig, RekeyConfig, RetryConfig, SessionConfig,
+    SessionMmpConfig, TreeConfig,
 };
 pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
 pub use transport::{
@@ -1106,5 +1106,50 @@ peers:
         assert_eq!(peer.alias, Some("test-peer".to_string()));
         assert_eq!(peer.addresses.len(), 2);
         assert!(peer.is_auto_connect());
+    }
+
+    #[test]
+    fn test_parse_nostr_bootstrap_config() {
+        let yaml = r#"
+node:
+  discovery:
+    nostr:
+      enabled: true
+      advertise: false
+      app: "fips.nat.test.v1"
+      signal_ttl_secs: 45
+      advert_relays:
+        - "wss://relay-a.example"
+      dm_relays:
+        - "wss://relay-b.example"
+      stun_servers:
+        - "stun:stun.example.org:3478"
+peers:
+  - npub: "npub1peer"
+    addresses:
+      - transport: udp
+        addr: "nat"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.node.discovery.nostr.enabled);
+        assert!(!config.node.discovery.nostr.advertise);
+        assert_eq!(config.node.discovery.nostr.app, "fips.nat.test.v1");
+        assert_eq!(config.node.discovery.nostr.signal_ttl_secs, 45);
+        assert_eq!(
+            config.node.discovery.nostr.advert_relays,
+            vec!["wss://relay-a.example".to_string()]
+        );
+        assert_eq!(
+            config.node.discovery.nostr.dm_relays,
+            vec!["wss://relay-b.example".to_string()]
+        );
+        assert_eq!(
+            config.node.discovery.nostr.stun_servers,
+            vec!["stun:stun.example.org:3478".to_string()]
+        );
+        assert_eq!(
+            config.peers[0].addresses[0].addr, "nat",
+            "udp:nat address should parse without special-casing in YAML"
+        );
     }
 }

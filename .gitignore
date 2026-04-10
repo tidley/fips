@@ -11,11 +11,8 @@
 .vscode/
 .idea/
 
-# AI Agents
+# Claude Code
 .claude/
-AGENTS.md
-CLAUDE.md
-agents/
 
 deploy/
 vps.env
@@ -26,6 +23,7 @@ dist/
 *.ipk
 
 sim-results/
+testing/nat/generated-configs/
 
 # Python
 __pycache__/
@@ -33,3 +31,6 @@ __pycache__/
 *.egg-info/
 *.egg
 
+# Vendored experimental bootstrap subcrate
+examples/nostr-bootstrap/target/
+examples/nostr-bootstrap/Cargo.lock

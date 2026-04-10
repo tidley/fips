@@ -173,6 +173,49 @@ Controls bloom-guided node discovery (LookupRequest/LookupResponse).
 | `node.discovery.backoff_max_secs` | u64 | `300` | Cap on exponential backoff (5 minutes) |
 | `node.discovery.forward_min_interval_secs` | u64 | `2` | Transit-side rate limiting: minimum interval between forwarded lookups for the same target |
 
+#### Nostr Bootstrap (`node.discovery.nostr.*`)
+
+Optional Nostr-signaled NAT traversal bootstrap for peers configured with
+`udp:nat`. This layer publishes replaceable service adverts, uses encrypted
+gift-wrapped Nostr events for offer/answer signaling, performs STUN-based
+reflexive address discovery, and then hands the established UDP socket into
+the normal FIPS transport/session stack.
+Inbox-relay discovery falls back to the local DM relay list if remote relay
+metadata cannot be fetched.
+This support is compiled behind the crate feature `nostr-bootstrap`; builds
+without that feature ignore `udp:nat` bootstrap configuration.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `node.discovery.nostr.enabled` | bool | `false` | Enable Nostr-signaled NAT traversal bootstrap |
+| `node.discovery.nostr.advertise` | bool | `true` | Publish service adverts so remote peers can bootstrap inbound |
+| `node.discovery.nostr.advert_relays` | list[string] | `["wss://offchain.pub", "wss://strfry.bitsbytom.com"]` | Relays used for service adverts |
+| `node.discovery.nostr.dm_relays` | list[string] | `["wss://nip17.com", "wss://offchain.pub"]` | Relays used for encrypted signaling events |
+| `node.discovery.nostr.stun_servers` | list[string] | `["stun:fips.tomdwyer.uk:3478", "stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478", "stun:openrelay.metered.ca:80"]` | STUN servers used for local reflexive address discovery |
+| `node.discovery.nostr.app` | string | `"fips.nat.traversal.v1"` | Traversal application namespace and advert identifier suffix |
+| `node.discovery.nostr.signal_ttl_secs` | u64 | `120` | Signaling TTL in seconds |
+| `node.discovery.nostr.attempt_timeout_secs` | u64 | `10` | Overall traversal attempt timeout in seconds |
+| `node.discovery.nostr.replay_window_secs` | u64 | `300` | Replay tracking retention window in seconds |
+| `node.discovery.nostr.punch_start_delay_ms` | u64 | `2000` | Delay before punch traffic starts |
+| `node.discovery.nostr.punch_interval_ms` | u64 | `200` | Interval between punch packets |
+| `node.discovery.nostr.punch_duration_ms` | u64 | `10000` | How long to keep punching before failure |
+| `node.discovery.nostr.advert_ttl_secs` | u64 | `600` | Advert TTL in seconds |
+| `node.discovery.nostr.advert_refresh_secs` | u64 | `300` | How often adverts are refreshed in seconds |
+
+If `stun_servers` is omitted, the built-in default list above is used. If it is
+specified in YAML, the configured list fully overrides the defaults.
+Initiators use only this local list for outbound STUN queries; peer-advertised
+STUN values are published for diagnostics/interoperability but are not used as
+arbitrary egress targets.
+The built-in advert relay default `wss://strfry.bitsbytom.com` is also
+contributor-operated rather than project-operated.
+The built-in STUN default `stun:fips.tomdwyer.uk:3478` is contributor-operated
+rather than project-operated.
+These built-in endpoints should be treated as best-effort defaults that
+operators are expected to override for production use.
+The current in-tree STUN parser handles IPv4 and IPv6 mapped-address
+attributes, but local interface discovery remains best-effort.
+
 ### Spanning Tree (`node.tree.*`)
 
 Controls tree construction and parent selection.

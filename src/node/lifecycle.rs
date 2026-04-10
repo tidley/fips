@@ -2,6 +2,9 @@
 
 use super::{Node, NodeError, NodeState};
 use crate::node::acl::PeerAclContext;
+#[cfg(feature = "nostr-bootstrap")]
+use crate::bootstrap::nostr::{BootstrapEvent, NostrBootstrap};
+use crate::bootstrap::{BootstrapHandoffResult, EstablishedTraversal};
 use crate::node::wire::build_msg1;
 use crate::peer::PeerConnection;
 use crate::protocol::{Disconnect, DisconnectReason};
@@ -107,86 +110,8 @@ impl Node {
             return Ok(());
         }
 
-        // Try addresses in priority order until one works
-        for addr in peer_config.addresses_by_priority() {
-            // For Ethernet addresses ("interface/mac"), find the transport
-            // instance matching the interface name and parse the MAC.
-            let (transport_id, remote_addr) = if addr.transport == "ethernet" {
-                match self.resolve_ethernet_addr(&addr.addr) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        debug!(
-                            transport = %addr.transport,
-                            addr = %addr.addr,
-                            error = %e,
-                            "Failed to resolve Ethernet address"
-                        );
-                        continue;
-                    }
-                }
-            } else if addr.transport == "ble" {
-                #[cfg(target_os = "linux")]
-                {
-                    match self.resolve_ble_addr(&addr.addr) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            debug!(
-                                transport = %addr.transport,
-                                addr = %addr.addr,
-                                error = %e,
-                                "Failed to resolve BLE address"
-                            );
-                            continue;
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    debug!(
-                        transport = %addr.transport,
-                        "BLE transport not available on this platform"
-                    );
-                    continue;
-                }
-            } else {
-                // Find a transport matching this address type
-                let tid = match self.find_transport_for_type(&addr.transport) {
-                    Some(id) => id,
-                    None => {
-                        debug!(
-                            transport = %addr.transport,
-                            addr = %addr.addr,
-                            "No operational transport for address type"
-                        );
-                        continue;
-                    }
-                };
-                (tid, TransportAddr::from_string(&addr.addr))
-            };
-
-            match self
-                .initiate_connection(transport_id, remote_addr, peer_identity)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e @ NodeError::AccessDenied(_)) => return Err(e),
-                Err(e) => {
-                    debug!(
-                        npub = %peer_config.npub,
-                        transport_id = %transport_id,
-                        error = %e,
-                        "Connection attempt failed, trying next address"
-                    );
-                    continue;
-                }
-            }
-        }
-
-        // No address worked
-        Err(NodeError::NoTransportForType(format!(
-            "no operational transport for any of {}'s addresses",
-            peer_config.npub
-        )))
+        self.try_peer_addresses(peer_config, peer_identity, true)
+            .await
     }
 
     /// Initiate a connection to a peer on a specific transport and address.
@@ -296,10 +221,7 @@ impl Node {
         let peer_node_addr = *peer_identity.node_addr();
 
         // Create connection in handshake phase (outbound knows expected identity)
-        let current_time_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let current_time_ms = Self::now_ms();
         let mut connection = PeerConnection::outbound(link_id, peer_identity, current_time_ms);
 
         // Allocate a session index for this handshake
@@ -450,6 +372,54 @@ impl Node {
         }
     }
 
+    pub(super) async fn poll_nostr_bootstrap(&mut self) {
+        #[cfg(feature = "nostr-bootstrap")]
+        {
+            let Some(bootstrap) = self.nostr_bootstrap.clone() else {
+                return;
+            };
+
+            for event in bootstrap.drain_events().await {
+                match event {
+                    BootstrapEvent::Established { traversal } => {
+                        let peer_npub = traversal.peer_npub.clone();
+                        match self.adopt_established_traversal(traversal).await {
+                            Ok(_) => {
+                                info!(peer_npub = %peer_npub, "Adopted NAT traversal socket");
+                            }
+                            Err(err) => {
+                                warn!(peer_npub = %peer_npub, error = %err, "Failed to adopt NAT traversal");
+                                if let Ok(peer_identity) = PeerIdentity::from_npub(&peer_npub) {
+                                    self.schedule_retry(*peer_identity.node_addr(), Self::now_ms());
+                                }
+                            }
+                        }
+                    }
+                    BootstrapEvent::Failed {
+                        peer_config,
+                        reason,
+                    } => {
+                        warn!(npub = %peer_config.npub, error = %reason, "NAT traversal failed");
+                        let peer_identity = match PeerIdentity::from_npub(&peer_config.npub) {
+                            Ok(identity) => identity,
+                            Err(_) => continue,
+                        };
+
+                        if self
+                            .try_peer_addresses(&peer_config, peer_identity, false)
+                            .await
+                            .is_ok()
+                        {
+                            continue;
+                        }
+
+                        self.schedule_retry(*peer_identity.node_addr(), Self::now_ms());
+                    }
+                }
+            }
+        }
+    }
+
     /// Poll pending transport connects and initiate handshakes for ready ones.
     ///
     /// Called from the tick handler. For each pending connect, queries the
@@ -537,11 +507,7 @@ impl Node {
                 // Clean up link and schedule retry
                 self.remove_link(&pending.link_id);
                 self.links.remove(&pending.link_id);
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                self.schedule_retry(*pending.peer_identity.node_addr(), now_ms);
+                self.schedule_retry(*pending.peer_identity.node_addr(), Self::now_ms());
             }
         }
     }
@@ -563,6 +529,28 @@ impl Node {
         let (packet_tx, packet_rx) = packet_channel(packet_buffer_size);
         self.packet_tx = Some(packet_tx.clone());
         self.packet_rx = Some(packet_rx);
+
+        #[cfg(feature = "nostr-bootstrap")]
+        if self.config.node.discovery.nostr.enabled {
+            match NostrBootstrap::start(&self.identity, self.config.node.discovery.nostr.clone())
+                .await
+            {
+                Ok(runtime) => {
+                    self.nostr_bootstrap = Some(runtime);
+                    info!("Nostr NAT traversal bootstrap enabled");
+                }
+                Err(err) => {
+                    warn!(error = %err, "Failed to start Nostr NAT traversal bootstrap");
+                }
+            }
+        }
+
+        #[cfg(not(feature = "nostr-bootstrap"))]
+        if self.config.node.discovery.nostr.enabled {
+            warn!(
+                "Nostr NAT traversal bootstrap configured but this build was compiled without the 'nostr-bootstrap' feature"
+            );
+        }
 
         // Initialize transports first (before TUN)
         let transport_handles = self.create_transports(&packet_tx).await;
@@ -615,20 +603,6 @@ impl Node {
                     info!("effective MTU: {} bytes", effective_mtu);
                     debug!("   max TCP MSS: {} bytes", max_mss);
 
-                    // On macOS, create a shutdown pipe. Writing to it unblocks the
-                    // reader thread's select() loop without closing the TUN fd
-                    // (which would cause a double-close when TunDevice drops).
-                    #[cfg(target_os = "macos")]
-                    let (shutdown_read_fd, shutdown_write_fd) = {
-                        let mut fds = [0i32; 2];
-                        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-                            return Err(NodeError::Tun(crate::upper::tun::TunError::Configure(
-                                "failed to create shutdown pipe".into(),
-                            )));
-                        }
-                        (fds[0], fds[1])
-                    };
-
                     // Create writer (dups the fd for independent write access)
                     let (writer, tun_tx) = device.create_writer(max_mss)?;
 
@@ -647,19 +621,33 @@ impl Node {
                     // Spawn reader thread
                     let transport_mtu = self.transport_mtu();
                     #[cfg(target_os = "macos")]
-                    let reader_handle = thread::spawn(move || {
-                        run_tun_reader(
-                            device,
-                            mtu,
-                            our_addr,
-                            reader_tun_tx,
-                            outbound_tx,
-                            transport_mtu,
-                            shutdown_read_fd,
-                        );
-                    });
+                    let reader_handle = {
+                        let mut fds = [0; 2];
+                        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+                        if ret != 0 {
+                            self.tun_state = TunState::Failed;
+                            warn!(
+                                error = %std::io::Error::last_os_error(),
+                                "Failed to create macOS TUN shutdown pipe, continuing without it"
+                            );
+                            None
+                        } else {
+                            self.tun_reader_shutdown_fd = Some(fds[1]);
+                            Some(thread::spawn(move || {
+                                run_tun_reader(
+                                    device,
+                                    mtu,
+                                    our_addr,
+                                    reader_tun_tx,
+                                    outbound_tx,
+                                    transport_mtu,
+                                    fds[0],
+                                );
+                            }))
+                        }
+                    };
                     #[cfg(not(target_os = "macos"))]
-                    let reader_handle = thread::spawn(move || {
+                    let reader_handle = Some(thread::spawn(move || {
                         run_tun_reader(
                             device,
                             mtu,
@@ -668,17 +656,15 @@ impl Node {
                             outbound_tx,
                             transport_mtu,
                         );
-                    });
+                    }));
 
-                    self.tun_state = TunState::Active;
-                    self.tun_name = Some(name);
-                    self.tun_tx = Some(tun_tx);
-                    self.tun_outbound_rx = Some(outbound_rx);
-                    self.tun_reader_handle = Some(reader_handle);
-                    self.tun_writer_handle = Some(writer_handle);
-                    #[cfg(target_os = "macos")]
-                    {
-                        self.tun_shutdown_fd = Some(shutdown_write_fd);
+                    if let Some(reader_handle) = reader_handle {
+                        self.tun_state = TunState::Active;
+                        self.tun_name = Some(name);
+                        self.tun_tx = Some(tun_tx);
+                        self.tun_outbound_rx = Some(outbound_rx);
+                        self.tun_reader_handle = Some(reader_handle);
+                        self.tun_writer_handle = Some(writer_handle);
                     }
                 }
                 Err(e) => {
@@ -856,6 +842,14 @@ impl Node {
         self.send_disconnect_to_all_peers(DisconnectReason::Shutdown)
             .await;
 
+        // Stop NAT traversal bootstrap background work and withdraw any advert
+        #[cfg(feature = "nostr-bootstrap")]
+        if let Some(bootstrap) = self.nostr_bootstrap.take()
+            && let Err(e) = bootstrap.shutdown().await
+        {
+            warn!(error = %e, "Failed to shutdown Nostr NAT traversal bootstrap");
+        }
+
         // Shutdown transports (they're packet producers)
         let transport_ids: Vec<_> = self.transports.keys().cloned().collect();
         for transport_id in transport_ids {
@@ -888,19 +882,17 @@ impl Node {
             // Drop the tun_tx to signal the writer to stop
             self.tun_tx.take();
 
-            // Delete the interface (on Linux, causes reader to get EFAULT)
-            if let Err(e) = shutdown_tun_interface(&name).await {
-                warn!(name = %name, error = %e, "Failed to shutdown TUN interface");
+            #[cfg(target_os = "macos")]
+            if let Some(shutdown_fd) = self.tun_reader_shutdown_fd.take() {
+                let _ = unsafe { libc::write(shutdown_fd, [1u8].as_ptr().cast(), 1) };
+                unsafe {
+                    libc::close(shutdown_fd);
+                }
             }
 
-            // On macOS, signal the reader thread to exit by writing to the
-            // shutdown pipe. The reader's select() will wake up and break.
-            #[cfg(target_os = "macos")]
-            if let Some(fd) = self.tun_shutdown_fd.take() {
-                unsafe {
-                    libc::write(fd, b"x".as_ptr() as *const libc::c_void, 1);
-                    libc::close(fd);
-                }
+            // Delete the interface (causes reader to get EFAULT)
+            if let Err(e) = shutdown_tun_interface(&name).await {
+                warn!(name = %name, error = %e, "Failed to shutdown TUN interface");
             }
 
             // Wait for threads to finish
@@ -961,6 +953,106 @@ impl Node {
         }
 
         info!(sent, total = peer_addrs.len(), reason = %reason, "Sent disconnect notifications");
+    }
+
+    pub(in crate::node) async fn try_peer_addresses(
+        &mut self,
+        peer_config: &crate::config::PeerConfig,
+        peer_identity: PeerIdentity,
+        allow_bootstrap_nat: bool,
+    ) -> Result<(), NodeError> {
+        for addr in peer_config.addresses_by_priority() {
+            if addr.transport == "udp" && addr.addr.eq_ignore_ascii_case("nat") {
+                if !allow_bootstrap_nat {
+                    continue;
+                }
+                #[cfg(not(feature = "nostr-bootstrap"))]
+                {
+                    debug!(npub = %peer_config.npub, "Skipping udp:nat address because this build does not include the nostr-bootstrap feature");
+                    continue;
+                }
+                #[cfg(feature = "nostr-bootstrap")]
+                {
+                    let Some(bootstrap) = self.nostr_bootstrap.clone() else {
+                        debug!(npub = %peer_config.npub, "No Nostr bootstrap runtime for udp:nat address");
+                        continue;
+                    };
+                    bootstrap.request_connect(peer_config.clone()).await;
+                    info!(npub = %peer_config.npub, "Started Nostr NAT traversal attempt");
+                    return Ok(());
+                }
+            }
+
+            let (transport_id, remote_addr) = if addr.transport == "ethernet" {
+                match self.resolve_ethernet_addr(&addr.addr) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        debug!(
+                            transport = %addr.transport,
+                            addr = %addr.addr,
+                            error = %e,
+                            "Failed to resolve Ethernet address"
+                        );
+                        continue;
+                    }
+                }
+            } else if addr.transport == "ble" {
+                #[cfg(target_os = "linux")]
+                {
+                    match self.resolve_ble_addr(&addr.addr) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            debug!(
+                                transport = %addr.transport,
+                                addr = %addr.addr,
+                                error = %e,
+                                "Failed to resolve BLE address"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    debug!(transport = %addr.transport, "BLE transport not available on this platform");
+                    continue;
+                }
+            } else {
+                let tid = match self.find_transport_for_type(&addr.transport) {
+                    Some(id) => id,
+                    None => {
+                        debug!(
+                            transport = %addr.transport,
+                            addr = %addr.addr,
+                            "No operational transport for address type"
+                        );
+                        continue;
+                    }
+                };
+                (tid, TransportAddr::from_string(&addr.addr))
+            };
+
+            match self
+                .initiate_connection(transport_id, remote_addr, peer_identity)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e @ NodeError::AccessDenied(_)) => return Err(e),
+                Err(e) => {
+                    debug!(
+                        npub = %peer_config.npub,
+                        transport_id = %transport_id,
+                        error = %e,
+                        "Connection attempt failed, trying next address"
+                    );
+                }
+            }
+        }
+
+        Err(NodeError::NoTransportForType(format!(
+            "no operational transport for any of {}'s addresses",
+            peer_config.npub
+        )))
     }
 
     // === Control API methods ===
@@ -1033,5 +1125,76 @@ impl Node {
             "npub": npub,
             "disconnected": true,
         }))
+    }
+
+    /// Adopt an already-established UDP traversal and start the normal FIPS
+    /// Noise handshake over it.
+    ///
+    /// This is intended for integration with an external rendezvous runtime
+    /// that has already completed relay signaling, STUN observation, and UDP
+    /// hole punching. After handoff, the adopted socket is owned by FIPS.
+    pub async fn adopt_established_traversal(
+        &mut self,
+        traversal: EstablishedTraversal,
+    ) -> Result<BootstrapHandoffResult, NodeError> {
+        if !self.state.is_operational() {
+            return Err(NodeError::NotStarted);
+        }
+
+        let packet_tx = self.packet_tx.clone().ok_or(NodeError::NotStarted)?;
+        let peer_identity = PeerIdentity::from_npub(&traversal.peer_npub).map_err(|e| {
+            NodeError::InvalidPeerNpub {
+                npub: traversal.peer_npub.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        let peer_node_addr = *peer_identity.node_addr();
+
+        self.peer_aliases
+            .insert(peer_node_addr, peer_identity.short_npub());
+        self.register_identity(peer_node_addr, peer_identity.pubkey_full());
+
+        let transport_id = self.allocate_transport_id();
+        let mut transport = crate::transport::udp::UdpTransport::new(
+            transport_id,
+            traversal.transport_name.clone(),
+            traversal.transport_config.clone().unwrap_or_default(),
+            packet_tx,
+        );
+
+        transport
+            .adopt_socket_async(traversal.socket)
+            .await
+            .map_err(|e| NodeError::BootstrapHandoff(e.to_string()))?;
+
+        let local_addr = transport.local_addr().ok_or_else(|| {
+            NodeError::BootstrapHandoff("adopted UDP transport has no local address".into())
+        })?;
+
+        self.transports.insert(
+            transport_id,
+            crate::transport::TransportHandle::Udp(transport),
+        );
+        self.bootstrap_transports.insert(transport_id);
+
+        let remote_addr = TransportAddr::from_string(&traversal.remote_addr.to_string());
+        if let Err(err) = self
+            .initiate_connection(transport_id, remote_addr.clone(), peer_identity)
+            .await
+        {
+            self.bootstrap_transports.remove(&transport_id);
+            if let Some(mut handle) = self.transports.remove(&transport_id) {
+                let _ = handle.stop().await;
+            }
+            return Err(err);
+        }
+
+        Ok(BootstrapHandoffResult {
+            transport_id,
+            local_addr,
+            remote_addr: traversal.remote_addr,
+            peer_node_addr,
+            session_id: traversal.session_id,
+        })
     }
 }

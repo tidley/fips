@@ -73,10 +73,8 @@ NAT mapping created during traversal is preserved.
 - [`docs/design/fips-configuration.md`](../design/fips-configuration.md)
   - documents the config surface and defaults
 
-### Example helper crate and NAT lab
+### NAT lab and CI coverage
 
-- [`examples/nostr-bootstrap/`](../../examples/nostr-bootstrap/)
-  - protocol helpers and rendezvous runtime support used by the NAT lab
 - [`testing/nat/`](../../testing/nat/)
   - Docker NAT lab with cone, symmetric, and LAN scenarios
 - [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)
@@ -133,7 +131,9 @@ Initiators use only their locally configured list for outbound STUN queries;
 peer adverts can report STUN choices for diagnostics, but they are not treated
 as arbitrary egress targets.
 The current in-tree STUN parser now handles IPv4 and IPv6 mapped-address
-attributes, though local interface discovery is still best-effort.
+attributes. Local traversal candidates include active non-loopback private
+interface addresses (RFC1918 IPv4 and IPv6 ULA), and punch planning attempts
+private-subnet and reflexive paths in parallel when both are available.
 
 ### Gift-wrap sender identity is now bound to payload identity
 
@@ -181,12 +181,13 @@ The code is configurable, but maintainers may still want to decide whether the
 shipped defaults should include a contributor-operated STUN server or whether
 the project should prefer only project-operated or clearly third-party defaults.
 
-### Example scope reduction
+### Example crate removal
 
-The example crate has been narrowed to protocol helpers, rendezvous runtime
-support, and NAT-lab coverage. The post-handoff console/video demo binaries
-depended on an in-tree app-port API and have been removed from this PR so that
-the NAT bootstrap can be reviewed independently.
+The standalone prototype crate at `examples/nostr-bootstrap` has been removed
+from this PR. It duplicated protocol/runtime logic that now lives in the main
+crate (`src/bootstrap/nostr/*`) and had no remaining runnable demo binaries.
+Keeping a second implementation path increased review and maintenance overhead
+without adding shipped functionality.
 
 ### Relationship to issue #34
 

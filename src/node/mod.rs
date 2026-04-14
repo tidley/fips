@@ -431,7 +431,7 @@ pub struct Node {
     /// are exhausted.
     retry_pending: HashMap<NodeAddr, retry::RetryState>,
 
-    /// Optional Nostr/STUN bootstrap coordinator for `udp:nat` peers.
+    /// Optional Nostr/STUN overlay discovery coordinator for `udp:nat` peers.
     #[cfg(feature = "nostr-bootstrap")]
     nostr_bootstrap: Option<Arc<crate::bootstrap::nostr::NostrBootstrap>>,
     /// Per-peer UDP transports adopted from NAT traversal handoff.
@@ -475,6 +475,7 @@ pub struct Node {
 impl Node {
     /// Create a new node from configuration.
     pub fn new(config: Config) -> Result<Self, NodeError> {
+        config.validate()?;
         let identity = config.create_identity()?;
         let node_addr = *identity.node_addr();
         let is_leaf_only = config.is_leaf_only();
@@ -611,7 +612,11 @@ impl Node {
     }
 
     /// Create a node with a specific identity.
-    pub fn with_identity(identity: Identity, config: Config) -> Self {
+    ///
+    /// This constructor validates cross-field config invariants before
+    /// constructing the node, same as [`Node::new`].
+    pub fn with_identity(identity: Identity, config: Config) -> Result<Self, NodeError> {
+        config.validate()?;
         let node_addr = *identity.node_addr();
 
         let mut startup_epoch = [0u8; 8];
@@ -667,7 +672,7 @@ impl Node {
             std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH),
         );
 
-        Self {
+        Ok(Self {
             identity,
             startup_epoch,
             started_at: std::time::Instant::now(),
@@ -731,7 +736,7 @@ impl Node {
             peer_aliases: HashMap::new(),
             peer_acl,
             host_map,
-        }
+        })
     }
 
     /// Create a leaf-only node (simplified state).

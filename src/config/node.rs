@@ -219,7 +219,7 @@ pub struct DiscoveryConfig {
     /// 1 = no retry, 2 = one retry, etc.
     #[serde(default = "DiscoveryConfig::default_max_attempts")]
     pub max_attempts: u8,
-    /// Nostr-based NAT traversal bootstrap.
+    /// Nostr-mediated overlay endpoint discovery.
     #[serde(default = "DiscoveryConfig::default_nostr")]
     pub nostr: NostrBootstrapConfig,
 }
@@ -270,7 +270,23 @@ impl DiscoveryConfig {
     }
 }
 
-/// Nostr-based NAT traversal bootstrap (`node.discovery.nostr.*`).
+/// Nostr advert discovery policy.
+///
+/// Controls how overlay endpoint adverts are consumed:
+/// - `disabled`: ignore advert-derived endpoints for all peers
+/// - `configured_only`: allow advert fallback only for configured peers with
+///   `peers[].via_nostr = true`
+/// - `open`: also consider adverts for non-configured peers
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NostrDiscoveryPolicy {
+    Disabled,
+    #[default]
+    ConfiguredOnly,
+    Open,
+}
+
+/// Nostr-mediated overlay endpoint discovery (`node.discovery.nostr.*`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NostrBootstrapConfig {
@@ -297,6 +313,13 @@ pub struct NostrBootstrapConfig {
     /// Signaling TTL in seconds.
     #[serde(default = "NostrBootstrapConfig::default_signal_ttl_secs")]
     pub signal_ttl_secs: u64,
+    /// Policy for advert-derived endpoint discovery.
+    #[serde(default)]
+    pub policy: NostrDiscoveryPolicy,
+    /// Max number of open-discovery peers queued for outbound retry/connection
+    /// at once. Prevents unbounded queue growth from ambient advert traffic.
+    #[serde(default = "NostrBootstrapConfig::default_open_discovery_max_pending")]
+    pub open_discovery_max_pending: usize,
     /// Overall punch attempt timeout in seconds.
     #[serde(default = "NostrBootstrapConfig::default_attempt_timeout_secs")]
     pub attempt_timeout_secs: u64,
@@ -330,6 +353,8 @@ impl Default for NostrBootstrapConfig {
             stun_servers: Self::default_stun_servers(),
             app: Self::default_app(),
             signal_ttl_secs: Self::default_signal_ttl_secs(),
+            policy: NostrDiscoveryPolicy::default(),
+            open_discovery_max_pending: Self::default_open_discovery_max_pending(),
             attempt_timeout_secs: Self::default_attempt_timeout_secs(),
             replay_window_secs: Self::default_replay_window_secs(),
             punch_start_delay_ms: Self::default_punch_start_delay_ms(),
@@ -370,11 +395,15 @@ impl NostrBootstrapConfig {
     }
 
     fn default_app() -> String {
-        "fips.nat.traversal.v1".to_string()
+        "fips-overlay-v1".to_string()
     }
 
     fn default_signal_ttl_secs() -> u64 {
         120
+    }
+
+    fn default_open_discovery_max_pending() -> usize {
+        64
     }
 
     fn default_attempt_timeout_secs() -> u64 {
@@ -398,11 +427,11 @@ impl NostrBootstrapConfig {
     }
 
     fn default_advert_ttl_secs() -> u64 {
-        600
+        3_600
     }
 
     fn default_advert_refresh_secs() -> u64 {
-        300
+        1_800
     }
 }
 

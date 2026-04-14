@@ -20,9 +20,24 @@ fn test_node_with_identity() {
     let expected_node_addr = *identity.node_addr();
     let config = Config::new();
 
-    let node = Node::with_identity(identity, config);
+    let node = Node::with_identity(identity, config).unwrap();
 
     assert_eq!(node.node_addr(), &expected_node_addr);
+}
+
+#[test]
+fn test_node_with_identity_validates_config() {
+    let identity = Identity::generate();
+    let mut config = Config::new();
+    config.node.discovery.nostr.enabled = false;
+    config.peers = vec![crate::config::PeerConfig {
+        npub: "npub1peer".to_string(),
+        via_nostr: true,
+        ..Default::default()
+    }];
+
+    let err = Node::with_identity(identity, config).expect_err("expected config validation error");
+    assert!(matches!(err, NodeError::Config(_)));
 }
 
 #[test]
@@ -65,6 +80,7 @@ async fn test_nat_bootstrap_failure_falls_back_to_direct_udp_address() {
         ],
         connect_policy: crate::config::ConnectPolicy::AutoConnect,
         auto_reconnect: true,
+        via_nostr: false,
     };
     let peer_identity = PeerIdentity::from_npub(&peer_config.npub).unwrap();
 
@@ -760,6 +776,31 @@ fn test_schedule_retry_skips_connected_peer() {
     assert!(
         node.retry_pending.is_empty(),
         "No retry for already-connected peer"
+    );
+}
+
+#[tokio::test]
+async fn test_process_pending_retries_drops_expired_entries() {
+    let mut node = make_node();
+    let peer_identity = Identity::generate();
+    let peer_npub = peer_identity.npub();
+    let peer_node_addr = *PeerIdentity::from_npub(&peer_npub).unwrap().node_addr();
+
+    let mut state = super::super::retry::RetryState::new(crate::config::PeerConfig::new(
+        peer_npub,
+        "udp",
+        "127.0.0.1:9",
+    ));
+    state.retry_after_ms = 0;
+    state.expires_at_ms = Some(1_000);
+    state.reconnect = true;
+    node.retry_pending.insert(peer_node_addr, state);
+
+    node.process_pending_retries(1_000).await;
+
+    assert!(
+        !node.retry_pending.contains_key(&peer_node_addr),
+        "expired retry entries should be dropped before retry processing"
     );
 }
 

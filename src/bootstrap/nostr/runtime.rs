@@ -21,13 +21,16 @@ use super::signal::{
 use super::stun::observe_traversal_addresses;
 use super::traversal::{nonce, now_ms, planned_remote_endpoints, run_punch_attempt};
 use super::types::{
-    ADVERT_KIND, BootstrapError, BootstrapEvent, PROTOCOL_VERSION, PunchHint, SIGNAL_KIND,
-    TraversalAdvert, TraversalAnswer, TraversalOffer,
+    ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, BootstrapError, BootstrapEvent,
+    CachedOverlayAdvert, OverlayAdvert, OverlayEndpointAdvert, PROTOCOL_VERSION, PunchHint,
+    SIGNAL_KIND, TraversalAnswer, TraversalOffer,
 };
 use crate::bootstrap::EstablishedTraversal;
 use crate::config::{NostrBootstrapConfig, PeerConfig};
 
 const MAX_CONCURRENT_INCOMING_OFFERS: usize = 16;
+const ADVERT_CACHE_MAX_ENTRIES: usize = 2048;
+const ADVERT_CACHE_STALE_GRACE_MULTIPLIER: u64 = 2;
 
 pub struct NostrBootstrap {
     client: Client,
@@ -35,7 +38,8 @@ pub struct NostrBootstrap {
     pubkey: PublicKey,
     npub: String,
     config: NostrBootstrapConfig,
-    advert_cache: RwLock<HashMap<String, TraversalAdvert>>,
+    advert_cache: RwLock<HashMap<String, CachedOverlayAdvert>>,
+    local_advert: RwLock<Option<OverlayAdvert>>,
     current_advert_event_id: RwLock<Option<EventId>>,
     pending_answers: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<TraversalAnswer>>>>,
     active_initiators: Mutex<HashSet<String>>,
@@ -85,6 +89,7 @@ impl NostrBootstrap {
             npub,
             config,
             advert_cache: RwLock::new(HashMap::new()),
+            local_advert: RwLock::new(None),
             current_advert_event_id: RwLock::new(None),
             pending_answers: Mutex::new(HashMap::new()),
             active_initiators: Mutex::new(HashSet::new()),
@@ -98,10 +103,7 @@ impl NostrBootstrap {
 
         runtime.subscribe().await?;
         runtime.publish_inbox_relays().await?;
-        if runtime.config.advertise {
-            runtime.publish_advert().await?;
-            *runtime.advertise_task.lock().await = Some(runtime.clone().spawn_advertise_loop());
-        }
+        *runtime.advertise_task.lock().await = Some(runtime.clone().spawn_advertise_loop());
         *runtime.notify_task.lock().await = Some(runtime.clone().spawn_notify_loop());
 
         Ok(runtime)
@@ -139,6 +141,54 @@ impl NostrBootstrap {
         out
     }
 
+    pub async fn update_local_advert(
+        &self,
+        advert: Option<OverlayAdvert>,
+    ) -> Result<(), BootstrapError> {
+        let changed = {
+            let mut slot = self.local_advert.write().await;
+            if *slot == advert {
+                false
+            } else {
+                *slot = advert;
+                true
+            }
+        };
+        if !changed {
+            return Ok(());
+        }
+        self.publish_advert().await
+    }
+
+    pub async fn advert_endpoints_for_peer(
+        &self,
+        peer_npub: &str,
+    ) -> Result<Vec<OverlayEndpointAdvert>, BootstrapError> {
+        let target_pubkey =
+            PublicKey::parse(peer_npub).map_err(|e| BootstrapError::InvalidPeerNpub {
+                npub: peer_npub.to_string(),
+                reason: e.to_string(),
+            })?;
+        let advert = self.fetch_advert(peer_npub, target_pubkey).await?;
+        Ok(advert.endpoints)
+    }
+
+    pub async fn cached_open_discovery_candidates(
+        &self,
+        max: usize,
+    ) -> Vec<(String, Vec<OverlayEndpointAdvert>)> {
+        self.prune_advert_cache().await;
+        let now = now_ms();
+        let cache = self.advert_cache.read().await;
+        cache
+            .values()
+            .filter(|entry| entry.author_npub != self.npub)
+            .filter(|entry| entry.valid_until_ms > now)
+            .map(|entry| (entry.author_npub.clone(), entry.advert.endpoints.clone()))
+            .take(max)
+            .collect()
+    }
+
     pub async fn shutdown(&self) -> Result<(), BootstrapError> {
         if let Some(handle) = self.advertise_task.lock().await.take() {
             handle.abort();
@@ -163,14 +213,32 @@ impl NostrBootstrap {
             while let Ok(notification) = notifications.recv().await {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::Custom(ADVERT_KIND) {
-                        if let Ok(advert) = serde_json::from_str::<TraversalAdvert>(&event.content)
-                            && advert.expires_at > now_ms()
-                        {
-                            self.advert_cache
-                                .write()
-                                .await
-                                .insert(advert.publisher_npub.clone(), advert);
+                        if let Ok(author_npub) = event.pubkey.to_bech32() {
+                            if let Some(valid_until_ms) = self.event_valid_until_ms(&event)
+                                && let Ok(advert) =
+                                    Self::parse_overlay_advert_event(&event, &self.config.app)
+                            {
+                                let mut cache = self.advert_cache.write().await;
+                                let should_replace = cache
+                                    .get(&author_npub)
+                                    .map(|existing| {
+                                        existing.created_at <= event.created_at.as_u64()
+                                    })
+                                    .unwrap_or(true);
+                                if should_replace {
+                                    cache.insert(
+                                        author_npub.clone(),
+                                        CachedOverlayAdvert {
+                                            author_npub,
+                                            advert,
+                                            created_at: event.created_at.as_u64(),
+                                            valid_until_ms,
+                                        },
+                                    );
+                                }
+                            }
                         }
+                        self.prune_advert_cache().await;
                         continue;
                     }
 
@@ -275,7 +343,9 @@ impl NostrBootstrap {
         self.client
             .subscribe_to(
                 self.config.advert_relays.clone(),
-                Filter::new().kind(Kind::Custom(ADVERT_KIND)),
+                Filter::new()
+                    .kind(Kind::Custom(ADVERT_KIND))
+                    .identifier(ADVERT_IDENTIFIER),
                 None,
             )
             .await
@@ -310,35 +380,70 @@ impl NostrBootstrap {
     }
 
     async fn publish_advert(&self) -> Result<(), BootstrapError> {
-        let now = now_ms();
-        let advert = TraversalAdvert {
-            app: self.config.app.clone(),
-            event_kind: ADVERT_KIND,
-            protocol: self.config.app.clone(),
-            publisher_npub: self.npub.clone(),
-            published_at: now,
-            expires_at: now + self.config.advert_ttl_secs * 1000,
-            sequence: now,
-            relays: self.config.dm_relays.clone(),
-            stun_servers: self.config.stun_servers.clone(),
-            transports: vec!["udp".to_string()],
-            endpoint_hint: None,
+        let previous_event_id = self.current_advert_event_id.read().await.to_owned();
+        if !self.config.advertise {
+            if let Some(event_id) = previous_event_id {
+                self.publish_delete(&self.config.advert_relays, [event_id])
+                    .await?;
+                *self.current_advert_event_id.write().await = None;
+            }
+            return Ok(());
+        }
+
+        let mut advert = match self.local_advert.read().await.clone() {
+            Some(advert) => advert,
+            None => {
+                if let Some(event_id) = previous_event_id {
+                    self.publish_delete(&self.config.advert_relays, [event_id])
+                        .await?;
+                    *self.current_advert_event_id.write().await = None;
+                }
+                return Ok(());
+            }
         };
 
-        let mut tags = vec![
-            Tag::identifier(format!("udp-service-v1/{}", self.config.app)),
+        advert.identifier = ADVERT_IDENTIFIER.to_string();
+        advert.version = ADVERT_VERSION;
+        if advert.endpoints.is_empty() {
+            if let Some(event_id) = previous_event_id {
+                self.publish_delete(&self.config.advert_relays, [event_id])
+                    .await?;
+                *self.current_advert_event_id.write().await = None;
+            }
+            return Ok(());
+        }
+
+        if advert.has_udp_nat_endpoint() {
+            if advert
+                .signal_relays
+                .as_ref()
+                .is_none_or(|relays| relays.is_empty())
+            {
+                return Err(BootstrapError::InvalidAdvert(
+                    "udp:nat endpoint requires non-empty signalRelays".to_string(),
+                ));
+            }
+            if advert
+                .stun_servers
+                .as_ref()
+                .is_none_or(|servers| servers.is_empty())
+            {
+                return Err(BootstrapError::InvalidAdvert(
+                    "udp:nat endpoint requires non-empty stunServers".to_string(),
+                ));
+            }
+        } else {
+            advert.signal_relays = None;
+            advert.stun_servers = None;
+        }
+
+        let expires_at = now_ms() + self.config.advert_ttl_secs * 1000;
+        let tags = vec![
+            Tag::identifier(ADVERT_IDENTIFIER.to_string()),
             Tag::custom(TagKind::custom("protocol"), [self.config.app.clone()]),
             Tag::custom(TagKind::custom("version"), [PROTOCOL_VERSION.to_string()]),
-            Tag::expiration(Timestamp::from((advert.expires_at / 1000).max(1))),
+            Tag::expiration(Timestamp::from((expires_at / 1000).max(1))),
         ];
-        tags.push(Tag::custom(
-            TagKind::custom("relays"),
-            self.config.dm_relays.clone(),
-        ));
-        tags.push(Tag::custom(
-            TagKind::custom("stun"),
-            self.config.stun_servers.clone(),
-        ));
 
         let event = EventBuilder::new(Kind::Custom(ADVERT_KIND), serde_json::to_string(&advert)?)
             .tags(tags)
@@ -348,6 +453,13 @@ impl NostrBootstrap {
             .send_event_to(self.config.advert_relays.clone(), event.clone())
             .await
             .map_err(|e| BootstrapError::Nostr(e.to_string()))?;
+        if let Some(prev_id) = previous_event_id
+            && prev_id != event.id
+        {
+            let _ = self
+                .publish_delete(&self.config.advert_relays, [prev_id])
+                .await;
+        }
         *self.current_advert_event_id.write().await = Some(event.id);
         Ok(())
     }
@@ -362,6 +474,9 @@ impl NostrBootstrap {
                 reason: e.to_string(),
             })?;
         let advert = self.fetch_advert(&peer_config.npub, target_pubkey).await?;
+        if !advert.has_udp_nat_endpoint() {
+            return Err(BootstrapError::MissingNatEndpoint(peer_config.npub.clone()));
+        }
         let relays = self
             .preferred_signal_relays(target_pubkey, Some(&advert))
             .await?;
@@ -540,11 +655,10 @@ impl NostrBootstrap {
         &self,
         peer_npub: &str,
         target_pubkey: PublicKey,
-    ) -> Result<TraversalAdvert, BootstrapError> {
-        if let Some(cached) = self.advert_cache.read().await.get(peer_npub).cloned()
-            && cached.expires_at > now_ms()
-        {
-            return Ok(cached);
+    ) -> Result<OverlayAdvert, BootstrapError> {
+        self.prune_advert_cache().await;
+        if let Some(cached) = self.advert_cache.read().await.get(peer_npub).cloned() {
+            return Ok(cached.advert);
         }
 
         let events = self
@@ -554,50 +668,61 @@ impl NostrBootstrap {
                 Filter::new()
                     .author(target_pubkey)
                     .kind(Kind::Custom(ADVERT_KIND))
-                    .identifier(format!("udp-service-v1/{}", self.config.app)),
+                    .identifier(ADVERT_IDENTIFIER),
                 Duration::from_secs(2),
             )
             .await
             .map_err(|e| BootstrapError::Nostr(e.to_string()))?;
 
-        let mut best: Option<TraversalAdvert> = None;
+        let mut best: Option<CachedOverlayAdvert> = None;
         for event in events.iter() {
-            let Ok(advert) = serde_json::from_str::<TraversalAdvert>(&event.content) else {
+            let Some(valid_until_ms) = self.event_valid_until_ms(event) else {
                 continue;
             };
-            if advert.expires_at <= now_ms() {
+            let Ok(advert) = Self::parse_overlay_advert_event(event, &self.config.app) else {
                 continue;
-            }
-            if advert.publisher_npub != peer_npub {
+            };
+            let Ok(author_npub) = event.pubkey.to_bech32() else {
+                continue;
+            };
+            if author_npub != peer_npub {
                 continue;
             }
             let replace = best
                 .as_ref()
-                .map(|current| advert.published_at >= current.published_at)
+                .map(|current| event.created_at.as_u64() >= current.created_at)
                 .unwrap_or(true);
             if replace {
-                best = Some(advert);
+                best = Some(CachedOverlayAdvert {
+                    author_npub,
+                    advert,
+                    created_at: event.created_at.as_u64(),
+                    valid_until_ms,
+                });
             }
         }
 
-        let advert = best.ok_or_else(|| BootstrapError::MissingAdvert(peer_npub.to_string()))?;
+        let cached = best.ok_or_else(|| BootstrapError::MissingAdvert(peer_npub.to_string()))?;
         self.advert_cache
             .write()
             .await
-            .insert(peer_npub.to_string(), advert.clone());
-        Ok(advert)
+            .insert(peer_npub.to_string(), cached.clone());
+        self.prune_advert_cache().await;
+        Ok(cached.advert)
     }
 
     async fn preferred_signal_relays(
         &self,
         target_pubkey: PublicKey,
-        advert: Option<&TraversalAdvert>,
+        advert: Option<&OverlayAdvert>,
     ) -> Result<Vec<String>, BootstrapError> {
         let mut merged = self.find_recipient_inbox_relays(target_pubkey).await?;
         if let Some(advert) = advert {
-            for relay in &advert.relays {
-                if !merged.contains(relay) {
-                    merged.push(relay.clone());
+            if let Some(relays) = advert.signal_relays.as_ref() {
+                for relay in relays {
+                    if !merged.contains(relay) {
+                        merged.push(relay.clone());
+                    }
                 }
             }
         }
@@ -649,6 +774,137 @@ impl NostrBootstrap {
             }
         }
         Ok(self.config.dm_relays.clone())
+    }
+
+    fn parse_overlay_advert_event(
+        event: &Event,
+        expected_app: &str,
+    ) -> Result<OverlayAdvert, BootstrapError> {
+        let advertised_app = event
+            .tags
+            .find(TagKind::custom("protocol"))
+            .and_then(|tag| tag.content())
+            .ok_or_else(|| {
+                BootstrapError::InvalidAdvert("missing required protocol tag".to_string())
+            })?;
+        if advertised_app != expected_app {
+            return Err(BootstrapError::InvalidAdvert(format!(
+                "unsupported protocol '{}'",
+                advertised_app
+            )));
+        }
+
+        let advert: OverlayAdvert = serde_json::from_str(&event.content)?;
+        Self::validate_overlay_advert(advert)
+    }
+
+    pub(super) fn validate_overlay_advert(
+        mut advert: OverlayAdvert,
+    ) -> Result<OverlayAdvert, BootstrapError> {
+        if advert.identifier != ADVERT_IDENTIFIER {
+            return Err(BootstrapError::InvalidAdvert(format!(
+                "unsupported identifier '{}'",
+                advert.identifier
+            )));
+        }
+        if advert.version != ADVERT_VERSION {
+            return Err(BootstrapError::InvalidAdvert(format!(
+                "unsupported version '{}'",
+                advert.version
+            )));
+        }
+        if advert.endpoints.is_empty() {
+            return Err(BootstrapError::InvalidAdvert(
+                "missing required endpoints".to_string(),
+            ));
+        }
+        for endpoint in &advert.endpoints {
+            if endpoint.addr.trim().is_empty() {
+                return Err(BootstrapError::InvalidAdvert(
+                    "endpoint addr cannot be empty".to_string(),
+                ));
+            }
+        }
+
+        let has_nat = advert.has_udp_nat_endpoint();
+        if has_nat {
+            if advert
+                .signal_relays
+                .as_ref()
+                .is_none_or(|relays| relays.is_empty())
+            {
+                return Err(BootstrapError::InvalidAdvert(
+                    "udp:nat endpoint requires signalRelays".to_string(),
+                ));
+            }
+            if advert
+                .stun_servers
+                .as_ref()
+                .is_none_or(|servers| servers.is_empty())
+            {
+                return Err(BootstrapError::InvalidAdvert(
+                    "udp:nat endpoint requires stunServers".to_string(),
+                ));
+            }
+        } else {
+            advert.signal_relays = None;
+            advert.stun_servers = None;
+        }
+
+        Ok(advert)
+    }
+
+    async fn prune_advert_cache(&self) {
+        let now = now_ms();
+        let mut cache = self.advert_cache.write().await;
+        cache.retain(|_, entry| entry.valid_until_ms > now);
+        if cache.len() <= ADVERT_CACHE_MAX_ENTRIES {
+            return;
+        }
+
+        let mut oldest = cache
+            .iter()
+            .map(|(npub, entry)| (npub.clone(), entry.valid_until_ms))
+            .collect::<Vec<_>>();
+        oldest.sort_by_key(|(_, ts)| *ts);
+        let overflow = cache.len().saturating_sub(ADVERT_CACHE_MAX_ENTRIES);
+        for (npub, _) in oldest.into_iter().take(overflow) {
+            cache.remove(&npub);
+        }
+    }
+
+    fn advert_max_age_ms(&self) -> u64 {
+        self.config.advert_ttl_secs * 1000 * ADVERT_CACHE_STALE_GRACE_MULTIPLIER
+    }
+
+    fn event_valid_until_ms(&self, event: &Event) -> Option<u64> {
+        Self::compute_advert_valid_until_ms(event, self.advert_max_age_ms(), now_ms())
+    }
+
+    pub(super) fn compute_advert_valid_until_ms(
+        event: &Event,
+        advert_max_age_ms: u64,
+        now_ms: u64,
+    ) -> Option<u64> {
+        if event.is_expired() {
+            return None;
+        }
+
+        let created_ms = event.created_at.as_u64().saturating_mul(1000);
+        let created_window_until = created_ms.saturating_add(advert_max_age_ms);
+        if created_window_until <= now_ms {
+            return None;
+        }
+
+        let expires_ms = event
+            .tags
+            .expiration()
+            .map(|timestamp| timestamp.as_u64().saturating_mul(1000));
+        let valid_until_ms = expires_ms
+            .map(|expires| expires.min(created_window_until))
+            .unwrap_or(created_window_until);
+
+        (valid_until_ms > now_ms).then_some(valid_until_ms)
     }
 
     async fn send_signal<T: Serialize>(

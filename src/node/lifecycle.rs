@@ -3,17 +3,26 @@
 use super::{Node, NodeError, NodeState};
 use crate::node::acl::PeerAclContext;
 #[cfg(feature = "nostr-bootstrap")]
-use crate::bootstrap::nostr::{BootstrapEvent, NostrBootstrap};
+use crate::bootstrap::nostr::{
+    ADVERT_IDENTIFIER, ADVERT_VERSION, BootstrapEvent, NostrBootstrap, OverlayAdvert,
+    OverlayEndpointAdvert, OverlayTransportKind,
+};
 use crate::bootstrap::{BootstrapHandoffResult, EstablishedTraversal};
+use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
 use crate::node::wire::build_msg1;
 use crate::peer::PeerConnection;
 use crate::protocol::{Disconnect, DisconnectReason};
 use crate::transport::{Link, LinkDirection, LinkId, TransportAddr, TransportId, packet_channel};
 use crate::upper::tun::{TunDevice, TunState, run_tun_reader, shutdown_tun_interface};
 use crate::{NodeAddr, PeerIdentity};
+#[cfg(feature = "nostr-bootstrap")]
+use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+#[cfg(feature = "nostr-bootstrap")]
+const OPEN_DISCOVERY_RETRY_LIFETIME_MULTIPLIER: u64 = 2;
 
 impl Node {
     /// Initiate connections to configured static peers.
@@ -379,6 +388,10 @@ impl Node {
                 return;
             };
 
+            if let Err(err) = self.refresh_overlay_advert(&bootstrap).await {
+                debug!(error = %err, "Failed to refresh local Nostr overlay advert");
+            }
+
             for event in bootstrap.drain_events().await {
                 match event {
                     BootstrapEvent::Established { traversal } => {
@@ -417,6 +430,8 @@ impl Node {
                     }
                 }
             }
+
+            self.queue_open_discovery_retries(&bootstrap).await;
         }
     }
 
@@ -530,29 +545,7 @@ impl Node {
         self.packet_tx = Some(packet_tx.clone());
         self.packet_rx = Some(packet_rx);
 
-        #[cfg(feature = "nostr-bootstrap")]
-        if self.config.node.discovery.nostr.enabled {
-            match NostrBootstrap::start(&self.identity, self.config.node.discovery.nostr.clone())
-                .await
-            {
-                Ok(runtime) => {
-                    self.nostr_bootstrap = Some(runtime);
-                    info!("Nostr NAT traversal bootstrap enabled");
-                }
-                Err(err) => {
-                    warn!(error = %err, "Failed to start Nostr NAT traversal bootstrap");
-                }
-            }
-        }
-
-        #[cfg(not(feature = "nostr-bootstrap"))]
-        if self.config.node.discovery.nostr.enabled {
-            warn!(
-                "Nostr NAT traversal bootstrap configured but this build was compiled without the 'nostr-bootstrap' feature"
-            );
-        }
-
-        // Initialize transports first (before TUN)
+        // Initialize transports first (before TUN, before Nostr discovery).
         let transport_handles = self.create_transports(&packet_tx).await;
 
         for mut handle in transport_handles {
@@ -576,6 +569,31 @@ impl Node {
 
         if !self.transports.is_empty() {
             info!(count = self.transports.len(), "Transports initialized");
+        }
+
+        #[cfg(feature = "nostr-bootstrap")]
+        if self.config.node.discovery.nostr.enabled {
+            match NostrBootstrap::start(&self.identity, self.config.node.discovery.nostr.clone())
+                .await
+            {
+                Ok(runtime) => {
+                    if let Err(err) = self.refresh_overlay_advert(&runtime).await {
+                        warn!(error = %err, "Failed to publish initial Nostr overlay advert");
+                    }
+                    self.nostr_bootstrap = Some(runtime);
+                    info!("Nostr overlay discovery enabled");
+                }
+                Err(err) => {
+                    warn!(error = %err, "Failed to start Nostr overlay discovery");
+                }
+            }
+        }
+
+        #[cfg(not(feature = "nostr-bootstrap"))]
+        if self.config.node.discovery.nostr.enabled {
+            warn!(
+                "Nostr overlay discovery configured but this build was compiled without the 'nostr-bootstrap' feature"
+            );
         }
 
         // Connect to static peers before TUN is active
@@ -842,12 +860,12 @@ impl Node {
         self.send_disconnect_to_all_peers(DisconnectReason::Shutdown)
             .await;
 
-        // Stop NAT traversal bootstrap background work and withdraw any advert
+        // Stop Nostr overlay discovery background work and withdraw any advert.
         #[cfg(feature = "nostr-bootstrap")]
         if let Some(bootstrap) = self.nostr_bootstrap.take()
             && let Err(e) = bootstrap.shutdown().await
         {
-            warn!(error = %e, "Failed to shutdown Nostr NAT traversal bootstrap");
+            warn!(error = %e, "Failed to shutdown Nostr overlay discovery");
         }
 
         // Shutdown transports (they're packet producers)
@@ -955,13 +973,95 @@ impl Node {
         info!(sent, total = peer_addrs.len(), reason = %reason, "Sent disconnect notifications");
     }
 
-    pub(in crate::node) async fn try_peer_addresses(
+    fn static_peer_addresses(&self, peer_config: &PeerConfig) -> Vec<PeerAddress> {
+        peer_config
+            .addresses_by_priority()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    async fn nostr_peer_fallback_addresses(
+        &self,
+        peer_config: &PeerConfig,
+        existing: &[PeerAddress],
+    ) -> Vec<PeerAddress> {
+        if !self.config.node.discovery.nostr.enabled
+            || !peer_config.via_nostr
+            || self.config.node.discovery.nostr.policy
+                == crate::config::NostrDiscoveryPolicy::Disabled
+        {
+            return Vec::new();
+        }
+
+        let Some(bootstrap) = self.nostr_bootstrap.clone() else {
+            return Vec::new();
+        };
+        let endpoints = match bootstrap.advert_endpoints_for_peer(&peer_config.npub).await {
+            Ok(endpoints) => endpoints,
+            Err(err) => {
+                debug!(
+                    npub = %peer_config.npub,
+                    error = %err,
+                    "Failed to resolve Nostr advert endpoints for configured peer"
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut fallback = Vec::new();
+        let mut next_priority = existing
+            .iter()
+            .map(|addr| addr.priority)
+            .max()
+            .unwrap_or(100)
+            .saturating_add(1);
+        for endpoint in endpoints {
+            let Some(candidate) = Self::overlay_endpoint_to_peer_address(&endpoint, next_priority)
+            else {
+                continue;
+            };
+            if existing
+                .iter()
+                .any(|addr| addr.transport == candidate.transport && addr.addr == candidate.addr)
+                || fallback.iter().any(|addr: &PeerAddress| {
+                    addr.transport == candidate.transport && addr.addr == candidate.addr
+                })
+            {
+                continue;
+            }
+            fallback.push(candidate);
+            next_priority = next_priority.saturating_add(1);
+        }
+        fallback
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    fn overlay_endpoint_to_peer_address(
+        endpoint: &OverlayEndpointAdvert,
+        priority: u8,
+    ) -> Option<PeerAddress> {
+        let transport = match endpoint.transport {
+            OverlayTransportKind::Udp => "udp",
+            OverlayTransportKind::Tcp => "tcp",
+            OverlayTransportKind::Tor => "tor",
+        };
+        Some(PeerAddress::with_priority(
+            transport,
+            endpoint.addr.clone(),
+            priority,
+        ))
+    }
+
+    async fn attempt_peer_address_list(
         &mut self,
-        peer_config: &crate::config::PeerConfig,
+        peer_config: &PeerConfig,
         peer_identity: PeerIdentity,
         allow_bootstrap_nat: bool,
+        addresses: &[PeerAddress],
     ) -> Result<(), NodeError> {
-        for addr in peer_config.addresses_by_priority() {
+        for addr in addresses {
             if addr.transport == "udp" && addr.addr.eq_ignore_ascii_case("nat") {
                 if !allow_bootstrap_nat {
                     continue;
@@ -974,11 +1074,11 @@ impl Node {
                 #[cfg(feature = "nostr-bootstrap")]
                 {
                     let Some(bootstrap) = self.nostr_bootstrap.clone() else {
-                        debug!(npub = %peer_config.npub, "No Nostr bootstrap runtime for udp:nat address");
+                        debug!(npub = %peer_config.npub, "No Nostr overlay runtime for udp:nat address");
                         continue;
                     };
                     bootstrap.request_connect(peer_config.clone()).await;
-                    info!(npub = %peer_config.npub, "Started Nostr NAT traversal attempt");
+                    info!(npub = %peer_config.npub, "Started Nostr UDP NAT traversal attempt");
                     return Ok(());
                 }
             }
@@ -1055,6 +1155,318 @@ impl Node {
         )))
     }
 
+    #[cfg(feature = "nostr-bootstrap")]
+    async fn queue_open_discovery_retries(&mut self, bootstrap: &std::sync::Arc<NostrBootstrap>) {
+        if !self.config.node.discovery.nostr.enabled
+            || self.config.node.discovery.nostr.policy != crate::config::NostrDiscoveryPolicy::Open
+        {
+            return;
+        }
+
+        let configured_npubs = self
+            .config
+            .peers()
+            .iter()
+            .map(|peer| peer.npub.clone())
+            .collect::<HashSet<_>>();
+        let now_ms = Self::now_ms();
+        let mut enqueue_budget = self.open_discovery_enqueue_budget(&configured_npubs);
+        if enqueue_budget == 0 {
+            return;
+        }
+
+        for (npub, endpoints) in bootstrap.cached_open_discovery_candidates(64).await {
+            if enqueue_budget == 0 {
+                break;
+            }
+            if configured_npubs.contains(&npub) {
+                continue;
+            }
+
+            let peer_identity = match PeerIdentity::from_npub(&npub) {
+                Ok(identity) => identity,
+                Err(_) => continue,
+            };
+            let node_addr = *peer_identity.node_addr();
+            if node_addr == *self.identity.node_addr() || self.peers.contains_key(&node_addr) {
+                continue;
+            }
+            if self.retry_pending.contains_key(&node_addr) {
+                continue;
+            }
+            let connecting = self.connections.values().any(|conn| {
+                conn.expected_identity()
+                    .map(|id| id.node_addr() == &node_addr)
+                    .unwrap_or(false)
+            });
+            if connecting {
+                continue;
+            }
+
+            let mut addresses = Vec::new();
+            let mut priority = 120u8;
+            for endpoint in endpoints {
+                let Some(candidate) = Self::overlay_endpoint_to_peer_address(&endpoint, priority)
+                else {
+                    continue;
+                };
+                if addresses.iter().any(|existing: &PeerAddress| {
+                    existing.transport == candidate.transport && existing.addr == candidate.addr
+                }) {
+                    continue;
+                }
+                addresses.push(candidate);
+                priority = priority.saturating_add(1);
+            }
+            if addresses.is_empty() {
+                continue;
+            }
+
+            self.peer_aliases
+                .entry(node_addr)
+                .or_insert_with(|| peer_identity.short_npub());
+            self.register_identity(node_addr, peer_identity.pubkey_full());
+
+            let mut state = super::retry::RetryState::new(PeerConfig {
+                npub: npub.clone(),
+                alias: None,
+                addresses,
+                connect_policy: ConnectPolicy::AutoConnect,
+                auto_reconnect: true,
+                via_nostr: false,
+            });
+            state.reconnect = false;
+            state.retry_after_ms = now_ms;
+            state.expires_at_ms = Some(self.open_discovery_retry_expires_at_ms(now_ms));
+            self.retry_pending.insert(node_addr, state);
+            enqueue_budget = enqueue_budget.saturating_sub(1);
+        }
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    fn available_outbound_slots(&self) -> usize {
+        let connection_used = self
+            .connections
+            .len()
+            .saturating_add(self.pending_connects.len());
+        let connection_slots = if self.max_connections == 0 {
+            usize::MAX
+        } else {
+            self.max_connections.saturating_sub(connection_used)
+        };
+
+        let peer_slots = if self.max_peers == 0 {
+            usize::MAX
+        } else {
+            self.max_peers.saturating_sub(self.peers.len())
+        };
+
+        connection_slots.min(peer_slots)
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    fn open_discovery_enqueue_budget(&self, configured_npubs: &HashSet<String>) -> usize {
+        let current_open_discovery_pending = self
+            .retry_pending
+            .values()
+            .filter(|state| !configured_npubs.contains(&state.peer_config.npub))
+            .count();
+
+        let cap_remaining = self
+            .config
+            .node
+            .discovery
+            .nostr
+            .open_discovery_max_pending
+            .saturating_sub(current_open_discovery_pending);
+
+        cap_remaining.min(self.available_outbound_slots())
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    fn open_discovery_retry_expires_at_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_add(
+            self.config
+                .node
+                .discovery
+                .nostr
+                .advert_ttl_secs
+                .saturating_mul(1000)
+                .saturating_mul(OPEN_DISCOVERY_RETRY_LIFETIME_MULTIPLIER),
+        )
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    fn build_overlay_advert(&self) -> Option<OverlayAdvert> {
+        if !self.config.node.discovery.nostr.enabled {
+            return None;
+        }
+
+        let mut endpoints = Vec::new();
+        let mut has_udp_nat = false;
+
+        for handle in self.transports.values() {
+            if !handle.is_operational() {
+                continue;
+            }
+
+            match handle.transport_type().name {
+                "udp" => {
+                    let Some(cfg) = self.lookup_udp_config(handle.name()) else {
+                        continue;
+                    };
+                    if !cfg.advertise_on_nostr() {
+                        continue;
+                    }
+                    if cfg.is_public() {
+                        if let Some(addr) = handle.local_addr()
+                            && !addr.ip().is_unspecified()
+                        {
+                            endpoints.push(OverlayEndpointAdvert {
+                                transport: OverlayTransportKind::Udp,
+                                addr: addr.to_string(),
+                            });
+                        }
+                    } else {
+                        endpoints.push(OverlayEndpointAdvert {
+                            transport: OverlayTransportKind::Udp,
+                            addr: "nat".to_string(),
+                        });
+                        has_udp_nat = true;
+                    }
+                }
+                "tcp" => {
+                    let Some(cfg) = self.lookup_tcp_config(handle.name()) else {
+                        continue;
+                    };
+                    if !cfg.advertise_on_nostr() {
+                        continue;
+                    }
+                    if let Some(addr) = handle.local_addr()
+                        && !addr.ip().is_unspecified()
+                    {
+                        endpoints.push(OverlayEndpointAdvert {
+                            transport: OverlayTransportKind::Tcp,
+                            addr: addr.to_string(),
+                        });
+                    }
+                }
+                "tor" => {
+                    let Some(cfg) = self.lookup_tor_config(handle.name()) else {
+                        continue;
+                    };
+                    if !cfg.advertise_on_nostr() {
+                        continue;
+                    }
+                    if let Some(addr) = handle.onion_address() {
+                        endpoints.push(OverlayEndpointAdvert {
+                            transport: OverlayTransportKind::Tor,
+                            addr: addr.to_string(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if endpoints.is_empty() {
+            return None;
+        }
+
+        Some(OverlayAdvert {
+            identifier: ADVERT_IDENTIFIER.to_string(),
+            version: ADVERT_VERSION,
+            endpoints,
+            signal_relays: has_udp_nat.then(|| self.config.node.discovery.nostr.dm_relays.clone()),
+            stun_servers: has_udp_nat
+                .then(|| self.config.node.discovery.nostr.stun_servers.clone()),
+        })
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    async fn refresh_overlay_advert(
+        &self,
+        bootstrap: &std::sync::Arc<NostrBootstrap>,
+    ) -> Result<(), crate::bootstrap::nostr::BootstrapError> {
+        let advert = self.build_overlay_advert();
+        bootstrap.update_local_advert(advert).await
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    fn lookup_udp_config(&self, transport_name: Option<&str>) -> Option<&crate::config::UdpConfig> {
+        match (&self.config.transports.udp, transport_name) {
+            (crate::config::TransportInstances::Single(cfg), None) => Some(cfg),
+            (crate::config::TransportInstances::Named(configs), Some(name)) => configs.get(name),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    fn lookup_tcp_config(&self, transport_name: Option<&str>) -> Option<&crate::config::TcpConfig> {
+        match (&self.config.transports.tcp, transport_name) {
+            (crate::config::TransportInstances::Single(cfg), None) => Some(cfg),
+            (crate::config::TransportInstances::Named(configs), Some(name)) => configs.get(name),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "nostr-bootstrap")]
+    fn lookup_tor_config(&self, transport_name: Option<&str>) -> Option<&crate::config::TorConfig> {
+        match (&self.config.transports.tor, transport_name) {
+            (crate::config::TransportInstances::Single(cfg), None) => Some(cfg),
+            (crate::config::TransportInstances::Named(configs), Some(name)) => configs.get(name),
+            _ => None,
+        }
+    }
+
+    pub(in crate::node) async fn try_peer_addresses(
+        &mut self,
+        peer_config: &PeerConfig,
+        peer_identity: PeerIdentity,
+        allow_bootstrap_nat: bool,
+    ) -> Result<(), NodeError> {
+        // Static-first dialing: avoid delaying configured address attempts on
+        // advert fetch/network latency.
+        let static_addresses = self.static_peer_addresses(peer_config);
+        if self
+            .attempt_peer_address_list(
+                peer_config,
+                peer_identity,
+                allow_bootstrap_nat,
+                &static_addresses,
+            )
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        #[cfg(feature = "nostr-bootstrap")]
+        {
+            let fallback = self
+                .nostr_peer_fallback_addresses(peer_config, &static_addresses)
+                .await;
+            if !fallback.is_empty()
+                && self
+                    .attempt_peer_address_list(
+                        peer_config,
+                        peer_identity,
+                        allow_bootstrap_nat,
+                        &fallback,
+                    )
+                    .await
+                    .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
+        Err(NodeError::NoTransportForType(format!(
+            "no operational transport for any of {}'s addresses",
+            peer_config.npub
+        )))
+    }
+
     // === Control API methods ===
 
     /// Connect to a peer via the control API.
@@ -1068,12 +1480,13 @@ impl Node {
         address: &str,
         transport: &str,
     ) -> Result<serde_json::Value, String> {
-        let peer_config = crate::config::PeerConfig {
+        let peer_config = PeerConfig {
             npub: npub.to_string(),
             alias: None,
-            addresses: vec![crate::config::PeerAddress::new(transport, address)],
-            connect_policy: crate::config::ConnectPolicy::Manual,
+            addresses: vec![PeerAddress::new(transport, address)],
+            connect_policy: ConnectPolicy::Manual,
             auto_reconnect: false,
+            via_nostr: false,
         };
 
         // Pre-seed identity cache (same as initiate_peer_connections does)

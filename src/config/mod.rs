@@ -34,8 +34,8 @@ use thiserror::Error;
 pub use gateway::{ConntrackConfig, GatewayConfig, GatewayDnsConfig, PortForward, Proto};
 pub use node::{
     BloomConfig, BuffersConfig, CacheConfig, ControlConfig, DiscoveryConfig, LimitsConfig,
-    NodeConfig, NostrBootstrapConfig, RateLimitConfig, RekeyConfig, RetryConfig, SessionConfig,
-    SessionMmpConfig, TreeConfig,
+    NodeConfig, NostrBootstrapConfig, NostrDiscoveryPolicy, RateLimitConfig, RekeyConfig,
+    RetryConfig, SessionConfig, SessionMmpConfig, TreeConfig,
 };
 pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
 pub use transport::{
@@ -337,6 +337,9 @@ pub enum ConfigError {
 
     #[error("identity error: {0}")]
     Identity(#[from] IdentityError),
+
+    #[error("invalid configuration: {0}")]
+    Validation(String),
 }
 
 /// Identity configuration (`node.identity.*`).
@@ -535,6 +538,60 @@ impl Config {
     /// Get peers that should auto-connect on startup.
     pub fn auto_connect_peers(&self) -> impl Iterator<Item = &PeerConfig> {
         self.peers.iter().filter(|p| p.is_auto_connect())
+    }
+
+    /// Validate cross-field configuration invariants.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let nostr = &self.node.discovery.nostr;
+
+        let any_transport_advertises_on_nostr = self
+            .transports
+            .udp
+            .iter()
+            .any(|(_, cfg)| cfg.advertise_on_nostr())
+            || self
+                .transports
+                .tcp
+                .iter()
+                .any(|(_, cfg)| cfg.advertise_on_nostr())
+            || self
+                .transports
+                .tor
+                .iter()
+                .any(|(_, cfg)| cfg.advertise_on_nostr());
+
+        if any_transport_advertises_on_nostr && !nostr.enabled {
+            return Err(ConfigError::Validation(
+                "at least one transport has `advertise_on_nostr = true`, but `node.discovery.nostr.enabled` is false".to_string(),
+            ));
+        }
+
+        if self.peers.iter().any(|peer| peer.via_nostr) && !nostr.enabled {
+            return Err(ConfigError::Validation(
+                "at least one peer has `via_nostr = true`, but `node.discovery.nostr.enabled` is false".to_string(),
+            ));
+        }
+
+        let has_nat_udp_advert = self
+            .transports
+            .udp
+            .iter()
+            .any(|(_, cfg)| cfg.advertise_on_nostr() && !cfg.is_public());
+
+        if nostr.enabled && has_nat_udp_advert {
+            if nostr.dm_relays.is_empty() {
+                return Err(ConfigError::Validation(
+                    "NAT UDP advert publishing requires `node.discovery.nostr.dm_relays` to be non-empty".to_string(),
+                ));
+            }
+            if nostr.stun_servers.is_empty() {
+                return Err(ConfigError::Validation(
+                    "NAT UDP advert publishing requires `node.discovery.nostr.stun_servers` to be non-empty".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Serialize this configuration to YAML.
@@ -1116,6 +1173,8 @@ node:
     nostr:
       enabled: true
       advertise: false
+      policy: configured_only
+      open_discovery_max_pending: 12
       app: "fips.nat.test.v1"
       signal_ttl_secs: 45
       advert_relays:
@@ -1126,6 +1185,7 @@ node:
         - "stun:stun.example.org:3478"
 peers:
   - npub: "npub1peer"
+    via_nostr: true
     addresses:
       - transport: udp
         addr: "nat"
@@ -1135,6 +1195,11 @@ peers:
         assert!(!config.node.discovery.nostr.advertise);
         assert_eq!(config.node.discovery.nostr.app, "fips.nat.test.v1");
         assert_eq!(config.node.discovery.nostr.signal_ttl_secs, 45);
+        assert_eq!(
+            config.node.discovery.nostr.policy,
+            NostrDiscoveryPolicy::ConfiguredOnly
+        );
+        assert_eq!(config.node.discovery.nostr.open_discovery_max_pending, 12);
         assert_eq!(
             config.node.discovery.nostr.advert_relays,
             vec!["wss://relay-a.example".to_string()]
@@ -1151,5 +1216,53 @@ peers:
             config.peers[0].addresses[0].addr, "nat",
             "udp:nat address should parse without special-casing in YAML"
         );
+        assert!(config.peers[0].via_nostr);
+    }
+
+    #[test]
+    fn test_validate_transport_advert_requires_nostr_enabled() {
+        let mut config = Config::default();
+        config.transports.udp = TransportInstances::Single(UdpConfig {
+            advertise_on_nostr: Some(true),
+            ..Default::default()
+        });
+        config.node.discovery.nostr.enabled = false;
+
+        let err = config.validate().expect_err("validation should fail");
+        assert!(err.to_string().contains("advertise_on_nostr"));
+    }
+
+    #[test]
+    fn test_validate_peer_via_nostr_requires_nostr_enabled() {
+        let mut config = Config::default();
+        config.peers = vec![PeerConfig {
+            npub: "npub1peer".to_string(),
+            via_nostr: true,
+            ..Default::default()
+        }];
+        config.node.discovery.nostr.enabled = false;
+
+        let err = config.validate().expect_err("validation should fail");
+        assert!(err.to_string().contains("via_nostr"));
+    }
+
+    #[test]
+    fn test_validate_nat_udp_advert_requires_relays_and_stun() {
+        let mut config = Config::default();
+        config.node.discovery.nostr.enabled = true;
+        config.node.discovery.nostr.dm_relays.clear();
+        config.transports.udp = TransportInstances::Single(UdpConfig {
+            advertise_on_nostr: Some(true),
+            public: Some(false),
+            ..Default::default()
+        });
+
+        let err = config.validate().expect_err("validation should fail");
+        assert!(err.to_string().contains("dm_relays"));
+
+        config.node.discovery.nostr.dm_relays = vec!["wss://relay.example".to_string()];
+        config.node.discovery.nostr.stun_servers.clear();
+        let err = config.validate().expect_err("validation should fail");
+        assert!(err.to_string().contains("stun_servers"));
     }
 }

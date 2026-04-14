@@ -404,7 +404,7 @@ Ethernet, Tor, and Bluetooth (BLE) with a small live mesh of deployed nodes.
 ### Near-term priorities
 
 - Peer discovery via Nostr relays (bootstrap without static peer lists)
-- Issue-37 traversal support now exists as an optional in-tree bootstrap plus the supporting [examples/nostr-bootstrap](examples/nostr-bootstrap/README.md) helper crate
+- Nostr-mediated overlay endpoint discovery with optional `udp:nat` rendezvous
 - Native API for FIPS-aware applications (npub:port addressing)
 - Security audit of cryptographic protocols
 

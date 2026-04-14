@@ -448,6 +448,8 @@ mod tests {
             mtu: Some(1280),
             recv_buf_size: None,
             send_buf_size: None,
+            advertise_on_nostr: None,
+            public: None,
         }
     }
 

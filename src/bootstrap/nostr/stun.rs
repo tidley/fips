@@ -227,11 +227,84 @@ async fn resolve_udp_target(host: &str, port: u16) -> Result<Option<SocketAddr>,
 
 fn local_addresses_from_port(port: u16) -> Vec<String> {
     let mut addresses = Vec::new();
+    push_private_interface_ips(&mut addresses);
     push_local_probe(&mut addresses, "0.0.0.0:0", "8.8.8.8:80");
     push_local_probe(&mut addresses, "[::]:0", "[2001:4860:4860::8888]:80");
     push_bound_addr(&mut addresses, ("0.0.0.0", port));
     push_bound_addr(&mut addresses, ("::", port));
     addresses
+}
+
+fn push_private_interface_ips(addresses: &mut Vec<String>) {
+    for ip in private_interface_ips() {
+        push_ip(addresses, ip);
+    }
+}
+
+#[cfg(unix)]
+fn private_interface_ips() -> Vec<IpAddr> {
+    let mut output = Vec::new();
+    let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+
+    // SAFETY: `getifaddrs` initializes `ifaddrs` on success, and the linked
+    // list is valid until `freeifaddrs` is called.
+    let rc = unsafe { libc::getifaddrs(&mut ifaddrs) };
+    if rc != 0 || ifaddrs.is_null() {
+        return output;
+    }
+
+    let mut cursor = ifaddrs;
+    while !cursor.is_null() {
+        // SAFETY: `cursor` points at a valid node from the `getifaddrs` list.
+        let entry = unsafe { &*cursor };
+        let flags = entry.ifa_flags as i32;
+        let is_up = (flags & libc::IFF_UP as i32) != 0;
+        let is_loopback = (flags & libc::IFF_LOOPBACK as i32) != 0;
+
+        if is_up && !is_loopback && !entry.ifa_addr.is_null() {
+            // SAFETY: `ifa_addr` is non-null and its concrete type matches
+            // `sa_family` for this entry.
+            let maybe_ip = unsafe {
+                match (*entry.ifa_addr).sa_family as i32 {
+                    libc::AF_INET => {
+                        let sockaddr = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                        Some(IpAddr::V4(Ipv4Addr::from(
+                            sockaddr.sin_addr.s_addr.to_ne_bytes(),
+                        )))
+                    }
+                    libc::AF_INET6 => {
+                        let sockaddr = &*(entry.ifa_addr as *const libc::sockaddr_in6);
+                        Some(IpAddr::V6(Ipv6Addr::from(sockaddr.sin6_addr.s6_addr)))
+                    }
+                    _ => None,
+                }
+            };
+
+            if let Some(ip) = maybe_ip
+                && is_private_overlay_candidate_ip(ip)
+            {
+                output.push(ip);
+            }
+        }
+
+        cursor = entry.ifa_next;
+    }
+
+    // SAFETY: `ifaddrs` came from `getifaddrs` and has not yet been freed.
+    unsafe { libc::freeifaddrs(ifaddrs) };
+    output
+}
+
+#[cfg(not(unix))]
+fn private_interface_ips() -> Vec<IpAddr> {
+    Vec::new()
+}
+
+fn is_private_overlay_candidate_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => v6.is_unique_local(),
+    }
 }
 
 fn push_local_probe(addresses: &mut Vec<String>, bind_addr: &str, connect_addr: &str) {
@@ -258,6 +331,44 @@ fn push_ip(addresses: &mut Vec<String>, ip: IpAddr) {
     let ip = ip.to_string();
     if !addresses.contains(&ip) {
         addresses.push(ip);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_private_overlay_candidate_ip;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn private_overlay_candidate_filter_includes_rfc1918_and_ula() {
+        assert!(is_private_overlay_candidate_ip(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 10
+        ))));
+        assert!(is_private_overlay_candidate_ip(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 4
+        ))));
+        assert!(is_private_overlay_candidate_ip(IpAddr::V4(Ipv4Addr::new(
+            172, 16, 5, 20
+        ))));
+        assert!(is_private_overlay_candidate_ip(IpAddr::V6(
+            "fd00::1234".parse::<Ipv6Addr>().unwrap()
+        )));
+    }
+
+    #[test]
+    fn private_overlay_candidate_filter_excludes_public_and_link_local() {
+        assert!(!is_private_overlay_candidate_ip(IpAddr::V4(Ipv4Addr::new(
+            8, 8, 8, 8
+        ))));
+        assert!(!is_private_overlay_candidate_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 10
+        ))));
+        assert!(!is_private_overlay_candidate_ip(IpAddr::V6(
+            "fe80::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(!is_private_overlay_candidate_ip(IpAddr::V6(
+            "2001:db8::1".parse::<Ipv6Addr>().unwrap()
+        )));
     }
 }
 

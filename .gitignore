@@ -34,3 +34,4 @@ __pycache__/
 # Vendored experimental bootstrap subcrate
 examples/nostr-bootstrap/target/
 examples/nostr-bootstrap/Cargo.lock
+.planning/

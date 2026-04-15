@@ -111,6 +111,8 @@ transports:
   udp:
     bind_addr: "0.0.0.0:2121"
     mtu: 1472
+    advertise_on_nostr: true
+    public: false
   tcp:
     bind_addr: "0.0.0.0:8443"
 

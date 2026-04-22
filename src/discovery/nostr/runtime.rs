@@ -25,19 +25,20 @@ use super::types::{
     CachedOverlayAdvert, OverlayAdvert, OverlayEndpointAdvert, PROTOCOL_VERSION, PunchHint,
     SIGNAL_KIND, TraversalAnswer, TraversalOffer,
 };
-use crate::bootstrap::EstablishedTraversal;
-use crate::config::{NostrBootstrapConfig, PeerConfig};
+use crate::config::{NostrDiscoveryConfig, PeerConfig};
+use crate::discovery::EstablishedTraversal;
 
 const MAX_CONCURRENT_INCOMING_OFFERS: usize = 16;
 const ADVERT_CACHE_MAX_ENTRIES: usize = 2048;
+const SEEN_SESSIONS_MAX_ENTRIES: usize = ADVERT_CACHE_MAX_ENTRIES;
 const ADVERT_CACHE_STALE_GRACE_MULTIPLIER: u64 = 2;
 
-pub struct NostrBootstrap {
+pub struct NostrDiscovery {
     client: Client,
     keys: nostr::Keys,
     pubkey: PublicKey,
     npub: String,
-    config: NostrBootstrapConfig,
+    config: NostrDiscoveryConfig,
     advert_cache: RwLock<HashMap<String, CachedOverlayAdvert>>,
     local_advert: RwLock<Option<OverlayAdvert>>,
     current_advert_event_id: RwLock<Option<EventId>>,
@@ -51,10 +52,10 @@ pub struct NostrBootstrap {
     advertise_task: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl NostrBootstrap {
+impl NostrDiscovery {
     pub async fn start(
         identity: &crate::Identity,
-        config: NostrBootstrapConfig,
+        config: NostrDiscoveryConfig,
     ) -> Result<Arc<Self>, BootstrapError> {
         if !config.enabled {
             return Err(BootstrapError::Disabled);
@@ -491,7 +492,6 @@ impl NostrBootstrap {
             observe_traversal_addresses(&base_socket, &self.config.stun_servers).await?;
         let session_id = nonce();
         let offer = create_traversal_offer(
-            self.config.app.clone(),
             session_id.clone(),
             now_ms(),
             self.config.signal_ttl_secs * 1000,
@@ -583,7 +583,6 @@ impl NostrBootstrap {
             &offer,
             now_ms(),
             self.config.signal_ttl_secs * 1000,
-            &self.config.app,
             &sender_npub,
             &self.npub,
         )?;
@@ -595,7 +594,6 @@ impl NostrBootstrap {
             observe_traversal_addresses(&base_socket, &self.config.stun_servers).await?;
         let accepted = reflexive_address.is_some() || !local_addresses.is_empty();
         let answer = create_traversal_answer(
-            self.config.app.clone(),
             offer.session_id.clone(),
             now_ms(),
             self.config.signal_ttl_secs * 1000,
@@ -952,6 +950,17 @@ impl NostrBootstrap {
             return Err(BootstrapError::Replay(session_id.to_string()));
         }
         seen.insert(session_id.to_string(), expiry);
+        if seen.len() > SEEN_SESSIONS_MAX_ENTRIES {
+            let mut oldest = seen
+                .iter()
+                .map(|(session, expires_at)| (session.clone(), *expires_at))
+                .collect::<Vec<_>>();
+            oldest.sort_by_key(|(_, expires_at)| *expires_at);
+            let overflow = seen.len().saturating_sub(SEEN_SESSIONS_MAX_ENTRIES);
+            for (session, _) in oldest.into_iter().take(overflow) {
+                seen.remove(&session);
+            }
+        }
         Ok(())
     }
 }

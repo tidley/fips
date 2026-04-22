@@ -4,10 +4,10 @@
 //! connecting over arbitrary transports.
 
 pub mod bloom;
-pub mod bootstrap;
 pub mod cache;
 pub mod config;
 pub mod control;
+pub mod discovery;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 pub mod identity;
@@ -32,8 +32,8 @@ pub use identity::{
 pub use config::{Config, ConfigError, IdentityConfig, TorConfig, UdpConfig};
 pub use upper::config::{DnsConfig, TunConfig};
 
-// Re-export bootstrap types
-pub use bootstrap::{BootstrapHandoffResult, EstablishedTraversal};
+// Re-export discovery types
+pub use discovery::{BootstrapHandoffResult, EstablishedTraversal};
 
 // Re-export tree types
 pub use tree::{CoordEntry, ParentDeclaration, TreeCoordinate, TreeError, TreeState};

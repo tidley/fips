@@ -432,8 +432,8 @@ pub struct Node {
     retry_pending: HashMap<NodeAddr, retry::RetryState>,
 
     /// Optional Nostr/STUN overlay discovery coordinator for `udp:nat` peers.
-    #[cfg(feature = "nostr-bootstrap")]
-    nostr_bootstrap: Option<Arc<crate::bootstrap::nostr::NostrBootstrap>>,
+    #[cfg(feature = "nostr-discovery")]
+    nostr_discovery: Option<Arc<crate::discovery::nostr::NostrDiscovery>>,
     /// Per-peer UDP transports adopted from NAT traversal handoff.
     bootstrap_transports: HashSet<TransportId>,
 
@@ -597,8 +597,8 @@ impl Node {
             ),
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
-            #[cfg(feature = "nostr-bootstrap")]
-            nostr_bootstrap: None,
+            #[cfg(feature = "nostr-discovery")]
+            nostr_discovery: None,
             bootstrap_transports: HashSet::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
@@ -725,8 +725,8 @@ impl Node {
             discovery_forward_limiter: DiscoveryForwardRateLimiter::new(),
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
-            #[cfg(feature = "nostr-bootstrap")]
-            nostr_bootstrap: None,
+            #[cfg(feature = "nostr-discovery")]
+            nostr_discovery: None,
             bootstrap_transports: HashSet::new(),
             last_parent_reeval: None,
             last_congestion_log: None,

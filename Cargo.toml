@@ -13,7 +13,7 @@ default = ["tui", "ble"]
 tui = ["dep:ratatui"]
 ble = ["dep:bluer"]
 gateway = ["dep:rustables"]
-nostr-bootstrap = ["dep:nostr", "dep:nostr-sdk"]
+nostr-discovery = ["dep:nostr", "dep:nostr-sdk"]
 
 [dependencies]
 ratatui = { version = "0.30", optional = true }

@@ -34,7 +34,7 @@ use thiserror::Error;
 pub use gateway::{ConntrackConfig, GatewayConfig, GatewayDnsConfig, PortForward, Proto};
 pub use node::{
     BloomConfig, BuffersConfig, CacheConfig, ControlConfig, DiscoveryConfig, LimitsConfig,
-    NodeConfig, NostrBootstrapConfig, NostrDiscoveryPolicy, RateLimitConfig, RekeyConfig,
+    NodeConfig, NostrDiscoveryConfig, NostrDiscoveryPolicy, RateLimitConfig, RekeyConfig,
     RetryConfig, SessionConfig, SessionMmpConfig, TreeConfig,
 };
 pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
@@ -1166,7 +1166,7 @@ peers:
     }
 
     #[test]
-    fn test_parse_nostr_bootstrap_config() {
+    fn test_parse_nostr_discovery_config() {
         let yaml = r#"
 node:
   discovery:

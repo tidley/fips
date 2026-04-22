@@ -1,5 +1,5 @@
-use crate::bootstrap::EstablishedTraversal;
 use crate::config::PeerConfig;
+use crate::discovery::EstablishedTraversal;
 use serde::{Deserialize, Serialize};
 
 pub const ADVERT_KIND: u16 = 30078;
@@ -116,9 +116,6 @@ pub struct CachedOverlayAdvert {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraversalOffer {
-    pub app: String,
-    #[serde(rename = "eventKind")]
-    pub event_kind: u16,
     #[serde(rename = "type")]
     pub message_type: String,
     #[serde(rename = "sessionId")]
@@ -142,9 +139,6 @@ pub struct TraversalOffer {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraversalAnswer {
-    pub app: String,
-    #[serde(rename = "eventKind")]
-    pub event_kind: u16,
     #[serde(rename = "type")]
     pub message_type: String,
     #[serde(rename = "sessionId")]

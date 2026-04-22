@@ -12,7 +12,7 @@ node:
     # nsec: "nsec1..."
   discovery:
     # Optional Nostr-mediated overlay endpoint discovery.
-    # Requires a build of fips compiled with the 'nostr-bootstrap' feature.
+    # Requires a build of fips compiled with the 'nostr-discovery' feature.
     # nostr:
     #   enabled: true
     #   policy: configured_only  # disabled | configured_only | open
@@ -27,7 +27,6 @@ node:
     #   # Built-in relay/STUN defaults are best-effort and should be
     #   # overridden by operators for production use.
     #   stun_servers:
-    #     - "stun:fips.tomdwyer.uk:3478"
     #     - "stun:stun.l.google.com:19302"
     #     - "stun:global.stun.twilio.com:3478"
     #     - "stun:openrelay.metered.ca:80"

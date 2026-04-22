@@ -82,7 +82,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --release ${{ (runner.os == 'macOS' || runner.os == 'Windows') && '--no-default-features --features tui' || '--features "gateway nostr-bootstrap"' }}
+        run: cargo build --release ${{ (runner.os == 'macOS' || runner.os == 'Windows') && '--no-default-features --features tui' || '--features "gateway nostr-discovery"' }}
 
       - name: SHA-256 hashes (Linux)
         if: runner.os == 'Linux'

@@ -183,7 +183,7 @@ offer/answer + punch-through, after which the established UDP socket is handed
 into the normal FIPS transport/session stack.
 Inbox-relay discovery falls back to the local DM relay list if remote relay
 metadata cannot be fetched.
-This support is compiled behind the crate feature `nostr-bootstrap`; builds
+This support is compiled behind the crate feature `nostr-discovery`; builds
 without that feature ignore `udp:nat` bootstrap configuration.
 
 | Parameter | Type | Default | Description |
@@ -194,7 +194,7 @@ without that feature ignore `udp:nat` bootstrap configuration.
 | `node.discovery.nostr.advertise` | bool | `true` | Publish local endpoint adverts |
 | `node.discovery.nostr.advert_relays` | list[string] | `["wss://offchain.pub", "wss://strfry.bitsbytom.com"]` | Relays used for service adverts |
 | `node.discovery.nostr.dm_relays` | list[string] | `["wss://nip17.com", "wss://offchain.pub"]` | Relays used for encrypted signaling events |
-| `node.discovery.nostr.stun_servers` | list[string] | `["stun:fips.tomdwyer.uk:3478", "stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478", "stun:openrelay.metered.ca:80"]` | STUN servers used for local reflexive address discovery |
+| `node.discovery.nostr.stun_servers` | list[string] | `["stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478", "stun:openrelay.metered.ca:80"]` | STUN servers used for local reflexive address discovery |
 | `node.discovery.nostr.app` | string | `"fips-overlay-v1"` | Traversal application namespace and advert identifier suffix |
 | `node.discovery.nostr.signal_ttl_secs` | u64 | `120` | Signaling TTL in seconds |
 | `node.discovery.nostr.attempt_timeout_secs` | u64 | `10` | Overall traversal attempt timeout in seconds |
@@ -212,8 +212,6 @@ STUN values are published for diagnostics/interoperability but are not used as
 arbitrary egress targets.
 The built-in advert relay default `wss://strfry.bitsbytom.com` is also
 contributor-operated rather than project-operated.
-The built-in STUN default `stun:fips.tomdwyer.uk:3478` is contributor-operated
-rather than project-operated.
 These built-in endpoints should be treated as best-effort defaults that
 operators are expected to override for production use.
 Advert freshness is enforced semantically: events with expired NIP-40

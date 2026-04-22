@@ -2,26 +2,26 @@
 
 use super::{Node, NodeError, NodeState};
 use crate::node::acl::PeerAclContext;
-#[cfg(feature = "nostr-bootstrap")]
-use crate::bootstrap::nostr::{
-    ADVERT_IDENTIFIER, ADVERT_VERSION, BootstrapEvent, NostrBootstrap, OverlayAdvert,
+use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
+#[cfg(feature = "nostr-discovery")]
+use crate::discovery::nostr::{
+    ADVERT_IDENTIFIER, ADVERT_VERSION, BootstrapEvent, NostrDiscovery, OverlayAdvert,
     OverlayEndpointAdvert, OverlayTransportKind,
 };
-use crate::bootstrap::{BootstrapHandoffResult, EstablishedTraversal};
-use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
+use crate::discovery::{BootstrapHandoffResult, EstablishedTraversal};
 use crate::node::wire::build_msg1;
 use crate::peer::PeerConnection;
 use crate::protocol::{Disconnect, DisconnectReason};
 use crate::transport::{Link, LinkDirection, LinkId, TransportAddr, TransportId, packet_channel};
 use crate::upper::tun::{TunDevice, TunState, run_tun_reader, shutdown_tun_interface};
 use crate::{NodeAddr, PeerIdentity};
-#[cfg(feature = "nostr-bootstrap")]
+#[cfg(feature = "nostr-discovery")]
 use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "nostr-bootstrap")]
+#[cfg(feature = "nostr-discovery")]
 const OPEN_DISCOVERY_RETRY_LIFETIME_MULTIPLIER: u64 = 2;
 
 impl Node {
@@ -381,10 +381,10 @@ impl Node {
         }
     }
 
-    pub(super) async fn poll_nostr_bootstrap(&mut self) {
-        #[cfg(feature = "nostr-bootstrap")]
+    pub(super) async fn poll_nostr_discovery(&mut self) {
+        #[cfg(feature = "nostr-discovery")]
         {
-            let Some(bootstrap) = self.nostr_bootstrap.clone() else {
+            let Some(bootstrap) = self.nostr_discovery.clone() else {
                 return;
             };
 
@@ -571,16 +571,16 @@ impl Node {
             info!(count = self.transports.len(), "Transports initialized");
         }
 
-        #[cfg(feature = "nostr-bootstrap")]
+        #[cfg(feature = "nostr-discovery")]
         if self.config.node.discovery.nostr.enabled {
-            match NostrBootstrap::start(&self.identity, self.config.node.discovery.nostr.clone())
+            match NostrDiscovery::start(&self.identity, self.config.node.discovery.nostr.clone())
                 .await
             {
                 Ok(runtime) => {
                     if let Err(err) = self.refresh_overlay_advert(&runtime).await {
                         warn!(error = %err, "Failed to publish initial Nostr overlay advert");
                     }
-                    self.nostr_bootstrap = Some(runtime);
+                    self.nostr_discovery = Some(runtime);
                     info!("Nostr overlay discovery enabled");
                 }
                 Err(err) => {
@@ -589,10 +589,10 @@ impl Node {
             }
         }
 
-        #[cfg(not(feature = "nostr-bootstrap"))]
+        #[cfg(not(feature = "nostr-discovery"))]
         if self.config.node.discovery.nostr.enabled {
             warn!(
-                "Nostr overlay discovery configured but this build was compiled without the 'nostr-bootstrap' feature"
+                "Nostr overlay discovery configured but this build was compiled without the 'nostr-discovery' feature"
             );
         }
 
@@ -861,8 +861,8 @@ impl Node {
             .await;
 
         // Stop Nostr overlay discovery background work and withdraw any advert.
-        #[cfg(feature = "nostr-bootstrap")]
-        if let Some(bootstrap) = self.nostr_bootstrap.take()
+        #[cfg(feature = "nostr-discovery")]
+        if let Some(bootstrap) = self.nostr_discovery.take()
             && let Err(e) = bootstrap.shutdown().await
         {
             warn!(error = %e, "Failed to shutdown Nostr overlay discovery");
@@ -981,7 +981,7 @@ impl Node {
             .collect()
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     async fn nostr_peer_fallback_addresses(
         &self,
         peer_config: &PeerConfig,
@@ -995,7 +995,7 @@ impl Node {
             return Vec::new();
         }
 
-        let Some(bootstrap) = self.nostr_bootstrap.clone() else {
+        let Some(bootstrap) = self.nostr_discovery.clone() else {
             return Vec::new();
         };
         let endpoints = match bootstrap.advert_endpoints_for_peer(&peer_config.npub).await {
@@ -1037,7 +1037,7 @@ impl Node {
         fallback
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     fn overlay_endpoint_to_peer_address(
         endpoint: &OverlayEndpointAdvert,
         priority: u8,
@@ -1066,14 +1066,14 @@ impl Node {
                 if !allow_bootstrap_nat {
                     continue;
                 }
-                #[cfg(not(feature = "nostr-bootstrap"))]
+                #[cfg(not(feature = "nostr-discovery"))]
                 {
-                    debug!(npub = %peer_config.npub, "Skipping udp:nat address because this build does not include the nostr-bootstrap feature");
+                    debug!(npub = %peer_config.npub, "Skipping udp:nat address because this build does not include the nostr-discovery feature");
                     continue;
                 }
-                #[cfg(feature = "nostr-bootstrap")]
+                #[cfg(feature = "nostr-discovery")]
                 {
-                    let Some(bootstrap) = self.nostr_bootstrap.clone() else {
+                    let Some(bootstrap) = self.nostr_discovery.clone() else {
                         debug!(npub = %peer_config.npub, "No Nostr overlay runtime for udp:nat address");
                         continue;
                     };
@@ -1155,8 +1155,8 @@ impl Node {
         )))
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
-    async fn queue_open_discovery_retries(&mut self, bootstrap: &std::sync::Arc<NostrBootstrap>) {
+    #[cfg(feature = "nostr-discovery")]
+    async fn queue_open_discovery_retries(&mut self, bootstrap: &std::sync::Arc<NostrDiscovery>) {
         if !self.config.node.discovery.nostr.enabled
             || self.config.node.discovery.nostr.policy != crate::config::NostrDiscoveryPolicy::Open
         {
@@ -1243,7 +1243,7 @@ impl Node {
         }
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     fn available_outbound_slots(&self) -> usize {
         let connection_used = self
             .connections
@@ -1264,7 +1264,7 @@ impl Node {
         connection_slots.min(peer_slots)
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     fn open_discovery_enqueue_budget(&self, configured_npubs: &HashSet<String>) -> usize {
         let current_open_discovery_pending = self
             .retry_pending
@@ -1283,7 +1283,7 @@ impl Node {
         cap_remaining.min(self.available_outbound_slots())
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     fn open_discovery_retry_expires_at_ms(&self, now_ms: u64) -> u64 {
         now_ms.saturating_add(
             self.config
@@ -1296,7 +1296,7 @@ impl Node {
         )
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     fn build_overlay_advert(&self) -> Option<OverlayAdvert> {
         if !self.config.node.discovery.nostr.enabled {
             return None;
@@ -1383,16 +1383,16 @@ impl Node {
         })
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     async fn refresh_overlay_advert(
         &self,
-        bootstrap: &std::sync::Arc<NostrBootstrap>,
-    ) -> Result<(), crate::bootstrap::nostr::BootstrapError> {
+        bootstrap: &std::sync::Arc<NostrDiscovery>,
+    ) -> Result<(), crate::discovery::nostr::BootstrapError> {
         let advert = self.build_overlay_advert();
         bootstrap.update_local_advert(advert).await
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     fn lookup_udp_config(&self, transport_name: Option<&str>) -> Option<&crate::config::UdpConfig> {
         match (&self.config.transports.udp, transport_name) {
             (crate::config::TransportInstances::Single(cfg), None) => Some(cfg),
@@ -1401,7 +1401,7 @@ impl Node {
         }
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     fn lookup_tcp_config(&self, transport_name: Option<&str>) -> Option<&crate::config::TcpConfig> {
         match (&self.config.transports.tcp, transport_name) {
             (crate::config::TransportInstances::Single(cfg), None) => Some(cfg),
@@ -1410,7 +1410,7 @@ impl Node {
         }
     }
 
-    #[cfg(feature = "nostr-bootstrap")]
+    #[cfg(feature = "nostr-discovery")]
     fn lookup_tor_config(&self, transport_name: Option<&str>) -> Option<&crate::config::TorConfig> {
         match (&self.config.transports.tor, transport_name) {
             (crate::config::TransportInstances::Single(cfg), None) => Some(cfg),
@@ -1441,7 +1441,7 @@ impl Node {
             return Ok(());
         }
 
-        #[cfg(feature = "nostr-bootstrap")]
+        #[cfg(feature = "nostr-discovery")]
         {
             let fallback = self
                 .nostr_peer_fallback_addresses(peer_config, &static_addresses)

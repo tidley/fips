@@ -1,0 +1,24 @@
+node:
+  identity:
+    persistent: true
+  discovery:
+    nostr:
+      enabled: false
+
+transports:
+  udp:
+    bind_addr: "0.0.0.0:2121"
+    advertise_on_nostr: false
+    public: false
+
+peers:
+  - npub: "npub1eug745tpjfmthyc0y7yau9c9rqr0k8e0y96jq9de2talprxp4enqzxdw28"
+    alias: "bob"
+    addresses:
+      - transport: udp
+        addr: "185.18.221.102:44750"
+    connect_policy: auto_connect
+    via_nostr: false
+
+tun:
+  enabled: false

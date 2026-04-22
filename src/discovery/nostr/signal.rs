@@ -79,11 +79,10 @@ pub(super) fn validate_offer_freshness(
     offer: &TraversalOffer,
     now: u64,
     signal_ttl_ms: u64,
-    app: &str,
     actual_sender_npub: &str,
     local_npub: &str,
 ) -> Result<(), BootstrapError> {
-    if offer.app != app || offer.event_kind != SIGNAL_KIND || offer.message_type != "offer" {
+    if offer.message_type != "offer" {
         return Err(BootstrapError::Protocol("invalid-offer".to_string()));
     }
     if offer.expires_at <= now || now.saturating_sub(offer.issued_at) > signal_ttl_ms {
@@ -97,7 +96,6 @@ pub(super) fn validate_offer_freshness(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_traversal_offer(
-    app: String,
     session_id: String,
     issued_at: u64,
     ttl_ms: u64,
@@ -109,8 +107,6 @@ pub(super) fn create_traversal_offer(
     stun_server: Option<String>,
 ) -> TraversalOffer {
     TraversalOffer {
-        app,
-        event_kind: SIGNAL_KIND,
         message_type: "offer".to_string(),
         session_id,
         issued_at,
@@ -126,7 +122,6 @@ pub(super) fn create_traversal_offer(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_traversal_answer(
-    app: String,
     session_id: String,
     issued_at: u64,
     ttl_ms: u64,
@@ -142,8 +137,6 @@ pub(super) fn create_traversal_answer(
     reason: Option<String>,
 ) -> TraversalAnswer {
     TraversalAnswer {
-        app,
-        event_kind: SIGNAL_KIND,
         message_type: "answer".to_string(),
         session_id,
         issued_at,
@@ -169,10 +162,7 @@ pub(super) fn validate_traversal_answer_for_offer(
     actual_sender_npub: &str,
     local_npub: &str,
 ) -> Result<(), BootstrapError> {
-    if offer.app != answer.app
-        || answer.event_kind != SIGNAL_KIND
-        || answer.message_type != "answer"
-    {
+    if answer.message_type != "answer" {
         return Err(BootstrapError::Protocol("invalid-answer".to_string()));
     }
     if offer.expires_at <= now

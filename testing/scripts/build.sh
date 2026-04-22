@@ -21,13 +21,14 @@ fi
 BUILD_DOCKER=true
 # Keep BLE disabled for host build simplicity while ensuring NAT harness
 # binaries include Nostr bootstrap support.
-DEFAULT_CARGO_BUILD_ARGS=(--no-default-features --features "tui nostr-bootstrap")
+DEFAULT_CARGO_BUILD_ARGS=(--no-default-features --features "tui nostr-discovery")
 if [ -n "${FIPS_CARGO_BUILD_ARGS:-}" ]; then
     # shellcheck disable=SC2206
     CARGO_BUILD_ARGS=($FIPS_CARGO_BUILD_ARGS)
 else
     CARGO_BUILD_ARGS=("${DEFAULT_CARGO_BUILD_ARGS[@]}")
 fi
+GATEWAY_CARGO_BUILD_ARGS=("${CARGO_BUILD_ARGS[@]}" --features gateway)
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-docker) BUILD_DOCKER=false; shift ;;
@@ -55,13 +56,13 @@ if [ "$UNAME_S" = "Darwin" ]; then
 
     echo "Building FIPS for Linux (release) using cargo-zigbuild..."
     cargo zigbuild --release --target "$CARGO_TARGET" --manifest-path="$PROJECT_ROOT/Cargo.toml" "${CARGO_BUILD_ARGS[@]}"
-    cargo zigbuild --release --target "$CARGO_TARGET" --manifest-path="$PROJECT_ROOT/Cargo.toml" --features gateway --bin fips-gateway
+    cargo zigbuild --release --target "$CARGO_TARGET" --manifest-path="$PROJECT_ROOT/Cargo.toml" "${GATEWAY_CARGO_BUILD_ARGS[@]}" --bin fips-gateway
 
     TARGET_DIR="$PROJECT_ROOT/target/$CARGO_TARGET/release"
 else
     echo "Building FIPS (release)..."
     cargo build --release --manifest-path="$PROJECT_ROOT/Cargo.toml" "${CARGO_BUILD_ARGS[@]}"
-    cargo build --release --manifest-path="$PROJECT_ROOT/Cargo.toml" --features gateway --bin fips-gateway
+    cargo build --release --manifest-path="$PROJECT_ROOT/Cargo.toml" "${GATEWAY_CARGO_BUILD_ARGS[@]}" --bin fips-gateway
 
     TARGET_DIR="$PROJECT_ROOT/target/release"
 fi

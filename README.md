@@ -399,7 +399,7 @@ Ethernet, Tor, and Bluetooth (BLE) with a small live mesh of deployed nodes.
 - Reproducible builds with toolchain pinning and SOURCE_DATE_EPOCH
 - Linux (Debian, systemd tarball, OpenWrt, AUR), macOS (`.pkg`), and Windows (ZIP, service) packaging
 - Docker-based integration and chaos testing
-- Optional Nostr-signaled `udp:nat` bootstrap when compiled with the `nostr-bootstrap` feature
+- Optional Nostr-signaled `udp:nat` bootstrap when compiled with the `nostr-discovery` feature
 
 ### Near-term priorities
 

@@ -17,13 +17,13 @@ This is not a parallel transport stack. The bootstrap layer exists only to get
 two peers to a live UDP socket and confirmed remote endpoint; after that, the
 existing UDP transport and normal Noise/FMP/FSP machinery take over.
 The in-tree bootstrap is compiled behind the cargo feature
-`nostr-bootstrap`.
+`nostr-discovery`.
 
 ## Main Pieces
 
 ### Bootstrap handoff boundary
 
-- [`src/bootstrap.rs`](../../src/bootstrap.rs)
+- [`src/discovery.rs`](../../src/discovery.rs)
   - defines `EstablishedTraversal` and `BootstrapHandoffResult`
   - records the key invariant that the adopted UDP socket must be the same
     socket used during STUN and punching
@@ -33,18 +33,18 @@ The in-tree bootstrap is compiled behind the cargo feature
 The original monolithic `src/bootstrap/nostr.rs` has been split into focused
 files:
 
-- [`src/bootstrap/nostr/runtime.rs`](../../src/bootstrap/nostr/runtime.rs)
+- [`src/discovery/nostr/runtime.rs`](../../src/discovery/nostr/runtime.rs)
   - runtime state, relay subscriptions, advert publication, connect flow,
     incoming-offer handling, and shutdown
-- [`src/bootstrap/nostr/signal.rs`](../../src/bootstrap/nostr/signal.rs)
+- [`src/discovery/nostr/signal.rs`](../../src/discovery/nostr/signal.rs)
   - gift-wrap construction/unwrapping and offer/answer validation
-- [`src/bootstrap/nostr/stun.rs`](../../src/bootstrap/nostr/stun.rs)
+- [`src/discovery/nostr/stun.rs`](../../src/discovery/nostr/stun.rs)
   - STUN parsing and reflexive address observation
-- [`src/bootstrap/nostr/traversal.rs`](../../src/bootstrap/nostr/traversal.rs)
+- [`src/discovery/nostr/traversal.rs`](../../src/discovery/nostr/traversal.rs)
   - punch planning, punch packet formats, and punch execution
-- [`src/bootstrap/nostr/types.rs`](../../src/bootstrap/nostr/types.rs)
+- [`src/discovery/nostr/types.rs`](../../src/discovery/nostr/types.rs)
   - shared types, constants, and errors
-- [`src/bootstrap/nostr/tests.rs`](../../src/bootstrap/nostr/tests.rs)
+- [`src/discovery/nostr/tests.rs`](../../src/discovery/nostr/tests.rs)
   - unit coverage for protocol helpers
 
 ### UDP transport socket adoption
@@ -115,7 +115,6 @@ usual.
 
 The main `node.discovery.nostr.stun_servers` defaults are now:
 
-- `stun:fips.tomdwyer.uk:3478`
 - `stun:stun.l.google.com:19302`
 - `stun:global.stun.twilio.com:3478`
 - `stun:openrelay.metered.ca:80`
@@ -123,7 +122,6 @@ The main `node.discovery.nostr.stun_servers` defaults are now:
 Maintainer note:
 
 - `wss://strfry.bitsbytom.com` is run by a contributor, not by the project
-- `stun:fips.tomdwyer.uk:3478` is run by a contributor, not by the project
 
 The list is fully configurable. If `stun_servers` is set in YAML, that list
 replaces the built-in defaults entirely.
@@ -162,12 +160,12 @@ transiently unavailable.
 | Area | Status | Main evidence |
 |---|---|---|
 | Protocol draft | Implemented and updated | [`nostr-udp-hole-punch-protocol.md`](./nostr-udp-hole-punch-protocol.md) |
-| STUN discovery | Implemented | [`src/bootstrap/nostr/stun.rs`](../../src/bootstrap/nostr/stun.rs) |
-| Offer/answer signaling | Implemented | [`src/bootstrap/nostr/signal.rs`](../../src/bootstrap/nostr/signal.rs), [`src/bootstrap/nostr/runtime.rs`](../../src/bootstrap/nostr/runtime.rs) |
-| Punch/ack exchange | Implemented | [`src/bootstrap/nostr/traversal.rs`](../../src/bootstrap/nostr/traversal.rs) |
-| Handoff into UDP transport | Implemented | [`src/bootstrap.rs`](../../src/bootstrap.rs), [`src/transport/udp/mod.rs`](../../src/transport/udp/mod.rs), [`src/node/lifecycle.rs`](../../src/node/lifecycle.rs) |
+| STUN discovery | Implemented | [`src/discovery/nostr/stun.rs`](../../src/discovery/nostr/stun.rs) |
+| Offer/answer signaling | Implemented | [`src/discovery/nostr/signal.rs`](../../src/discovery/nostr/signal.rs), [`src/discovery/nostr/runtime.rs`](../../src/discovery/nostr/runtime.rs) |
+| Punch/ack exchange | Implemented | [`src/discovery/nostr/traversal.rs`](../../src/discovery/nostr/traversal.rs) |
+| Handoff into UDP transport | Implemented | [`src/discovery.rs`](../../src/discovery.rs), [`src/transport/udp/mod.rs`](../../src/transport/udp/mod.rs), [`src/node/lifecycle.rs`](../../src/node/lifecycle.rs) |
 | `udp:nat` integration | Implemented | [`src/node/lifecycle.rs`](../../src/node/lifecycle.rs) |
-| Cleanup on shutdown | Implemented | [`src/bootstrap/nostr/runtime.rs`](../../src/bootstrap/nostr/runtime.rs), [`src/node/lifecycle.rs`](../../src/node/lifecycle.rs) |
+| Cleanup on shutdown | Implemented | [`src/discovery/nostr/runtime.rs`](../../src/discovery/nostr/runtime.rs), [`src/node/lifecycle.rs`](../../src/node/lifecycle.rs) |
 | NAT-lab integration tests | Implemented | [`testing/nat/scripts/nat-test.sh`](../../testing/nat/scripts/nat-test.sh) |
 | CI coverage | Implemented | [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) |
 
@@ -183,9 +181,9 @@ the project should prefer only project-operated or clearly third-party defaults.
 
 ### Example crate removal
 
-The standalone prototype crate at `examples/nostr-bootstrap` has been removed
+The standalone prototype crate at `examples/nostr-discovery` has been removed
 from this PR. It duplicated protocol/runtime logic that now lives in the main
-crate (`src/bootstrap/nostr/*`) and had no remaining runnable demo binaries.
+crate (`src/discovery/nostr/*`) and had no remaining runnable demo binaries.
 Keeping a second implementation path increased review and maintenance overhead
 without adding shipped functionality.
 

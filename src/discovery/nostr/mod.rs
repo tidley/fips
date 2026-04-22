@@ -1,4 +1,4 @@
-#![cfg(feature = "nostr-bootstrap")]
+#![cfg(feature = "nostr-discovery")]
 
 mod runtime;
 mod signal;
@@ -9,7 +9,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use runtime::NostrBootstrap;
+pub use runtime::NostrDiscovery;
 pub use types::{
     ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, BootstrapError, BootstrapEvent,
     CachedOverlayAdvert, OverlayAdvert, OverlayEndpointAdvert, OverlayTransportKind,

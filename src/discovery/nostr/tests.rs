@@ -1,6 +1,6 @@
 use nostr::prelude::{EventBuilder, Kind, Tag, Timestamp};
 
-use super::runtime::NostrBootstrap;
+use super::runtime::NostrDiscovery;
 use super::signal::{
     build_signal_event, create_traversal_answer, create_traversal_offer, validate_offer_freshness,
     validate_traversal_answer_for_offer,
@@ -103,7 +103,7 @@ fn rejects_invalid_overlay_adverts() {
         signal_relays: None,
         stun_servers: None,
     };
-    assert!(NostrBootstrap::validate_overlay_advert(missing_nat_metadata).is_err());
+    assert!(NostrDiscovery::validate_overlay_advert(missing_nat_metadata).is_err());
 
     let wrong_identifier = OverlayAdvert {
         identifier: "not-fips-overlay".to_string(),
@@ -115,7 +115,7 @@ fn rejects_invalid_overlay_adverts() {
         signal_relays: None,
         stun_servers: None,
     };
-    assert!(NostrBootstrap::validate_overlay_advert(wrong_identifier).is_err());
+    assert!(NostrDiscovery::validate_overlay_advert(wrong_identifier).is_err());
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn advert_freshness_rejects_expired_events() {
     let now_secs = Timestamp::now().as_u64();
     let event = signed_overlay_advert_event(now_secs, Some(now_secs.saturating_sub(1)));
     let valid_until =
-        NostrBootstrap::compute_advert_valid_until_ms(&event, 600_000, now_secs * 1000);
+        NostrDiscovery::compute_advert_valid_until_ms(&event, 600_000, now_secs * 1000);
     assert!(valid_until.is_none());
 }
 
@@ -133,7 +133,7 @@ fn advert_freshness_rejects_stale_created_at_without_expiration() {
     let stale_created = now_secs.saturating_sub(10_000);
     let event = signed_overlay_advert_event(stale_created, None);
     let valid_until =
-        NostrBootstrap::compute_advert_valid_until_ms(&event, 600_000, now_secs * 1000);
+        NostrDiscovery::compute_advert_valid_until_ms(&event, 600_000, now_secs * 1000);
     assert!(valid_until.is_none());
 }
 
@@ -142,16 +142,16 @@ fn advert_freshness_uses_earliest_expiration_bound() {
     let now_secs = Timestamp::now().as_u64();
     let event = signed_overlay_advert_event(now_secs.saturating_sub(10), Some(now_secs + 30));
     let valid_until =
-        NostrBootstrap::compute_advert_valid_until_ms(&event, 3_600_000, now_secs * 1000)
+        NostrDiscovery::compute_advert_valid_until_ms(&event, 3_600_000, now_secs * 1000)
             .expect("event should be fresh");
     assert_eq!(valid_until, (now_secs + 30) * 1000);
 }
 
 #[test]
 fn parses_stun_urls() {
-    let parsed = parse_stun_url("stun:fips.tomdwyer.uk:3478").unwrap();
-    assert_eq!(parsed.host, "fips.tomdwyer.uk");
-    assert_eq!(parsed.port, 3478);
+    let parsed = parse_stun_url("stun:stun.l.google.com:19302").unwrap();
+    assert_eq!(parsed.host, "stun.l.google.com");
+    assert_eq!(parsed.port, 19302);
 }
 
 #[test]
@@ -212,7 +212,6 @@ fn builds_and_parses_probe_packets() {
 #[test]
 fn validates_offer_answer_pair() {
     let offer = create_traversal_offer(
-        "fips.nat.traversal.v1".to_string(),
         "sess-1".to_string(),
         1_700_000_000_000,
         60_000,
@@ -224,7 +223,6 @@ fn validates_offer_answer_pair() {
         Some("stun:example.org:3478".to_string()),
     );
     let answer = create_traversal_answer(
-        "fips.nat.traversal.v1".to_string(),
         "sess-1".to_string(),
         1_700_000_000_500,
         60_000,
@@ -260,7 +258,6 @@ fn validates_offer_answer_pair() {
 #[test]
 fn rejects_offer_with_mismatched_actual_sender() {
     let offer = create_traversal_offer(
-        "fips.nat.traversal.v1".to_string(),
         "sess-1".to_string(),
         1_700_000_000_000,
         60_000,
@@ -276,7 +273,6 @@ fn rejects_offer_with_mismatched_actual_sender() {
         &offer,
         1_700_000_000_100,
         60_000,
-        "fips.nat.traversal.v1",
         "npub1actual",
         "npub1server",
     );
@@ -287,7 +283,6 @@ fn rejects_offer_with_mismatched_actual_sender() {
 #[test]
 fn rejects_answer_with_mismatched_actual_sender() {
     let offer = create_traversal_offer(
-        "fips.nat.traversal.v1".to_string(),
         "sess-1".to_string(),
         1_700_000_000_000,
         60_000,
@@ -299,7 +294,6 @@ fn rejects_answer_with_mismatched_actual_sender() {
         Some("stun:example.org:3478".to_string()),
     );
     let answer = create_traversal_answer(
-        "fips.nat.traversal.v1".to_string(),
         "sess-1".to_string(),
         1_700_000_000_500,
         60_000,

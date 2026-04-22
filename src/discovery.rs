@@ -6,7 +6,7 @@
 //! it hands the live socket and selected remote endpoint to FIPS so the
 //! existing Noise/FMP transport path can take over.
 
-#[cfg(feature = "nostr-bootstrap")]
+#[cfg(feature = "nostr-discovery")]
 pub mod nostr;
 
 use crate::config::UdpConfig;

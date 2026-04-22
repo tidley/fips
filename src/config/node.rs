@@ -221,7 +221,7 @@ pub struct DiscoveryConfig {
     pub max_attempts: u8,
     /// Nostr-mediated overlay endpoint discovery.
     #[serde(default = "DiscoveryConfig::default_nostr")]
-    pub nostr: NostrBootstrapConfig,
+    pub nostr: NostrDiscoveryConfig,
 }
 
 impl Default for DiscoveryConfig {
@@ -235,7 +235,7 @@ impl Default for DiscoveryConfig {
             forward_min_interval_secs: 2,
             retry_interval_secs: 5,
             max_attempts: 2,
-            nostr: NostrBootstrapConfig::default(),
+            nostr: NostrDiscoveryConfig::default(),
         }
     }
 }
@@ -265,8 +265,8 @@ impl DiscoveryConfig {
     fn default_max_attempts() -> u8 {
         2
     }
-    fn default_nostr() -> NostrBootstrapConfig {
-        NostrBootstrapConfig::default()
+    fn default_nostr() -> NostrDiscoveryConfig {
+        NostrDiscoveryConfig::default()
     }
 }
 
@@ -289,61 +289,61 @@ pub enum NostrDiscoveryPolicy {
 /// Nostr-mediated overlay endpoint discovery (`node.discovery.nostr.*`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NostrBootstrapConfig {
+pub struct NostrDiscoveryConfig {
     /// Enable Nostr-signaled traversal bootstrap.
     #[serde(default)]
     pub enabled: bool,
     /// Publish service advertisements so remote peers can bootstrap inbound.
-    #[serde(default = "NostrBootstrapConfig::default_advertise")]
+    #[serde(default = "NostrDiscoveryConfig::default_advertise")]
     pub advertise: bool,
     /// Relay URLs used for service advertisements.
-    #[serde(default = "NostrBootstrapConfig::default_advert_relays")]
+    #[serde(default = "NostrDiscoveryConfig::default_advert_relays")]
     pub advert_relays: Vec<String>,
     /// Relay URLs used for encrypted signaling events.
-    #[serde(default = "NostrBootstrapConfig::default_dm_relays")]
+    #[serde(default = "NostrDiscoveryConfig::default_dm_relays")]
     pub dm_relays: Vec<String>,
     /// STUN servers used for local reflexive address discovery.
     /// Outbound observation uses only this local list; peer-advertised STUN
     /// values are informational and are not treated as egress targets.
-    #[serde(default = "NostrBootstrapConfig::default_stun_servers")]
+    #[serde(default = "NostrDiscoveryConfig::default_stun_servers")]
     pub stun_servers: Vec<String>,
     /// Traversal application namespace and advert identifier suffix.
-    #[serde(default = "NostrBootstrapConfig::default_app")]
+    #[serde(default = "NostrDiscoveryConfig::default_app")]
     pub app: String,
     /// Signaling TTL in seconds.
-    #[serde(default = "NostrBootstrapConfig::default_signal_ttl_secs")]
+    #[serde(default = "NostrDiscoveryConfig::default_signal_ttl_secs")]
     pub signal_ttl_secs: u64,
     /// Policy for advert-derived endpoint discovery.
     #[serde(default)]
     pub policy: NostrDiscoveryPolicy,
     /// Max number of open-discovery peers queued for outbound retry/connection
     /// at once. Prevents unbounded queue growth from ambient advert traffic.
-    #[serde(default = "NostrBootstrapConfig::default_open_discovery_max_pending")]
+    #[serde(default = "NostrDiscoveryConfig::default_open_discovery_max_pending")]
     pub open_discovery_max_pending: usize,
     /// Overall punch attempt timeout in seconds.
-    #[serde(default = "NostrBootstrapConfig::default_attempt_timeout_secs")]
+    #[serde(default = "NostrDiscoveryConfig::default_attempt_timeout_secs")]
     pub attempt_timeout_secs: u64,
     /// Replay tracking retention window in seconds.
-    #[serde(default = "NostrBootstrapConfig::default_replay_window_secs")]
+    #[serde(default = "NostrDiscoveryConfig::default_replay_window_secs")]
     pub replay_window_secs: u64,
     /// Delay before punch traffic starts.
-    #[serde(default = "NostrBootstrapConfig::default_punch_start_delay_ms")]
+    #[serde(default = "NostrDiscoveryConfig::default_punch_start_delay_ms")]
     pub punch_start_delay_ms: u64,
     /// Interval between punch packets.
-    #[serde(default = "NostrBootstrapConfig::default_punch_interval_ms")]
+    #[serde(default = "NostrDiscoveryConfig::default_punch_interval_ms")]
     pub punch_interval_ms: u64,
     /// How long to keep punching before failure.
-    #[serde(default = "NostrBootstrapConfig::default_punch_duration_ms")]
+    #[serde(default = "NostrDiscoveryConfig::default_punch_duration_ms")]
     pub punch_duration_ms: u64,
     /// Advert TTL in seconds.
-    #[serde(default = "NostrBootstrapConfig::default_advert_ttl_secs")]
+    #[serde(default = "NostrDiscoveryConfig::default_advert_ttl_secs")]
     pub advert_ttl_secs: u64,
     /// How often adverts are refreshed in seconds.
-    #[serde(default = "NostrBootstrapConfig::default_advert_refresh_secs")]
+    #[serde(default = "NostrDiscoveryConfig::default_advert_refresh_secs")]
     pub advert_refresh_secs: u64,
 }
 
-impl Default for NostrBootstrapConfig {
+impl Default for NostrDiscoveryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -366,7 +366,7 @@ impl Default for NostrBootstrapConfig {
     }
 }
 
-impl NostrBootstrapConfig {
+impl NostrDiscoveryConfig {
     fn default_advertise() -> bool {
         true
     }
@@ -387,7 +387,6 @@ impl NostrBootstrapConfig {
 
     fn default_stun_servers() -> Vec<String> {
         vec![
-            "stun:fips.tomdwyer.uk:3478".to_string(),
             "stun:stun.l.google.com:19302".to_string(),
             "stun:global.stun.twilio.com:3478".to_string(),
             "stun:openrelay.metered.ca:80".to_string(),

@@ -1,7 +1,6 @@
 //! Node lifecycle management: start, stop, and peer connection initiation.
 
 use super::{Node, NodeError, NodeState};
-use crate::node::acl::PeerAclContext;
 use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
 #[cfg(feature = "nostr-discovery")]
 use crate::discovery::nostr::{
@@ -9,6 +8,7 @@ use crate::discovery::nostr::{
     OverlayEndpointAdvert, OverlayTransportKind,
 };
 use crate::discovery::{BootstrapHandoffResult, EstablishedTraversal};
+use crate::node::acl::PeerAclContext;
 use crate::node::wire::build_msg1;
 use crate::peer::PeerConnection;
 use crate::protocol::{Disconnect, DisconnectReason};

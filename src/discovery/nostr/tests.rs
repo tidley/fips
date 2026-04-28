@@ -2,7 +2,10 @@ use nostr::prelude::{EventBuilder, Kind, Tag, Timestamp};
 
 use super::runtime::NostrDiscovery;
 use super::signal::{
-    build_signal_event, create_traversal_answer, create_traversal_offer, validate_offer_freshness,
+    build_peer_assist_probe, build_signal_event, create_assist_grant, create_assist_observed,
+    create_assist_request, create_traversal_answer, create_traversal_offer,
+    parse_peer_assist_probe, validate_assist_grant_for_request, validate_assist_observed_for_grant,
+    validate_assist_request_freshness, validate_offer_freshness,
     validate_traversal_answer_for_offer,
 };
 use super::stun::{parse_stun_binding_success, parse_stun_url};
@@ -116,6 +119,15 @@ fn rejects_invalid_overlay_adverts() {
         stun_servers: None,
     };
     assert!(NostrDiscovery::validate_overlay_advert(wrong_identifier).is_err());
+
+    let missing_all_endpoints = OverlayAdvert {
+        identifier: ADVERT_IDENTIFIER.to_string(),
+        version: ADVERT_VERSION,
+        endpoints: vec![],
+        signal_relays: None,
+        stun_servers: None,
+    };
+    assert!(NostrDiscovery::validate_overlay_advert(missing_all_endpoints).is_err());
 }
 
 #[test]
@@ -252,6 +264,153 @@ fn validates_offer_answer_pair() {
             "npub1client",
         )
         .is_ok()
+    );
+}
+
+#[test]
+fn validates_assist_request_grant_observed_flow() {
+    let request = create_assist_request(
+        "assist-1".to_string(),
+        1_700_000_000_000,
+        60_000,
+        "request-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+    );
+    let grant = create_assist_grant(
+        "assist-1".to_string(),
+        "grant-1".to_string(),
+        1_700_000_000_500,
+        60_000,
+        "grant-nonce".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "request-1".to_string(),
+        true,
+        Some("198.51.100.20:44750".to_string()),
+        Some("probe-1".to_string()),
+        Some(1),
+        None,
+    );
+    let observed = create_assist_observed(
+        "assist-1".to_string(),
+        "grant-1".to_string(),
+        1_700_000_000_700,
+        60_000,
+        "observed-1".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "grant-nonce".to_string(),
+        true,
+        "198.51.100.20:44750".to_string(),
+        Some(addr("203.0.113.99", 39000)),
+        None,
+    );
+
+    assert!(
+        validate_assist_request_freshness(
+            &request,
+            1_700_000_000_100,
+            60_000,
+            "npub1client",
+            "npub1server",
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_assist_grant_for_request(
+            &request,
+            &grant,
+            1_700_000_000_900,
+            60_000,
+            "npub1server",
+            "npub1client",
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_assist_observed_for_grant(
+            &grant,
+            &observed,
+            1_700_000_000_900,
+            60_000,
+            "npub1server",
+            "npub1client",
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn builds_and_parses_peer_assist_probe_packets() {
+    let packet = build_peer_assist_probe("grant-1", "probe-token");
+    let parsed = parse_peer_assist_probe(&packet).unwrap();
+    assert_eq!(parsed.grant_id, "grant-1");
+    assert_eq!(parsed.token, "probe-token");
+}
+
+#[test]
+fn rejects_accepted_assist_observed_without_observed_address() {
+    let request = create_assist_request(
+        "assist-1".to_string(),
+        1_700_000_000_000,
+        60_000,
+        "request-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+    );
+    let grant = create_assist_grant(
+        "assist-1".to_string(),
+        "grant-1".to_string(),
+        1_700_000_000_500,
+        60_000,
+        "grant-1".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "request-1".to_string(),
+        true,
+        Some("198.51.100.20:44750".to_string()),
+        Some("probe-1".to_string()),
+        Some(1),
+        None,
+    );
+    let observed = create_assist_observed(
+        "assist-1".to_string(),
+        "grant-1".to_string(),
+        1_700_000_000_700,
+        60_000,
+        "observed-1".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "grant-1".to_string(),
+        true,
+        "198.51.100.20:44750".to_string(),
+        None,
+        None,
+    );
+
+    assert!(
+        validate_assist_grant_for_request(
+            &request,
+            &grant,
+            1_700_000_000_900,
+            60_000,
+            "npub1server",
+            "npub1client",
+        )
+        .is_ok()
+    );
+
+    assert!(
+        validate_assist_observed_for_grant(
+            &grant,
+            &observed,
+            1_700_000_000_900,
+            60_000,
+            "npub1server",
+            "npub1client",
+        )
+        .is_err()
     );
 }
 

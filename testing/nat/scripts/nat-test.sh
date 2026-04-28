@@ -74,8 +74,8 @@ dump_fips_state() {
     local container="$1"
     local relay_host="${2:-172.31.254.30}"
     local relay_port="${3:-7777}"
-    local stun_host="${4:-172.31.254.40}"
-    local stun_port="${5:-3478}"
+    local stun_host="${4:-}"
+    local stun_port="${5:-}"
     dump_container_state "$container"
     echo ""
     echo "--- $container: UDP sockets ---"
@@ -91,10 +91,14 @@ dump_fips_state() {
     docker exec "$container" fipsctl show links 2>&1 || true
     echo ""
     echo "--- $container: relay reachability ---"
-    docker exec "$container" sh -lc "nc -vz -w5 ${relay_host} ${relay_port}" 2>&1 || true
-    echo ""
-    echo "--- $container: stun reachability ---"
-    send_stun_probe "$container" "$stun_host" "$stun_port"
+    if [ -n "$relay_host" ] && [ -n "$relay_port" ]; then
+        docker exec "$container" sh -lc "nc -vz -w5 ${relay_host} ${relay_port}" 2>&1 || true
+    fi
+    if [ -n "$stun_host" ] && [ -n "$stun_port" ]; then
+        echo ""
+        echo "--- $container: stun reachability ---"
+        send_stun_probe "$container" "$stun_host" "$stun_port"
+    fi
 }
 
 dump_node_udp_probe() {
@@ -244,6 +248,21 @@ dump_lan_diagnostics() {
     dump_container_state fips-nat-stun
 }
 
+dump_assist_diagnostics() {
+    echo ""
+    echo "=== assist diagnostics ==="
+    dump_fips_state fips-nat-assist-a 172.31.254.30 7777 172.31.254.40 3478
+    dump_fips_state fips-nat-assist-b 172.31.254.30 7777
+    dump_fips_state fips-nat-assist-c 172.31.254.30 7777
+    dump_fips_state fips-nat-assist-d 172.31.254.30 7777
+    dump_container_state fips-nat-router-a
+    dump_container_state fips-nat-router-b
+    dump_container_state fips-nat-router-c
+    dump_container_state fips-nat-router-d
+    dump_container_state fips-nat-relay
+    dump_container_state fips-nat-stun
+}
+
 trap 'echo ""; echo "NAT test interrupted"; cleanup; exit 130' INT TERM
 
 require_test_image() {
@@ -281,6 +300,29 @@ if not addr.startswith(sys.argv[2]):
 " "$expected_transport" "$expected_prefix"
 }
 
+assert_peer_path_for_npub() {
+    local container="$1"
+    local npub="$2"
+    local expected_transport="$3"
+    local expected_prefix="$4"
+    docker exec "$container" fipsctl show peers \
+        | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+target = sys.argv[1]
+peers = [p for p in data.get('peers', []) if p.get('npub') == target and p.get('connectivity') == 'connected']
+if not peers:
+    raise SystemExit(f'no connected peer for {target}')
+peer = peers[0]
+transport = peer.get('transport_type', '')
+addr = peer.get('transport_addr', '')
+if transport != sys.argv[2]:
+    raise SystemExit(f'transport mismatch for {target}: expected {sys.argv[2]!r}, got {transport!r}')
+if not addr.startswith(sys.argv[3]):
+    raise SystemExit(f'addr mismatch for {target}: expected prefix {sys.argv[3]!r}, got {addr!r}')
+" "$npub" "$expected_transport" "$expected_prefix"
+}
+
 assert_link_path() {
     local container="$1"
     local expected_prefix="$2"
@@ -297,6 +339,19 @@ if not addr.startswith(sys.argv[1]):
 " "$expected_prefix"
 }
 
+assert_transport_name() {
+    local container="$1"
+    local expected_name="$2"
+    docker exec "$container" fipsctl show transports \
+        | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+expected = sys.argv[1]
+if not any(t.get('name') == expected for t in data.get('transports', [])):
+    raise SystemExit(f'missing transport named {expected!r}')
+" "$expected_name"
+}
+
 require_bootstrap_activity() {
     local container="$1"
     local logs
@@ -311,6 +366,25 @@ ping_peer() {
     local container="$1"
     local npub="$2"
     docker exec "$container" ping6 -c 3 -W 5 "${npub}.fips" >/dev/null
+}
+
+wait_for_ping() {
+    local container="$1"
+    local npub="$2"
+    local timeout_secs="${3:-45}"
+    local start_ts now
+    start_ts="$(date +%s)"
+    while true; do
+        if ping_peer "$container" "$npub"; then
+            return 0
+        fi
+        now="$(date +%s)"
+        if [ $((now - start_ts)) -ge "$timeout_secs" ]; then
+            echo "ping timeout: ${container} -> ${npub}.fips" >&2
+            return 1
+        fi
+        sleep 2
+    done
 }
 
 run_cone() {
@@ -389,6 +463,70 @@ run_lan() {
     cleanup
 }
 
+run_assist() {
+    echo "=== NAT lab: chained peer assist with Alice as STUN root ==="
+    cleanup
+    "$GENERATE_SCRIPT" assist
+    "${COMPOSE[@]}" --profile assist up -d --build --force-recreate
+    "$TOPOLOGY_SCRIPT" assist
+    docker exec fips-nat-assist-a sh -lc 'grep -A2 "^[[:space:]]*stun_servers:" /etc/fips/fips.yaml | grep -q "172.31.254.40:3478"'
+    docker exec fips-nat-assist-b sh -lc 'grep -q "^[[:space:]]*stun_servers:[[:space:]]*\\[\\]" /etc/fips/fips.yaml'
+    docker exec fips-nat-assist-c sh -lc 'grep -q "^[[:space:]]*stun_servers:[[:space:]]*\\[\\]" /etc/fips/fips.yaml'
+    docker exec fips-nat-assist-d sh -lc 'grep -q "^[[:space:]]*stun_servers:[[:space:]]*\\[\\]" /etc/fips/fips.yaml'
+    wait_for_peers fips-nat-assist-a 1 120 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    wait_for_peers fips-nat-assist-b 2 120 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    wait_for_peers fips-nat-assist-c 2 120 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    wait_for_peers fips-nat-assist-d 1 120 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    # shellcheck disable=SC1090
+    source "$NAT_DIR/generated-configs/assist/npubs.env"
+    assert_peer_path_for_npub fips-nat-assist-a "$NPUB_B" udp 172.31.254.
+    assert_peer_path_for_npub fips-nat-assist-b "$NPUB_A" udp 172.31.254.
+    assert_peer_path_for_npub fips-nat-assist-b "$NPUB_C" udp 172.31.254.12:
+    assert_peer_path_for_npub fips-nat-assist-c "$NPUB_B" udp 172.31.254.11:
+    assert_peer_path_for_npub fips-nat-assist-c "$NPUB_D" udp 172.31.254.13:
+    assert_peer_path_for_npub fips-nat-assist-d "$NPUB_C" udp 172.31.254.12:
+    assert_transport_name fips-nat-assist-b nostr-assist
+    assert_transport_name fips-nat-assist-c nostr-assist
+    assert_transport_name fips-nat-assist-d nostr-assist
+    wait_for_ping fips-nat-assist-c "$NPUB_B" 45 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    wait_for_ping fips-nat-assist-b "$NPUB_C" 45 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    wait_for_ping fips-nat-assist-a "$NPUB_C" 60 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    wait_for_ping fips-nat-assist-c "$NPUB_A" 60 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    wait_for_ping fips-nat-assist-a "$NPUB_D" 75 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    wait_for_ping fips-nat-assist-d "$NPUB_A" 75 || {
+        dump_assist_diagnostics
+        return 1
+    }
+    cleanup
+}
+
 main() {
     require_docker_daemon
     require_test_image
@@ -397,6 +535,7 @@ main() {
             run_cone
             run_symmetric
             run_lan
+            run_assist
             ;;
         cone)
             run_cone
@@ -407,8 +546,11 @@ main() {
         lan)
             run_lan
             ;;
+        assist)
+            run_assist
+            ;;
         *)
-            echo "Usage: $0 [all|cone|symmetric|lan]" >&2
+            echo "Usage: $0 [all|cone|symmetric|lan|assist]" >&2
             exit 1
             ;;
     esac

@@ -8,6 +8,7 @@ pub const ADVERT_VERSION: u32 = 1;
 pub const SIGNAL_KIND: u16 = 21059;
 pub const PUNCH_MAGIC: u32 = 0x4E505443;
 pub const PUNCH_ACK_MAGIC: u32 = 0x4E505441;
+pub const PEER_ASSIST_MAGIC: u32 = 0x4E504153;
 pub const PROTOCOL_VERSION: &str = "1";
 
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +163,85 @@ pub struct TraversalAnswer {
     #[serde(rename = "stunServer")]
     pub stun_server: Option<String>,
     pub punch: Option<PunchHint>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistRequest {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    #[serde(rename = "issuedAt")]
+    pub issued_at: u64,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: u64,
+    pub nonce: String,
+    #[serde(rename = "senderNpub")]
+    pub sender_npub: String,
+    #[serde(rename = "recipientNpub")]
+    pub recipient_npub: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistGrant {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    #[serde(rename = "grantId")]
+    pub grant_id: String,
+    #[serde(rename = "issuedAt")]
+    pub issued_at: u64,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: u64,
+    pub nonce: String,
+    #[serde(rename = "senderNpub")]
+    pub sender_npub: String,
+    #[serde(rename = "recipientNpub")]
+    pub recipient_npub: String,
+    #[serde(rename = "inReplyTo")]
+    pub in_reply_to: String,
+    pub accepted: bool,
+    #[serde(rename = "helperAddr")]
+    pub helper_addr: Option<String>,
+    #[serde(rename = "probeToken")]
+    pub probe_token: Option<String>,
+    #[serde(rename = "maxUses")]
+    pub max_uses: Option<u8>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAssistProbe {
+    pub grant_id: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistObserved {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    #[serde(rename = "grantId")]
+    pub grant_id: String,
+    #[serde(rename = "issuedAt")]
+    pub issued_at: u64,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: u64,
+    pub nonce: String,
+    #[serde(rename = "senderNpub")]
+    pub sender_npub: String,
+    #[serde(rename = "recipientNpub")]
+    pub recipient_npub: String,
+    #[serde(rename = "inReplyTo")]
+    pub in_reply_to: String,
+    pub accepted: bool,
+    #[serde(rename = "helperAddr")]
+    pub helper_addr: String,
+    #[serde(rename = "observedAddress")]
+    pub observed_address: Option<TraversalAddress>,
     pub reason: Option<String>,
 }
 

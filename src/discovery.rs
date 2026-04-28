@@ -42,6 +42,11 @@ pub struct EstablishedTraversal {
     pub remote_addr: SocketAddr,
     /// The live UDP socket carrying the established mapping.
     pub socket: UdpSocket,
+    /// Public endpoint for this socket as observed during rendezvous.
+    ///
+    /// When present, this can be advertised so other peers may use the live
+    /// transport as a peer-assisted rendezvous helper.
+    pub public_endpoint: Option<SocketAddr>,
     /// Optional name for the adopted UDP transport.
     pub transport_name: Option<String>,
     /// Optional UDP transport tuning overrides.
@@ -61,9 +66,16 @@ impl EstablishedTraversal {
             peer_npub: peer_npub.into(),
             remote_addr,
             socket,
+            public_endpoint: None,
             transport_name: None,
             transport_config: None,
         }
+    }
+
+    /// Attach an observed public endpoint for this live socket.
+    pub fn with_public_endpoint(mut self, addr: SocketAddr) -> Self {
+        self.public_endpoint = Some(addr);
+        self
     }
 
     /// Attach an explicit transport name to the adopted UDP transport.

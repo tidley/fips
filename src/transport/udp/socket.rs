@@ -205,6 +205,15 @@ mod platform {
             self.local_addr
         }
 
+        /// Duplicate this socket as a standard UDP socket.
+        pub fn try_clone_std(&self) -> Result<std::net::UdpSocket, TransportError> {
+            let cloned = self
+                .inner
+                .try_clone()
+                .map_err(|e| TransportError::StartFailed(format!("socket clone failed: {}", e)))?;
+            Ok(cloned.into())
+        }
+
         /// Get the actual receive buffer size granted by the kernel.
         pub fn recv_buffer_size(&self) -> Result<usize, TransportError> {
             self.inner
@@ -480,6 +489,15 @@ mod platform {
         /// Get the local bound address.
         pub fn local_addr(&self) -> SocketAddr {
             self.local_addr
+        }
+
+        /// Duplicate this socket as a standard UDP socket.
+        pub fn try_clone_std(&self) -> Result<std::net::UdpSocket, TransportError> {
+            let cloned = self
+                .inner
+                .try_clone()
+                .map_err(|e| TransportError::StartFailed(format!("socket clone failed: {}", e)))?;
+            Ok(cloned.into())
         }
 
         /// Get the actual receive buffer size.

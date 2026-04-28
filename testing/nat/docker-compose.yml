@@ -56,7 +56,7 @@ services:
   nat-a:
     build:
       context: ./router
-    profiles: ["cone", "symmetric"]
+    profiles: ["cone", "symmetric", "assist"]
     container_name: fips-nat-router-a
     cap_add:
       - NET_ADMIN
@@ -79,7 +79,7 @@ services:
   nat-b:
     build:
       context: ./router
-    profiles: ["cone", "symmetric"]
+    profiles: ["cone", "symmetric", "assist"]
     container_name: fips-nat-router-b
     cap_add:
       - NET_ADMIN
@@ -98,6 +98,52 @@ services:
     networks:
       wan:
         ipv4_address: 172.31.254.11
+
+  nat-c:
+    build:
+      context: ./router
+    profiles: ["assist"]
+    container_name: fips-nat-router-c
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    restart: "no"
+    environment:
+      - NAT_MODE=${NAT_MODE_C:-cone}
+      - TCP_FORWARD_PORTS=8443
+      - LAN_IF=eth1
+      - WAN_IF=eth0
+      - LAN_HOST=172.31.3.10
+      - LAN_SUBNET=172.31.3.0/24
+      - WAN_SUBNET=172.31.254.0/24
+      - WAN_GATEWAY=172.31.254.1
+    networks:
+      wan:
+        ipv4_address: 172.31.254.12
+
+  nat-d:
+    build:
+      context: ./router
+    profiles: ["assist"]
+    container_name: fips-nat-router-d
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    restart: "no"
+    environment:
+      - NAT_MODE=${NAT_MODE_D:-cone}
+      - TCP_FORWARD_PORTS=8443
+      - LAN_IF=eth1
+      - WAN_IF=eth0
+      - LAN_HOST=172.31.4.10
+      - LAN_SUBNET=172.31.4.0/24
+      - WAN_SUBNET=172.31.254.0/24
+      - WAN_GATEWAY=172.31.254.1
+    networks:
+      wan:
+        ipv4_address: 172.31.254.13
 
   cone-a:
     <<: *fips-common
@@ -232,3 +278,101 @@ services:
     networks:
       shared-lan:
         ipv4_address: 172.31.10.11
+
+  assist-a:
+    <<: *fips-common
+    profiles: ["assist"]
+    container_name: fips-nat-assist-a
+    hostname: fips-nat-assist-a
+    depends_on:
+      - nat-a
+      - relay
+      - stun
+    entrypoint:
+      - /usr/local/bin/nat-node-entrypoint.sh
+    environment:
+      - RUST_LOG=info,fips::discovery::nostr=debug,fips::node::lifecycle=debug
+      - DATA_IF=eth0
+      - ROUTE_SUBNET=172.31.254.0/24
+      - ROUTE_VIA=172.31.1.254
+      - RELAY_HOST=172.31.254.30
+      - RELAY_PORT=7777
+      - STUN_HOST=172.31.254.40
+      - STUN_PORT=3478
+    volumes:
+      - ../docker/resolv.conf:/etc/resolv.conf:ro
+      - ./node/entrypoint.sh:/usr/local/bin/nat-node-entrypoint.sh:ro
+      - ./generated-configs/assist/node-a.yaml:/etc/fips/fips.yaml:ro
+    network_mode: none
+
+  assist-b:
+    <<: *fips-common
+    profiles: ["assist"]
+    container_name: fips-nat-assist-b
+    hostname: fips-nat-assist-b
+    depends_on:
+      - nat-b
+      - relay
+      - stun
+    entrypoint:
+      - /usr/local/bin/nat-node-entrypoint.sh
+    environment:
+      - RUST_LOG=info,fips::discovery::nostr=debug,fips::node::lifecycle=debug
+      - DATA_IF=eth0
+      - ROUTE_SUBNET=172.31.254.0/24
+      - ROUTE_VIA=172.31.2.254
+      - RELAY_HOST=172.31.254.30
+      - RELAY_PORT=7777
+      - STUN_HOST=172.31.254.40
+      - STUN_PORT=3478
+    volumes:
+      - ../docker/resolv.conf:/etc/resolv.conf:ro
+      - ./node/entrypoint.sh:/usr/local/bin/nat-node-entrypoint.sh:ro
+      - ./generated-configs/assist/node-b.yaml:/etc/fips/fips.yaml:ro
+    network_mode: none
+
+  assist-c:
+    <<: *fips-common
+    profiles: ["assist"]
+    container_name: fips-nat-assist-c
+    hostname: fips-nat-assist-c
+    depends_on:
+      - nat-c
+      - relay
+    entrypoint:
+      - /usr/local/bin/nat-node-entrypoint.sh
+    environment:
+      - RUST_LOG=info,fips::discovery::nostr=debug,fips::node::lifecycle=debug
+      - DATA_IF=eth0
+      - ROUTE_SUBNET=172.31.254.0/24
+      - ROUTE_VIA=172.31.3.254
+      - RELAY_HOST=172.31.254.30
+      - RELAY_PORT=7777
+    volumes:
+      - ../docker/resolv.conf:/etc/resolv.conf:ro
+      - ./node/entrypoint.sh:/usr/local/bin/nat-node-entrypoint.sh:ro
+      - ./generated-configs/assist/node-c.yaml:/etc/fips/fips.yaml:ro
+    network_mode: none
+
+  assist-d:
+    <<: *fips-common
+    profiles: ["assist"]
+    container_name: fips-nat-assist-d
+    hostname: fips-nat-assist-d
+    depends_on:
+      - nat-d
+      - relay
+    entrypoint:
+      - /usr/local/bin/nat-node-entrypoint.sh
+    environment:
+      - RUST_LOG=info,fips::discovery::nostr=debug,fips::node::lifecycle=debug
+      - DATA_IF=eth0
+      - ROUTE_SUBNET=172.31.254.0/24
+      - ROUTE_VIA=172.31.4.254
+      - RELAY_HOST=172.31.254.30
+      - RELAY_PORT=7777
+    volumes:
+      - ../docker/resolv.conf:/etc/resolv.conf:ro
+      - ./node/entrypoint.sh:/usr/local/bin/nat-node-entrypoint.sh:ro
+      - ./generated-configs/assist/node-d.yaml:/etc/fips/fips.yaml:ro
+    network_mode: none

@@ -38,6 +38,8 @@ pub struct UdpTransport {
     state: TransportState,
     /// Bound socket (None until started).
     socket: Option<AsyncUdpSocket>,
+    /// Duplicate standard socket handle for STUN/helper observation.
+    std_socket: Option<std::net::UdpSocket>,
     /// Channel for delivering received packets to Node.
     packet_tx: PacketTx,
     /// Receive loop task handle.
@@ -64,6 +66,7 @@ impl UdpTransport {
             config,
             state: TransportState::Configured,
             socket: None,
+            std_socket: None,
             packet_tx,
             recv_task: None,
             local_addr: None,
@@ -80,6 +83,15 @@ impl UdpTransport {
     /// Get the local bound address (only valid after start).
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.local_addr
+    }
+
+    /// Clone the live UDP socket as a standard socket.
+    pub fn try_clone_std_socket(&self) -> Result<std::net::UdpSocket, TransportError> {
+        self.std_socket
+            .as_ref()
+            .ok_or(TransportError::NotStarted)?
+            .try_clone()
+            .map_err(|e| TransportError::StartFailed(format!("socket clone failed: {}", e)))
     }
 
     /// Get the transport statistics.
@@ -160,6 +172,7 @@ impl UdpTransport {
         let actual_recv = raw_socket.recv_buffer_size()?;
         let actual_send = raw_socket.send_buffer_size()?;
         self.local_addr = Some(raw_socket.local_addr());
+        self.std_socket = Some(raw_socket.try_clone_std()?);
 
         // Wrap in AsyncFd for tokio integration
         let async_socket = raw_socket.into_async()?;
@@ -221,6 +234,7 @@ impl UdpTransport {
         let actual_recv = raw_socket.recv_buffer_size()?;
         let actual_send = raw_socket.send_buffer_size()?;
         self.local_addr = Some(raw_socket.local_addr());
+        self.std_socket = Some(raw_socket.try_clone_std()?);
 
         let async_socket = raw_socket.into_async()?;
         self.socket = Some(async_socket.clone());
@@ -271,6 +285,7 @@ impl UdpTransport {
 
         // Drop socket
         self.socket.take();
+        self.std_socket.take();
         self.local_addr = None;
 
         self.state = TransportState::Down;
@@ -385,6 +400,7 @@ impl Drop for UdpTransport {
             task.abort();
         }
         self.socket.take();
+        self.std_socket.take();
         self.local_addr = None;
     }
 }
@@ -461,6 +477,7 @@ mod tests {
             send_buf_size: None,
             advertise_on_nostr: None,
             public: None,
+            peer_assist: None,
         }
     }
 

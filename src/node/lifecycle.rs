@@ -3,6 +3,8 @@
 use super::{Node, NodeError, NodeState};
 use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
 #[cfg(feature = "nostr-discovery")]
+use crate::discovery::nostr::stun::observe_traversal_addresses;
+#[cfg(feature = "nostr-discovery")]
 use crate::discovery::nostr::{
     ADVERT_IDENTIFIER, ADVERT_VERSION, BootstrapEvent, NostrDiscovery, OverlayAdvert,
     OverlayEndpointAdvert, OverlayTransportKind,
@@ -575,6 +577,7 @@ impl Node {
                 .await
             {
                 Ok(runtime) => {
+                    self.refresh_base_udp_helper_endpoints().await;
                     if let Err(err) = self.refresh_overlay_advert(&runtime).await {
                         warn!(error = %err, "Failed to publish initial Nostr overlay advert");
                     }
@@ -1299,7 +1302,7 @@ impl Node {
     }
 
     #[cfg(feature = "nostr-discovery")]
-    fn build_overlay_advert(&self) -> Option<OverlayAdvert> {
+    pub(in crate::node) fn build_overlay_advert(&self) -> Option<OverlayAdvert> {
         if !self.config.node.discovery.nostr.enabled {
             return None;
         }
@@ -1381,8 +1384,73 @@ impl Node {
             endpoints,
             signal_relays: has_udp_nat.then(|| self.config.node.discovery.nostr.dm_relays.clone()),
             stun_servers: has_udp_nat
-                .then(|| self.config.node.discovery.nostr.stun_servers.clone()),
+                .then(|| self.config.node.discovery.nostr.stun_servers.clone())
+                .filter(|servers| !servers.is_empty()),
         })
+    }
+
+    #[cfg(feature = "nostr-discovery")]
+    async fn refresh_base_udp_helper_endpoints(&mut self) {
+        if !self.config.node.discovery.nostr.enabled
+            || !self
+                .config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .private_enabled()
+            || self.config.node.discovery.nostr.stun_servers.is_empty()
+        {
+            return;
+        }
+
+        let mut helper_updates = Vec::new();
+        let stun_servers = self.config.node.discovery.nostr.stun_servers.clone();
+
+        for (transport_id, handle) in &self.transports {
+            if handle.transport_type().name != "udp" || !handle.is_operational() {
+                continue;
+            }
+
+            let Some(cfg) = self.lookup_udp_config(handle.name()) else {
+                continue;
+            };
+            if !cfg.advertise_on_nostr() || cfg.is_public() || !cfg.peer_assist_enabled() {
+                continue;
+            }
+
+            let socket = match handle.try_clone_udp_socket() {
+                Ok(socket) => socket,
+                Err(err) => {
+                    debug!(
+                        transport_id = %transport_id,
+                        error = %err,
+                        "Failed to clone UDP socket for helper endpoint observation"
+                    );
+                    continue;
+                }
+            };
+
+            match observe_traversal_addresses(&socket, &stun_servers).await {
+                Ok((Some(reflexive), _, _)) => {
+                    if let Ok(addr) = format!("{}:{}", reflexive.ip, reflexive.port).parse() {
+                        helper_updates.push((*transport_id, addr));
+                    }
+                }
+                Ok((None, _, _)) => {}
+                Err(err) => {
+                    debug!(
+                        transport_id = %transport_id,
+                        error = %err,
+                        "Failed to observe helper endpoint for UDP transport"
+                    );
+                }
+            }
+        }
+
+        for (transport_id, addr) in helper_updates {
+            self.peer_assist_endpoints.insert(transport_id, addr);
+        }
     }
 
     #[cfg(feature = "nostr-discovery")]
@@ -1390,6 +1458,16 @@ impl Node {
         &self,
         bootstrap: &std::sync::Arc<NostrDiscovery>,
     ) -> Result<(), crate::discovery::nostr::BootstrapError> {
+        let mut helper_endpoints = self
+            .peer_assist_endpoints
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        helper_endpoints.sort();
+        helper_endpoints.dedup();
+        bootstrap
+            .update_private_helper_endpoints(helper_endpoints)
+            .await;
         let advert = self.build_overlay_advert();
         bootstrap.update_local_advert(advert).await
     }
@@ -1598,6 +1676,21 @@ impl Node {
             crate::transport::TransportHandle::Udp(transport),
         );
         self.bootstrap_transports.insert(transport_id);
+        if traversal
+            .transport_config
+            .as_ref()
+            .is_some_and(|cfg| cfg.peer_assist_enabled())
+            && let Some(public_endpoint) = traversal.public_endpoint
+        {
+            self.peer_assist_endpoints
+                .insert(transport_id, public_endpoint);
+        }
+        #[cfg(feature = "nostr-discovery")]
+        if let Some(runtime) = self.nostr_discovery.clone()
+            && let Err(err) = self.refresh_overlay_advert(&runtime).await
+        {
+            debug!(error = %err, "Failed to refresh local Nostr overlay advert after traversal adoption");
+        }
 
         let remote_addr = TransportAddr::from_string(&traversal.remote_addr.to_string());
         if let Err(err) = self
@@ -1605,8 +1698,15 @@ impl Node {
             .await
         {
             self.bootstrap_transports.remove(&transport_id);
+            self.peer_assist_endpoints.remove(&transport_id);
             if let Some(mut handle) = self.transports.remove(&transport_id) {
                 let _ = handle.stop().await;
+            }
+            #[cfg(feature = "nostr-discovery")]
+            if let Some(runtime) = self.nostr_discovery.clone()
+                && let Err(refresh_err) = self.refresh_overlay_advert(&runtime).await
+            {
+                debug!(error = %refresh_err, "Failed to refresh local Nostr overlay advert after traversal cleanup");
             }
             return Err(err);
         }

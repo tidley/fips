@@ -435,6 +435,9 @@ pub struct Node {
     nostr_discovery: Option<Arc<crate::discovery::nostr::NostrDiscovery>>,
     /// Per-peer UDP transports adopted from NAT traversal handoff.
     bootstrap_transports: HashSet<TransportId>,
+    /// Publicly reachable helper endpoints for live UDP transports that may be
+    /// used for peer-assisted rendezvous.
+    peer_assist_endpoints: HashMap<TransportId, std::net::SocketAddr>,
 
     // === Periodic Parent Re-evaluation ===
     /// Timestamp of last periodic parent re-evaluation (for pacing).
@@ -599,6 +602,7 @@ impl Node {
             #[cfg(feature = "nostr-discovery")]
             nostr_discovery: None,
             bootstrap_transports: HashSet::new(),
+            peer_assist_endpoints: HashMap::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
             estimated_mesh_size: None,
@@ -727,6 +731,7 @@ impl Node {
             #[cfg(feature = "nostr-discovery")]
             nostr_discovery: None,
             bootstrap_transports: HashSet::new(),
+            peer_assist_endpoints: HashMap::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
             estimated_mesh_size: None,
@@ -1437,6 +1442,7 @@ impl Node {
         );
 
         self.bootstrap_transports.remove(&transport_id);
+        self.peer_assist_endpoints.remove(&transport_id);
         self.transport_drops.remove(&transport_id);
         self.transports.remove(&transport_id);
     }

@@ -51,6 +51,13 @@ pub struct UdpConfig {
     /// Default: false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public: Option<bool>,
+
+    /// Whether this UDP transport may be used as a private peer-assist helper
+    /// surface once a public endpoint for the live socket is known.
+    ///
+    /// Default: false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_assist: Option<bool>,
 }
 
 impl UdpConfig {
@@ -82,6 +89,11 @@ impl UdpConfig {
     /// Whether this UDP transport should be advertised as directly reachable.
     pub fn is_public(&self) -> bool {
         self.public.unwrap_or(false)
+    }
+
+    /// Whether this UDP transport may be used as a private peer-assist helper.
+    pub fn peer_assist_enabled(&self) -> bool {
+        self.peer_assist.unwrap_or(false)
     }
 }
 

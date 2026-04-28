@@ -147,7 +147,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run unit tests
-        run: cargo nextest run --all --profile ci
+        run: cargo nextest run --all --profile ci --features "gateway nostr-discovery"
 
       - name: Publish test report (Checks tab)
         uses: dorny/test-reporter@v2

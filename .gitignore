@@ -27,6 +27,16 @@ dist/
 
 sim-results/
 
+# Local/private agent files
+AGENTS.md
+CLAUDE.md
+agents/
+
+# Local node identity/config artifacts
+fips.key
+fips.pub
+fips.yaml
+
 # Python
 __pycache__/
 *.py[cod]

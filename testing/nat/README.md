@@ -38,8 +38,27 @@ This distinction matters because plain `MASQUERADE` is convenient source NAT, bu
 
 ## Prerequisites
 
+- Linux runner/host with `CAP_NET_ADMIN` and support for `ip netns`, `veth`, and `iptables`
 - Docker with Compose support
 - locally built `fips-test:latest`
+
+## CI / automation strategy
+
+NAT harness tests are **manual/nightly-only** for now; they are not part of the default PR CI matrix.
+
+Why:
+- the harness requires privileged namespace and firewall operations (`veth`, `ip netns`, `iptables`)
+- hosted CI runners are inconsistent for this capability and can produce flaky false negatives
+
+PR gate policy:
+- required PR CI covers unit/integration suites already wired in `.github/workflows/ci.yml`
+- NAT harness validation is run explicitly by maintainers before merge when NAT/rendezvous logic changes
+
+Recommended manual run:
+
+```bash
+./testing/nat/scripts/nat-test.sh assist
+```
 
 Build the test image with:
 

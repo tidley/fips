@@ -286,6 +286,81 @@ pub enum NostrDiscoveryPolicy {
     Open,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerAssistMode {
+    #[default]
+    Disabled,
+    FallbackPrivate,
+    PreferPrivate,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerAssistRequestPolicy {
+    #[default]
+    OpenRateLimited,
+    Allowlist,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerAssistConfig {
+    #[serde(default)]
+    pub mode: PeerAssistMode,
+    #[serde(default)]
+    pub request_policy: PeerAssistRequestPolicy,
+    #[serde(default)]
+    pub request_allowlist: Vec<String>,
+    #[serde(default = "PeerAssistConfig::default_max_pending_requests")]
+    pub max_pending_requests: usize,
+    #[serde(default = "PeerAssistConfig::default_grant_ttl_secs")]
+    pub grant_ttl_secs: u64,
+    #[serde(default = "PeerAssistConfig::default_max_requests_per_peer_per_window")]
+    pub max_requests_per_peer_per_window: usize,
+    #[serde(default = "PeerAssistConfig::default_request_window_secs")]
+    pub request_window_secs: u64,
+}
+
+impl Default for PeerAssistConfig {
+    fn default() -> Self {
+        Self {
+            mode: PeerAssistMode::Disabled,
+            request_policy: PeerAssistRequestPolicy::OpenRateLimited,
+            request_allowlist: Vec::new(),
+            max_pending_requests: Self::default_max_pending_requests(),
+            grant_ttl_secs: Self::default_grant_ttl_secs(),
+            max_requests_per_peer_per_window: Self::default_max_requests_per_peer_per_window(),
+            request_window_secs: Self::default_request_window_secs(),
+        }
+    }
+}
+
+impl PeerAssistConfig {
+    fn default_max_pending_requests() -> usize {
+        64
+    }
+
+    fn default_grant_ttl_secs() -> u64 {
+        15
+    }
+
+    fn default_max_requests_per_peer_per_window() -> usize {
+        8
+    }
+
+    fn default_request_window_secs() -> u64 {
+        60
+    }
+
+    pub fn private_enabled(&self) -> bool {
+        matches!(
+            self.mode,
+            PeerAssistMode::FallbackPrivate | PeerAssistMode::PreferPrivate
+        )
+    }
+}
+
 /// Nostr-mediated overlay endpoint discovery (`node.discovery.nostr.*`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -341,6 +416,9 @@ pub struct NostrDiscoveryConfig {
     /// How often adverts are refreshed in seconds.
     #[serde(default = "NostrDiscoveryConfig::default_advert_refresh_secs")]
     pub advert_refresh_secs: u64,
+    /// Private peer-assist helper policy and rate limiting.
+    #[serde(default)]
+    pub peer_assist: PeerAssistConfig,
 }
 
 impl Default for NostrDiscoveryConfig {
@@ -362,6 +440,7 @@ impl Default for NostrDiscoveryConfig {
             punch_duration_ms: Self::default_punch_duration_ms(),
             advert_ttl_secs: Self::default_advert_ttl_secs(),
             advert_refresh_secs: Self::default_advert_refresh_secs(),
+            peer_assist: PeerAssistConfig::default(),
         }
     }
 }

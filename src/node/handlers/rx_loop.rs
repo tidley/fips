@@ -146,15 +146,22 @@ impl Node {
     /// Dispatches based on the phase field in the 4-byte common prefix.
     async fn process_packet(&mut self, packet: ReceivedPacket) {
         if packet.data.len() < COMMON_PREFIX_SIZE {
+            let _ = self.try_handle_peer_assist_probe(&packet).await;
             return; // Drop packets too short for common prefix
         }
 
         let prefix = match CommonPrefix::parse(&packet.data) {
             Some(p) => p,
-            None => return, // Malformed prefix
+            None => {
+                let _ = self.try_handle_peer_assist_probe(&packet).await;
+                return; // Malformed prefix
+            }
         };
 
         if prefix.version != FMP_VERSION {
+            if self.try_handle_peer_assist_probe(&packet).await {
+                return;
+            }
             debug!(
                 version = prefix.version,
                 transport_id = %packet.transport_id,
@@ -174,6 +181,9 @@ impl Node {
                 self.handle_msg2(packet).await;
             }
             _ => {
+                if self.try_handle_peer_assist_probe(&packet).await {
+                    return;
+                }
                 debug!(
                     phase = prefix.phase,
                     transport_id = %packet.transport_id,
@@ -181,5 +191,44 @@ impl Node {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "nostr-discovery")]
+    async fn try_handle_peer_assist_probe(&self, packet: &ReceivedPacket) -> bool {
+        if !self
+            .config
+            .node
+            .discovery
+            .nostr
+            .peer_assist
+            .private_enabled()
+        {
+            return false;
+        }
+        let Some(public_addr) = self
+            .peer_assist_endpoints
+            .get(&packet.transport_id)
+            .copied()
+        else {
+            return false;
+        };
+        let Some(remote_addr) = packet
+            .remote_addr
+            .as_str()
+            .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+        else {
+            return false;
+        };
+        let Some(runtime) = self.nostr_discovery.clone() else {
+            return false;
+        };
+        runtime
+            .observe_peer_assist_probe(public_addr, remote_addr, &packet.data)
+            .await
+    }
+
+    #[cfg(not(feature = "nostr-discovery"))]
+    async fn try_handle_peer_assist_probe(&self, _packet: &ReceivedPacket) -> bool {
+        false
     }
 }

@@ -11,7 +11,7 @@ use super::types::{BootstrapError, TraversalAddress};
 // Local interface discovery remains best-effort and may still be incomplete
 // on dual-stack, NAT64, or heavily firewalled hosts.
 
-pub(super) async fn observe_traversal_addresses(
+pub(crate) async fn observe_traversal_addresses(
     socket: &std::net::UdpSocket,
     stun_servers: &[String],
 ) -> Result<

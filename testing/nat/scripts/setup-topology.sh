@@ -5,16 +5,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NAT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-SCENARIO="${1:?usage: setup-topology.sh <cone|symmetric>}"
+SCENARIO="${1:?usage: setup-topology.sh <cone|symmetric|assist>}"
 
 case "$SCENARIO" in
     cone)
         node_a="fips-nat-cone-a"
         node_b="fips-nat-cone-b"
+        node_c=""
+        node_d=""
         ;;
     symmetric)
         node_a="fips-nat-symmetric-a"
         node_b="fips-nat-symmetric-b"
+        node_c=""
+        node_d=""
+        ;;
+    assist)
+        node_a="fips-nat-assist-a"
+        node_b="fips-nat-assist-b"
+        node_c="fips-nat-assist-c"
+        node_d="fips-nat-assist-d"
         ;;
     *)
         echo "Unsupported topology scenario: $SCENARIO" >&2
@@ -24,6 +34,8 @@ esac
 
 router_a="fips-nat-router-a"
 router_b="fips-nat-router-b"
+router_c="fips-nat-router-c"
+router_d="fips-nat-router-d"
 
 helper_image() {
     if [ -n "${IP_HELPER_IMAGE:-}" ]; then
@@ -126,6 +138,12 @@ main() {
 
     setup_pair "$image" "$node_a" "$router_a" vna0 vna1 172.31.1.10/24 172.31.1.254/24
     setup_pair "$image" "$node_b" "$router_b" vnb0 vnb1 172.31.2.10/24 172.31.2.254/24
+    if [ -n "$node_c" ]; then
+        setup_pair "$image" "$node_c" "$router_c" vnc0 vnc1 172.31.3.10/24 172.31.3.254/24
+    fi
+    if [ -n "${node_d:-}" ]; then
+        setup_pair "$image" "$node_d" "$router_d" vnd0 vnd1 172.31.4.10/24 172.31.4.254/24
+    fi
 }
 
 main "$@"

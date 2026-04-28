@@ -998,6 +998,16 @@ impl TransportHandle {
         }
     }
 
+    /// Clone the live UDP socket as a standard socket.
+    pub fn try_clone_udp_socket(&self) -> Result<std::net::UdpSocket, TransportError> {
+        match self {
+            TransportHandle::Udp(t) => t.try_clone_std_socket(),
+            _ => Err(TransportError::NotSupported(
+                "standard UDP socket clone only supported for UDP transports".into(),
+            )),
+        }
+    }
+
     /// Get the interface name (Ethernet only, returns None for other transports).
     pub fn interface_name(&self) -> Option<&str> {
         match self {

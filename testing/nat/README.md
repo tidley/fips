@@ -15,11 +15,12 @@ Docker bridge networks. The harness creates explicit `veth` pairs and
 moves them into the node and router namespaces after `docker compose up`
 so every packet must traverse the router namespace.
 
-It covers three scenarios:
+It covers four scenarios:
 
 - `cone`: both peers behind explicit namespace/veth full-cone emulation, UDP traversal succeeds
 - `symmetric`: both peers behind symmetric-style NAT, UDP traversal fails, TCP fallback succeeds
 - `lan`: both peers share a LAN subnet, LAN targets are preferred over reflexive addresses
+- `assist`: Alice is the only node with dedicated public STUN, Bob joins through Alice's relay-published helper endpoint, Colin joins through Bob, then Dave joins through Colin
 
 ## NAT model notes
 
@@ -60,6 +61,7 @@ Run one scenario:
 ./testing/nat/scripts/nat-test.sh cone
 ./testing/nat/scripts/nat-test.sh symmetric
 ./testing/nat/scripts/nat-test.sh lan
+./testing/nat/scripts/nat-test.sh assist
 ```
 
 ## Layout
@@ -97,3 +99,14 @@ Run one scenario:
   - both nodes connect
   - connected transport is UDP
   - active link remote addresses stay on the shared LAN subnet
+
+- `assist`
+  - Alice is the only node with dedicated `stun_servers`
+  - Bob, Colin, and Dave all have `stun_servers: []`
+  - Alice publishes a helper-capable endpoint from her base `udp:nat` transport
+  - Bob converges to Alice over UDP through that relay-backed helper advert
+  - Colin converges to Bob over UDP through a relay-backed helper advert
+  - Dave converges to Colin over UDP through a second relay-backed helper advert
+  - Bob, Colin, and Dave all expose an adopted transport named `nostr-assist`
+  - Alice sees Bob on Bob's WAN-mapped router address, Bob sees Colin on Colin's WAN-mapped router address, and Colin sees Dave on Dave's WAN-mapped router address
+  - Alice can exchange routed ICMPv6 traffic with Colin and with Dave across the mesh

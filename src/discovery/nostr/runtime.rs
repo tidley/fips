@@ -15,23 +15,41 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::signal::{
-    SignalEnvelope, build_signal_event, create_traversal_answer, create_traversal_offer,
-    unwrap_signal_event, validate_offer_freshness, validate_traversal_answer_for_offer,
+    SignalEnvelope, build_peer_assist_probe, build_signal_event, create_assist_grant,
+    create_assist_observed, create_assist_request, create_traversal_answer, create_traversal_offer,
+    parse_peer_assist_probe, unwrap_signal_event, validate_assist_grant_for_request,
+    validate_assist_observed_for_grant, validate_assist_request_freshness,
+    validate_offer_freshness, validate_traversal_answer_for_offer,
 };
 use super::stun::observe_traversal_addresses;
 use super::traversal::{nonce, now_ms, planned_remote_endpoints, run_punch_attempt};
 use super::types::{
-    ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, BootstrapError, BootstrapEvent,
-    CachedOverlayAdvert, OverlayAdvert, OverlayEndpointAdvert, PROTOCOL_VERSION, PunchHint,
-    SIGNAL_KIND, TraversalAnswer, TraversalOffer,
+    ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, AssistGrant, AssistObserved, AssistRequest,
+    BootstrapError, BootstrapEvent, CachedOverlayAdvert, OverlayAdvert, OverlayEndpointAdvert,
+    PROTOCOL_VERSION, PunchHint, SIGNAL_KIND, TraversalAddress, TraversalAnswer, TraversalOffer,
 };
-use crate::config::{NostrDiscoveryConfig, PeerConfig};
+use crate::config::{NostrDiscoveryConfig, PeerAssistRequestPolicy, PeerConfig, UdpConfig};
 use crate::discovery::EstablishedTraversal;
 
 const MAX_CONCURRENT_INCOMING_OFFERS: usize = 16;
 const ADVERT_CACHE_MAX_ENTRIES: usize = 2048;
 const SEEN_SESSIONS_MAX_ENTRIES: usize = ADVERT_CACHE_MAX_ENTRIES;
 const ADVERT_CACHE_STALE_GRACE_MULTIPLIER: u64 = 2;
+
+#[derive(Debug, Clone)]
+struct PendingPrivateAssistGrant {
+    request_id: String,
+    grant_id: String,
+    grant_nonce: String,
+    probe_token: String,
+    sender_pubkey: PublicKey,
+    sender_npub: String,
+    helper_addr: String,
+    relays: Vec<String>,
+    expires_at: u64,
+}
+
+type RateLimitWindow = HashMap<String, Vec<u64>>;
 
 pub struct NostrDiscovery {
     client: Client,
@@ -43,6 +61,12 @@ pub struct NostrDiscovery {
     local_advert: RwLock<Option<OverlayAdvert>>,
     current_advert_event_id: RwLock<Option<EventId>>,
     pending_answers: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<TraversalAnswer>>>>,
+    pending_assist_grants: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<AssistGrant>>>>,
+    pending_assist_observed:
+        Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<AssistObserved>>>>,
+    pending_private_assist_grants: Mutex<HashMap<String, PendingPrivateAssistGrant>>,
+    helper_endpoints: RwLock<Vec<std::net::SocketAddr>>,
+    assist_request_windows: Mutex<RateLimitWindow>,
     active_initiators: Mutex<HashSet<String>>,
     seen_sessions: Mutex<HashMap<String, u64>>,
     offer_slots: Arc<Semaphore>,
@@ -50,6 +74,10 @@ pub struct NostrDiscovery {
     event_rx: Mutex<mpsc::UnboundedReceiver<BootstrapEvent>>,
     notify_task: Mutex<Option<JoinHandle<()>>>,
     advertise_task: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    test_capture_outgoing: bool,
+    #[cfg(test)]
+    test_sent_signals: Mutex<Vec<String>>,
 }
 
 impl NostrDiscovery {
@@ -93,6 +121,11 @@ impl NostrDiscovery {
             local_advert: RwLock::new(None),
             current_advert_event_id: RwLock::new(None),
             pending_answers: Mutex::new(HashMap::new()),
+            pending_assist_grants: Mutex::new(HashMap::new()),
+            pending_assist_observed: Mutex::new(HashMap::new()),
+            pending_private_assist_grants: Mutex::new(HashMap::new()),
+            helper_endpoints: RwLock::new(Vec::new()),
+            assist_request_windows: Mutex::new(HashMap::new()),
             active_initiators: Mutex::new(HashSet::new()),
             seen_sessions: Mutex::new(HashMap::new()),
             offer_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING_OFFERS)),
@@ -100,6 +133,10 @@ impl NostrDiscovery {
             event_rx: Mutex::new(event_rx),
             notify_task: Mutex::new(None),
             advertise_task: Mutex::new(None),
+            #[cfg(test)]
+            test_capture_outgoing: false,
+            #[cfg(test)]
+            test_sent_signals: Mutex::new(Vec::new()),
         });
 
         runtime.subscribe().await?;
@@ -108,6 +145,47 @@ impl NostrDiscovery {
         *runtime.notify_task.lock().await = Some(runtime.clone().spawn_notify_loop());
 
         Ok(runtime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        identity: &crate::Identity,
+        config: NostrDiscoveryConfig,
+    ) -> Arc<Self> {
+        let keys = nostr::Keys::parse(&hex::encode(identity.keypair().secret_bytes()))
+            .expect("parse nostr keys");
+        let client = Client::builder()
+            .signer(keys.clone())
+            .opts(Options::new().autoconnect(false).gossip(false))
+            .build();
+        let pubkey = keys.public_key();
+        let npub = crate::encode_npub(&identity.pubkey());
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        Arc::new(Self {
+            client,
+            keys,
+            pubkey,
+            npub,
+            config,
+            advert_cache: RwLock::new(HashMap::new()),
+            local_advert: RwLock::new(None),
+            current_advert_event_id: RwLock::new(None),
+            pending_answers: Mutex::new(HashMap::new()),
+            pending_assist_grants: Mutex::new(HashMap::new()),
+            pending_assist_observed: Mutex::new(HashMap::new()),
+            pending_private_assist_grants: Mutex::new(HashMap::new()),
+            helper_endpoints: RwLock::new(Vec::new()),
+            assist_request_windows: Mutex::new(HashMap::new()),
+            active_initiators: Mutex::new(HashSet::new()),
+            seen_sessions: Mutex::new(HashMap::new()),
+            offer_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING_OFFERS)),
+            event_tx,
+            event_rx: Mutex::new(event_rx),
+            notify_task: Mutex::new(None),
+            advertise_task: Mutex::new(None),
+            test_capture_outgoing: true,
+            test_sent_signals: Mutex::new(Vec::new()),
+        })
     }
 
     pub async fn request_connect(self: &Arc<Self>, peer_config: PeerConfig) {
@@ -140,6 +218,89 @@ impl NostrDiscovery {
             out.push(event);
         }
         out
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drain_test_signals(&self) -> Vec<String> {
+        let mut signals = self.test_sent_signals.lock().await;
+        std::mem::take(&mut *signals)
+    }
+
+    pub async fn update_private_helper_endpoints(&self, mut endpoints: Vec<std::net::SocketAddr>) {
+        endpoints.sort();
+        endpoints.dedup();
+        *self.helper_endpoints.write().await = endpoints;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn connect_peer_via_private_assist_for_test(
+        &self,
+        peer_config: PeerConfig,
+        advert: OverlayAdvert,
+    ) -> Result<EstablishedTraversal, BootstrapError> {
+        let target_pubkey =
+            PublicKey::parse(&peer_config.npub).map_err(|e| BootstrapError::InvalidPeerNpub {
+                npub: peer_config.npub.clone(),
+                reason: e.to_string(),
+            })?;
+        let relays = if let Some(relays) = advert.signal_relays.clone() {
+            relays
+        } else {
+            self.config.dm_relays.clone()
+        };
+        self.connect_peer_via_private_assist(peer_config, target_pubkey, &relays)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn handle_incoming_assist_request_for_test(
+        self: Arc<Self>,
+        request: AssistRequest,
+        sender: PublicKey,
+        sender_npub: String,
+    ) -> Result<(), BootstrapError> {
+        self.handle_incoming_assist_request(request, sender, sender_npub)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_assist_grant_for_test(
+        &self,
+        grant: AssistGrant,
+        sender_npub: String,
+    ) {
+        if let Some(tx) = self
+            .pending_assist_grants
+            .lock()
+            .await
+            .remove(&grant.in_reply_to)
+        {
+            let _ = tx.send(SignalEnvelope {
+                payload: grant,
+                event_id: EventId::all_zeros(),
+                sender_npub,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_assist_observed_for_test(
+        &self,
+        observed: AssistObserved,
+        sender_npub: String,
+    ) {
+        if let Some(tx) = self
+            .pending_assist_observed
+            .lock()
+            .await
+            .remove(&observed.in_reply_to)
+        {
+            let _ = tx.send(SignalEnvelope {
+                payload: observed,
+                event_id: EventId::all_zeros(),
+                sender_npub,
+            });
+        }
     }
 
     pub async fn update_local_advert(
@@ -282,6 +443,45 @@ impl NostrDiscovery {
                         continue;
                     }
 
+                    if let Ok(grant) = serde_json::from_str::<AssistGrant>(&unwrapped.rumor.content)
+                        && grant.message_type == "assist-grant"
+                        && grant.recipient_npub == self.npub
+                    {
+                        if let Some(tx) = self
+                            .pending_assist_grants
+                            .lock()
+                            .await
+                            .remove(&grant.in_reply_to)
+                        {
+                            let _ = tx.send(SignalEnvelope {
+                                payload: grant,
+                                event_id: event.id,
+                                sender_npub: sender_npub.clone(),
+                            });
+                        }
+                        continue;
+                    }
+
+                    if let Ok(observed) =
+                        serde_json::from_str::<AssistObserved>(&unwrapped.rumor.content)
+                        && observed.message_type == "assist-observed"
+                        && observed.recipient_npub == self.npub
+                    {
+                        if let Some(tx) = self
+                            .pending_assist_observed
+                            .lock()
+                            .await
+                            .remove(&observed.in_reply_to)
+                        {
+                            let _ = tx.send(SignalEnvelope {
+                                payload: observed,
+                                event_id: event.id,
+                                sender_npub: sender_npub.clone(),
+                            });
+                        }
+                        continue;
+                    }
+
                     if let Ok(offer) =
                         serde_json::from_str::<TraversalOffer>(&unwrapped.rumor.content)
                         && offer.message_type == "offer"
@@ -299,6 +499,27 @@ impl NostrDiscovery {
                                 .await
                             {
                                 warn!(error = %err, "failed to handle traversal offer");
+                            }
+                        });
+                        continue;
+                    }
+
+                    if let Ok(request) =
+                        serde_json::from_str::<AssistRequest>(&unwrapped.rumor.content)
+                        && request.message_type == "assist-request"
+                        && request.recipient_npub == self.npub
+                    {
+                        let runtime = Arc::clone(&self);
+                        tokio::spawn(async move {
+                            if let Err(err) = runtime
+                                .handle_incoming_assist_request(
+                                    request,
+                                    unwrapped.sender,
+                                    sender_npub,
+                                )
+                                .await
+                            {
+                                warn!(error = %err, "failed to handle assist request");
                             }
                         });
                     }
@@ -424,10 +645,11 @@ impl NostrDiscovery {
                     "udp:nat endpoint requires non-empty signalRelays".to_string(),
                 ));
             }
-            if advert
-                .stun_servers
-                .as_ref()
-                .is_none_or(|servers| servers.is_empty())
+            if !self.config.peer_assist.private_enabled()
+                && advert
+                    .stun_servers
+                    .as_ref()
+                    .is_none_or(|servers| servers.is_empty())
             {
                 return Err(BootstrapError::InvalidAdvert(
                     "udp:nat endpoint requires non-empty stunServers".to_string(),
@@ -475,14 +697,34 @@ impl NostrDiscovery {
                 reason: e.to_string(),
             })?;
         let advert = self.fetch_advert(&peer_config.npub, target_pubkey).await?;
-        if !advert.has_udp_nat_endpoint() {
-            return Err(BootstrapError::MissingNatEndpoint(peer_config.npub.clone()));
-        }
         let relays = self
             .preferred_signal_relays(target_pubkey, Some(&advert))
             .await?;
         if relays.is_empty() {
             return Err(BootstrapError::MissingRelays(peer_config.npub));
+        }
+
+        let private_assist_enabled = self.config.peer_assist.private_enabled();
+        if !advert.has_udp_nat_endpoint() {
+            return Err(BootstrapError::MissingNatEndpoint(peer_config.npub));
+        }
+
+        if private_assist_enabled && self.config.stun_servers.is_empty() {
+            return self
+                .connect_peer_via_private_assist(peer_config, target_pubkey, &relays)
+                .await;
+        }
+
+        if private_assist_enabled
+            && matches!(
+                self.config.peer_assist.mode,
+                crate::config::PeerAssistMode::PreferPrivate
+            )
+            && let Ok(traversal) = self
+                .connect_peer_via_private_assist(peer_config.clone(), target_pubkey, &relays)
+                .await
+        {
+            return Ok(traversal);
         }
 
         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
@@ -498,7 +740,7 @@ impl NostrDiscovery {
             session_id.clone(),
             self.npub.clone(),
             peer_config.npub.clone(),
-            reflexive_address,
+            reflexive_address.clone(),
             local_addresses,
             stun_server,
         );
@@ -569,7 +811,193 @@ impl NostrDiscovery {
 
         Ok(
             EstablishedTraversal::new(session_id, peer_config.npub, remote_addr, base_socket)
+                .with_public_endpoint(
+                    reflexive_address
+                        .as_ref()
+                        .and_then(Self::traversal_address_to_socket)
+                        .ok_or_else(|| {
+                            BootstrapError::Protocol(
+                                "missing reflexive address for established traversal".to_string(),
+                            )
+                        })?,
+                )
                 .with_transport_name("nostr-nat"),
+        )
+    }
+
+    async fn connect_peer_via_private_assist(
+        &self,
+        peer_config: PeerConfig,
+        target_pubkey: PublicKey,
+        relays: &[String],
+    ) -> Result<EstablishedTraversal, BootstrapError> {
+        let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+        base_socket.set_nonblocking(true)?;
+
+        let request_id = nonce();
+        let request = create_assist_request(
+            request_id.clone(),
+            now_ms(),
+            self.config.peer_assist.grant_ttl_secs * 1000,
+            nonce(),
+            self.npub.clone(),
+            peer_config.npub.clone(),
+        );
+
+        let (grant_tx, grant_rx) = oneshot::channel();
+        self.pending_assist_grants
+            .lock()
+            .await
+            .insert(request.nonce.clone(), grant_tx);
+        let request_event = self.send_signal(relays, target_pubkey, &request).await?;
+
+        let grant = match tokio::time::timeout(
+            Duration::from_secs(self.config.peer_assist.grant_ttl_secs),
+            grant_rx,
+        )
+        .await
+        {
+            Ok(Ok(grant)) => grant,
+            Ok(Err(_)) => {
+                let _ = self
+                    .pending_assist_grants
+                    .lock()
+                    .await
+                    .remove(&request.nonce);
+                return Err(BootstrapError::Protocol(
+                    "assist grant channel closed".to_string(),
+                ));
+            }
+            Err(_) => {
+                let _ = self
+                    .pending_assist_grants
+                    .lock()
+                    .await
+                    .remove(&request.nonce);
+                return Err(BootstrapError::SignalTimeout(peer_config.npub));
+            }
+        };
+
+        validate_assist_grant_for_request(
+            &request,
+            &grant.payload,
+            now_ms(),
+            self.config.peer_assist.grant_ttl_secs * 1000,
+            &grant.sender_npub,
+            &self.npub,
+        )?;
+        if !grant.payload.accepted {
+            return Err(BootstrapError::Protocol(
+                grant
+                    .payload
+                    .reason
+                    .unwrap_or_else(|| "remote rejected private assist".to_string()),
+            ));
+        }
+
+        let helper_addr = grant
+            .payload
+            .helper_addr
+            .as_deref()
+            .ok_or_else(|| {
+                BootstrapError::Protocol("missing helper endpoint in grant".to_string())
+            })?
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| BootstrapError::Protocol(format!("invalid helper endpoint: {e}")))?;
+        let grant_id = grant.payload.grant_id.clone();
+        let probe_token =
+            grant.payload.probe_token.clone().ok_or_else(|| {
+                BootstrapError::Protocol("missing probe token in grant".to_string())
+            })?;
+
+        let (observed_tx, observed_rx) = oneshot::channel();
+        self.pending_assist_observed
+            .lock()
+            .await
+            .insert(grant.payload.nonce.clone(), observed_tx);
+
+        let probe_socket = base_socket.try_clone()?;
+        let probe_task = tokio::spawn(async move {
+            let probe = build_peer_assist_probe(&grant_id, &probe_token);
+            loop {
+                let _ = probe_socket.send_to(&probe, helper_addr);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+
+        let observed = match tokio::time::timeout(
+            Duration::from_secs(self.config.peer_assist.grant_ttl_secs),
+            observed_rx,
+        )
+        .await
+        {
+            Ok(Ok(observed)) => observed,
+            Ok(Err(_)) => {
+                let _ = self
+                    .pending_assist_observed
+                    .lock()
+                    .await
+                    .remove(&grant.payload.nonce);
+                probe_task.abort();
+                return Err(BootstrapError::Protocol(
+                    "assist observed channel closed".to_string(),
+                ));
+            }
+            Err(_) => {
+                let _ = self
+                    .pending_assist_observed
+                    .lock()
+                    .await
+                    .remove(&grant.payload.nonce);
+                probe_task.abort();
+                return Err(BootstrapError::SignalTimeout(peer_config.npub));
+            }
+        };
+        probe_task.abort();
+
+        validate_assist_observed_for_grant(
+            &grant.payload,
+            &observed.payload,
+            now_ms(),
+            self.config.peer_assist.grant_ttl_secs * 1000,
+            &observed.sender_npub,
+            &self.npub,
+        )?;
+        if !observed.payload.accepted {
+            return Err(BootstrapError::Protocol(
+                observed
+                    .payload
+                    .reason
+                    .unwrap_or_else(|| "remote rejected observed endpoint".to_string()),
+            ));
+        }
+
+        let _ = self
+            .publish_delete(
+                relays,
+                [request_event.id, grant.event_id, observed.event_id],
+            )
+            .await;
+
+        let observed_endpoint = observed
+            .payload
+            .observed_address
+            .as_ref()
+            .and_then(Self::traversal_address_to_socket)
+            .ok_or_else(|| {
+                BootstrapError::Protocol(
+                    "missing observed address for accepted peer-assist answer".to_string(),
+                )
+            })?;
+
+        Ok(
+            EstablishedTraversal::new(request_id, peer_config.npub, helper_addr, base_socket)
+                .with_public_endpoint(observed_endpoint)
+                .with_transport_name("nostr-assist")
+                .with_transport_config(UdpConfig {
+                    peer_assist: Some(true),
+                    ..Default::default()
+                }),
         )
     }
 
@@ -602,7 +1030,7 @@ impl NostrDiscovery {
             offer.sender_npub.clone(),
             offer.nonce.clone(),
             accepted,
-            reflexive_address,
+            reflexive_address.clone(),
             local_addresses,
             stun_server,
             accepted.then(|| self.punch_hint()),
@@ -641,12 +1069,231 @@ impl NostrDiscovery {
                     remote_addr,
                     base_socket,
                 )
+                .with_public_endpoint(
+                    reflexive_address
+                        .as_ref()
+                        .and_then(Self::traversal_address_to_socket)
+                        .unwrap_or(remote_addr),
+                )
                 .with_transport_name("nostr-nat"),
             });
         }
 
         let _ = self.publish_delete(&relays, [answer_event.id]).await;
         Ok(())
+    }
+
+    async fn handle_incoming_assist_request(
+        self: Arc<Self>,
+        request: AssistRequest,
+        sender: PublicKey,
+        sender_npub: String,
+    ) -> Result<(), BootstrapError> {
+        validate_assist_request_freshness(
+            &request,
+            now_ms(),
+            self.config.signal_ttl_secs * 1000,
+            &sender_npub,
+            &self.npub,
+        )?;
+        self.mark_session_seen(&request.request_id).await?;
+
+        let relays = self.preferred_signal_relays(sender, None).await?;
+        if !self.config.peer_assist.private_enabled() {
+            let grant = create_assist_grant(
+                request.request_id,
+                nonce(),
+                now_ms(),
+                self.config.peer_assist.grant_ttl_secs * 1000,
+                nonce(),
+                self.npub.clone(),
+                request.sender_npub,
+                request.nonce,
+                false,
+                None,
+                None,
+                None,
+                Some("peer-assist disabled".to_string()),
+            );
+            let _ = self.send_signal(&relays, sender, &grant).await?;
+            return Ok(());
+        }
+
+        if !self.requester_allowed(&sender_npub).await {
+            let grant = create_assist_grant(
+                request.request_id,
+                nonce(),
+                now_ms(),
+                self.config.peer_assist.grant_ttl_secs * 1000,
+                nonce(),
+                self.npub.clone(),
+                request.sender_npub,
+                request.nonce,
+                false,
+                None,
+                None,
+                None,
+                Some("peer-assist requester not allowed".to_string()),
+            );
+            let _ = self.send_signal(&relays, sender, &grant).await?;
+            return Ok(());
+        }
+
+        let helper_addr = self
+            .helper_endpoints
+            .read()
+            .await
+            .first()
+            .copied()
+            .ok_or_else(|| BootstrapError::Protocol("no eligible helper transport".to_string()))?;
+
+        let pending_count = self.pending_private_assist_grants.lock().await.len();
+        if pending_count >= self.config.peer_assist.max_pending_requests {
+            let grant = create_assist_grant(
+                request.request_id,
+                nonce(),
+                now_ms(),
+                self.config.peer_assist.grant_ttl_secs * 1000,
+                nonce(),
+                self.npub.clone(),
+                request.sender_npub,
+                request.nonce,
+                false,
+                None,
+                None,
+                None,
+                Some("peer-assist helper is at capacity".to_string()),
+            );
+            let _ = self.send_signal(&relays, sender, &grant).await?;
+            return Ok(());
+        }
+
+        let grant_id = nonce();
+        let grant_nonce = nonce();
+        let probe_token = nonce();
+        self.pending_private_assist_grants.lock().await.insert(
+            grant_id.clone(),
+            PendingPrivateAssistGrant {
+                request_id: request.request_id.clone(),
+                grant_id: grant_id.clone(),
+                grant_nonce: grant_nonce.clone(),
+                probe_token: probe_token.clone(),
+                sender_pubkey: sender,
+                sender_npub: sender_npub.clone(),
+                helper_addr: helper_addr.to_string(),
+                relays: relays.clone(),
+                expires_at: now_ms() + self.config.peer_assist.grant_ttl_secs * 1000,
+            },
+        );
+
+        let grant = create_assist_grant(
+            request.request_id,
+            grant_id,
+            now_ms(),
+            self.config.peer_assist.grant_ttl_secs * 1000,
+            grant_nonce,
+            self.npub.clone(),
+            request.sender_npub,
+            request.nonce,
+            true,
+            Some(helper_addr.to_string()),
+            Some(probe_token),
+            Some(1),
+            None,
+        );
+        let _ = self.send_signal(&relays, sender, &grant).await?;
+        Ok(())
+    }
+
+    pub async fn observe_peer_assist_probe(
+        &self,
+        helper_addr: std::net::SocketAddr,
+        remote_addr: std::net::SocketAddr,
+        data: &[u8],
+    ) -> bool {
+        let Some(probe) = parse_peer_assist_probe(data) else {
+            return false;
+        };
+        let now = now_ms();
+        let pending = {
+            let mut pending = self.pending_private_assist_grants.lock().await;
+            pending.retain(|_, entry| entry.expires_at > now);
+            let Some(entry) = pending.remove(&probe.grant_id) else {
+                return false;
+            };
+            if entry.helper_addr != helper_addr.to_string() || entry.probe_token != probe.token {
+                pending.insert(entry.grant_id.clone(), entry);
+                return false;
+            }
+            entry
+        };
+
+        let observed = create_assist_observed(
+            pending.request_id,
+            pending.grant_id,
+            now,
+            self.config.peer_assist.grant_ttl_secs * 1000,
+            nonce(),
+            self.npub.clone(),
+            pending.sender_npub.clone(),
+            pending.grant_nonce,
+            true,
+            helper_addr.to_string(),
+            Some(TraversalAddress {
+                protocol: "udp".to_string(),
+                ip: remote_addr.ip().to_string(),
+                port: remote_addr.port(),
+            }),
+            None,
+        );
+        match self
+            .send_signal(&pending.relays, pending.sender_pubkey, &observed)
+            .await
+        {
+            Ok(_) => true,
+            Err(err) => {
+                debug!(
+                    sender_npub = %pending.sender_npub,
+                    error = %err,
+                    "failed to send peer-assist answer"
+                );
+                false
+            }
+        }
+    }
+
+    async fn requester_allowed(&self, sender_npub: &str) -> bool {
+        match self.config.peer_assist.request_policy {
+            PeerAssistRequestPolicy::Allowlist => self
+                .config
+                .peer_assist
+                .request_allowlist
+                .iter()
+                .any(|allowed| allowed == sender_npub),
+            PeerAssistRequestPolicy::OpenRateLimited => {
+                let now = now_ms();
+                let window_ms = self
+                    .config
+                    .peer_assist
+                    .request_window_secs
+                    .saturating_mul(1000);
+                let mut windows = self.assist_request_windows.lock().await;
+                let entry = windows.entry(sender_npub.to_string()).or_default();
+                entry.retain(|timestamp| now.saturating_sub(*timestamp) <= window_ms);
+                if entry.len() >= self.config.peer_assist.max_requests_per_peer_per_window {
+                    return false;
+                }
+                entry.push(now);
+                true
+            }
+        }
+    }
+
+    fn traversal_address_to_socket(addr: &TraversalAddress) -> Option<std::net::SocketAddr> {
+        if !addr.protocol.eq_ignore_ascii_case("udp") {
+            return None;
+        }
+        format!("{}:{}", addr.ip, addr.port).parse().ok()
     }
 
     async fn fetch_advert(
@@ -835,15 +1482,6 @@ impl NostrDiscovery {
                     "udp:nat endpoint requires signalRelays".to_string(),
                 ));
             }
-            if advert
-                .stun_servers
-                .as_ref()
-                .is_none_or(|servers| servers.is_empty())
-            {
-                return Err(BootstrapError::InvalidAdvert(
-                    "udp:nat endpoint requires stunServers".to_string(),
-                ));
-            }
         } else {
             advert.signal_relays = None;
             advert.stun_servers = None;
@@ -920,6 +1558,14 @@ impl NostrDiscovery {
             Timestamp::from((now_ms() + self.config.signal_ttl_secs * 1000) / 1000),
         )
         .await?;
+        #[cfg(test)]
+        if self.test_capture_outgoing {
+            self.test_sent_signals
+                .lock()
+                .await
+                .push(serde_json::to_string(payload)?);
+            return Ok(signal);
+        }
         self.client
             .send_event_to(relays.to_vec(), signal.clone())
             .await

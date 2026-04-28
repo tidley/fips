@@ -34,8 +34,9 @@ use thiserror::Error;
 pub use gateway::{ConntrackConfig, GatewayConfig, GatewayDnsConfig, PortForward, Proto};
 pub use node::{
     BloomConfig, BuffersConfig, CacheConfig, ControlConfig, DiscoveryConfig, LimitsConfig,
-    NodeConfig, NostrDiscoveryConfig, NostrDiscoveryPolicy, RateLimitConfig, RekeyConfig,
-    RetryConfig, SessionConfig, SessionMmpConfig, TreeConfig,
+    NodeConfig, NostrDiscoveryConfig, NostrDiscoveryPolicy, PeerAssistConfig, PeerAssistMode,
+    PeerAssistRequestPolicy, RateLimitConfig, RekeyConfig, RetryConfig, SessionConfig,
+    SessionMmpConfig, TreeConfig,
 };
 pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
 pub use transport::{
@@ -584,9 +585,9 @@ impl Config {
                     "NAT UDP advert publishing requires `node.discovery.nostr.dm_relays` to be non-empty".to_string(),
                 ));
             }
-            if nostr.stun_servers.is_empty() {
+            if nostr.stun_servers.is_empty() && !nostr.peer_assist.private_enabled() {
                 return Err(ConfigError::Validation(
-                    "NAT UDP advert publishing requires `node.discovery.nostr.stun_servers` to be non-empty".to_string(),
+                    "NAT UDP advert publishing requires `node.discovery.nostr.stun_servers` or private peer assist to be enabled".to_string(),
                 ));
             }
         }

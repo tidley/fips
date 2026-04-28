@@ -1,3 +1,5 @@
+#![cfg(feature = "nostr-discovery")]
+
 //! Integration tests for bootstrap handoff into the FIPS node.
 
 use super::*;
@@ -191,6 +193,7 @@ async fn test_third_peer_can_handshake_via_adopted_transport_socket() {
     let mut transport_c = UdpTransport::new(transport_id_c, None, udp_config, packet_tx_c);
     transport_c.start_async().await.unwrap();
     let addr_c = transport_c.local_addr().unwrap();
+    let addr_c_label = addr_c.to_string();
     node_c
         .transports
         .insert(transport_id_c, TransportHandle::Udp(transport_c));
@@ -211,7 +214,7 @@ async fn test_third_peer_can_handshake_via_adopted_transport_socket() {
             .await
             .expect("timeout waiting for Colin->Bob msg1")
             .expect("node_b channel closed");
-        if pkt.remote_addr.as_str() == Some(&addr_c.to_string())
+        if pkt.remote_addr.as_str() == Some(addr_c_label.as_str())
             && pkt.data.first().map(|b| b & 0x0f) == Some(PHASE_MSG1)
         {
             break pkt;
@@ -417,9 +420,11 @@ async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
         signal_relays: Some(vec!["wss://relay.example".to_string()]),
         stun_servers: None,
     };
-    let mut bob_peer_config = PeerConfig::default();
-    bob_peer_config.npub = node_b.npub();
-    bob_peer_config.via_nostr = true;
+    let bob_peer_config = PeerConfig {
+        npub: node_b.npub(),
+        via_nostr: true,
+        ..Default::default()
+    };
 
     let colin_connect_task = tokio::spawn({
         let runtime = colin_runtime.clone();
@@ -464,9 +469,10 @@ async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
+    let helper_addr_label = helper_addr.to_string();
     assert_eq!(
         grant.helper_addr.as_deref(),
-        Some(helper_addr.to_string().as_str())
+        Some(helper_addr_label.as_str())
     );
 
     colin_runtime

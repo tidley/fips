@@ -1244,13 +1244,24 @@ peers:
 
     #[test]
     fn test_validate_peer_via_nostr_requires_nostr_enabled() {
-        let mut config = Config::default();
-        config.peers = vec![PeerConfig {
-            npub: "npub1peer".to_string(),
-            via_nostr: true,
+        let config = Config {
+            peers: vec![PeerConfig {
+                npub: "npub1peer".to_string(),
+                via_nostr: true,
+                ..Default::default()
+            }],
+            node: NodeConfig {
+                discovery: DiscoveryConfig {
+                    nostr: NostrDiscoveryConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             ..Default::default()
-        }];
-        config.node.discovery.nostr.enabled = false;
+        };
 
         let err = config.validate().expect_err("validation should fail");
         assert!(err.to_string().contains("via_nostr"));
@@ -1259,11 +1270,13 @@ peers:
     #[test]
     fn test_validate_peer_addresses_required_unless_via_nostr() {
         // Empty addresses + via_nostr=false → error.
-        let mut config = Config::default();
-        config.peers = vec![PeerConfig {
-            npub: "npub1peer".to_string(),
+        let mut config = Config {
+            peers: vec![PeerConfig {
+                npub: "npub1peer".to_string(),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let err = config.validate().expect_err("validation should fail");
         assert!(err.to_string().contains("at least one address"));
 

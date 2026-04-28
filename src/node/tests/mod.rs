@@ -9,6 +9,7 @@ mod acl;
 mod ble;
 mod bloom;
 mod bloom_poison;
+#[cfg(feature = "nostr-discovery")]
 mod bootstrap;
 mod disconnect;
 mod discovery;

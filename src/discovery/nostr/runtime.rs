@@ -87,6 +87,7 @@ pub struct NostrDiscovery {
     pending_private_assist_grants: Mutex<HashMap<String, PendingPrivateAssistGrant>>,
     helper_endpoints: RwLock<Vec<std::net::SocketAddr>>,
     assist_request_windows: Mutex<RateLimitWindow>,
+    traversal_offer_windows: Mutex<RateLimitWindow>,
     active_initiators: Mutex<HashSet<String>>,
     seen_sessions: Mutex<HashMap<String, u64>>,
     offer_slots: Arc<Semaphore>,
@@ -147,6 +148,7 @@ impl NostrDiscovery {
             pending_private_assist_grants: Mutex::new(HashMap::new()),
             helper_endpoints: RwLock::new(Vec::new()),
             assist_request_windows: Mutex::new(HashMap::new()),
+            traversal_offer_windows: Mutex::new(HashMap::new()),
             active_initiators: Mutex::new(HashSet::new()),
             seen_sessions: Mutex::new(HashMap::new()),
             offer_slots,
@@ -198,6 +200,7 @@ impl NostrDiscovery {
             pending_private_assist_grants: Mutex::new(HashMap::new()),
             helper_endpoints: RwLock::new(Vec::new()),
             assist_request_windows: Mutex::new(HashMap::new()),
+            traversal_offer_windows: Mutex::new(HashMap::new()),
             active_initiators: Mutex::new(HashSet::new()),
             seen_sessions: Mutex::new(HashMap::new()),
             offer_slots,
@@ -516,6 +519,10 @@ impl NostrDiscovery {
                         && offer.message_type == "offer"
                         && offer.recipient_npub == self.npub
                     {
+                        if !self.traversal_offer_allowed(&sender_npub).await {
+                            warn!(sender_npub = %sender_npub, "dropping traversal offer because sender exceeded the rate limit");
+                            continue;
+                        }
                         let Ok(permit) = self.offer_slots.clone().try_acquire_owned() else {
                             warn!(
                                 sender_npub = %sender_npub,
@@ -1383,15 +1390,32 @@ impl NostrDiscovery {
                     .request_window_secs
                     .saturating_mul(1000);
                 let mut windows = self.assist_request_windows.lock().await;
-                let entry = windows.entry(sender_npub.to_string()).or_default();
-                entry.retain(|timestamp| now.saturating_sub(*timestamp) <= window_ms);
-                if entry.len() >= self.config.peer_assist.max_requests_per_peer_per_window {
-                    return false;
-                }
-                entry.push(now);
-                true
+                allow_in_rate_window(
+                    &mut windows,
+                    sender_npub,
+                    now,
+                    window_ms,
+                    self.config.peer_assist.max_requests_per_peer_per_window,
+                )
             }
         }
+    }
+
+    async fn traversal_offer_allowed(&self, sender_npub: &str) -> bool {
+        let now = now_ms();
+        let window_ms = self
+            .config
+            .peer_assist
+            .request_window_secs
+            .saturating_mul(1000);
+        let mut windows = self.traversal_offer_windows.lock().await;
+        allow_in_rate_window(
+            &mut windows,
+            sender_npub,
+            now,
+            window_ms,
+            self.config.peer_assist.max_requests_per_peer_per_window,
+        )
     }
 
     fn traversal_address_to_socket(addr: &TraversalAddress) -> Option<std::net::SocketAddr> {
@@ -1477,12 +1501,12 @@ impl NostrDiscovery {
         advert: Option<&OverlayAdvert>,
     ) -> Result<Vec<String>, BootstrapError> {
         let mut merged = self.find_recipient_inbox_relays(target_pubkey).await?;
-        if let Some(advert) = advert {
-            if let Some(relays) = advert.signal_relays.as_ref() {
-                for relay in relays {
-                    if !merged.contains(relay) {
-                        merged.push(relay.clone());
-                    }
+        if let Some(advert) = advert
+            && let Some(relays) = advert.signal_relays.as_ref()
+        {
+            for relay in relays {
+                if !merged.contains(relay) {
+                    merged.push(relay.clone());
                 }
             }
         }
@@ -1740,4 +1764,23 @@ impl NostrDiscovery {
         }
         Ok(())
     }
+}
+
+pub(super) fn allow_in_rate_window(
+    windows: &mut RateLimitWindow,
+    key: &str,
+    now: u64,
+    window_ms: u64,
+    max_requests: usize,
+) -> bool {
+    if max_requests == 0 {
+        return false;
+    }
+    let entry = windows.entry(key.to_string()).or_default();
+    entry.retain(|timestamp| now.saturating_sub(*timestamp) <= window_ms);
+    if entry.len() >= max_requests {
+        return false;
+    }
+    entry.push(now);
+    true
 }

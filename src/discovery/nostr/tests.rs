@@ -1,6 +1,6 @@
 use nostr::prelude::{EventBuilder, Kind, Tag, Timestamp};
 
-use super::runtime::NostrDiscovery;
+use super::runtime::{NostrDiscovery, allow_in_rate_window};
 use super::signal::{
     build_peer_assist_probe, build_signal_event, create_assist_grant, create_assist_observed,
     create_assist_request, create_traversal_answer, create_traversal_offer,
@@ -415,6 +415,180 @@ fn rejects_accepted_assist_observed_without_observed_address() {
 }
 
 #[test]
+fn rejects_expired_assist_request() {
+    let request = create_assist_request(
+        "assist-1".to_string(),
+        1_700_000_000_000,
+        60_000,
+        "request-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+    );
+
+    let result = validate_assist_request_freshness(
+        &request,
+        1_700_000_061_000,
+        60_000,
+        "npub1client",
+        "npub1server",
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_expired_assist_grant() {
+    let request = create_assist_request(
+        "assist-1".to_string(),
+        1_700_000_000_000,
+        60_000,
+        "request-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+    );
+    let grant = create_assist_grant(
+        "assist-1".to_string(),
+        "grant-1".to_string(),
+        1_700_000_000_500,
+        60_000,
+        "grant-1".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "request-1".to_string(),
+        true,
+        Some("198.51.100.20:44750".to_string()),
+        Some("probe-1".to_string()),
+        Some(1),
+        None,
+    );
+
+    let result = validate_assist_grant_for_request(
+        &request,
+        &grant,
+        1_700_000_061_000,
+        60_000,
+        "npub1server",
+        "npub1client",
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_assist_grant_with_mismatched_request() {
+    let request = create_assist_request(
+        "assist-1".to_string(),
+        1_700_000_000_000,
+        60_000,
+        "request-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+    );
+    let grant = create_assist_grant(
+        "assist-2".to_string(),
+        "grant-1".to_string(),
+        1_700_000_000_500,
+        60_000,
+        "grant-1".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "wrong-request-nonce".to_string(),
+        true,
+        Some("198.51.100.20:44750".to_string()),
+        Some("probe-1".to_string()),
+        Some(1),
+        None,
+    );
+
+    let result = validate_assist_grant_for_request(
+        &request,
+        &grant,
+        1_700_000_000_900,
+        60_000,
+        "npub1server",
+        "npub1client",
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_assist_grant_with_invalid_helper_endpoint() {
+    let request = create_assist_request(
+        "assist-1".to_string(),
+        1_700_000_000_000,
+        60_000,
+        "request-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+    );
+    let grant = create_assist_grant(
+        "assist-1".to_string(),
+        "grant-1".to_string(),
+        1_700_000_000_500,
+        60_000,
+        "grant-1".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "request-1".to_string(),
+        true,
+        Some("not-a-socket".to_string()),
+        Some("probe-1".to_string()),
+        Some(1),
+        None,
+    );
+
+    let result = validate_assist_grant_for_request(
+        &request,
+        &grant,
+        1_700_000_000_900,
+        60_000,
+        "npub1server",
+        "npub1client",
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn accepts_rejected_assist_grant_with_reason() {
+    let request = create_assist_request(
+        "assist-1".to_string(),
+        1_700_000_000_000,
+        60_000,
+        "request-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+    );
+    let grant = create_assist_grant(
+        "assist-1".to_string(),
+        "grant-1".to_string(),
+        1_700_000_000_500,
+        60_000,
+        "grant-1".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "request-1".to_string(),
+        false,
+        None,
+        None,
+        None,
+        Some("peer-assist requester not allowed".to_string()),
+    );
+
+    let result = validate_assist_grant_for_request(
+        &request,
+        &grant,
+        1_700_000_000_900,
+        60_000,
+        "npub1server",
+        "npub1client",
+    );
+
+    assert!(result.is_ok());
+}
+
+#[test]
 fn rejects_offer_with_mismatched_actual_sender() {
     let offer = create_traversal_offer(
         "sess-1".to_string(),
@@ -482,6 +656,87 @@ fn rejects_answer_with_mismatched_actual_sender() {
     );
 
     assert!(result.is_err());
+}
+
+#[test]
+fn rate_window_allows_until_sender_limit() {
+    let mut windows = std::collections::HashMap::new();
+
+    assert!(allow_in_rate_window(
+        &mut windows,
+        "npub1sender",
+        1_000,
+        60_000,
+        2,
+    ));
+    assert!(allow_in_rate_window(
+        &mut windows,
+        "npub1sender",
+        2_000,
+        60_000,
+        2,
+    ));
+    assert!(!allow_in_rate_window(
+        &mut windows,
+        "npub1sender",
+        3_000,
+        60_000,
+        2,
+    ));
+}
+
+#[test]
+fn rate_window_is_per_sender() {
+    let mut windows = std::collections::HashMap::new();
+
+    assert!(allow_in_rate_window(
+        &mut windows,
+        "npub1sender-a",
+        1_000,
+        60_000,
+        1,
+    ));
+    assert!(allow_in_rate_window(
+        &mut windows,
+        "npub1sender-b",
+        1_000,
+        60_000,
+        1,
+    ));
+    assert!(!allow_in_rate_window(
+        &mut windows,
+        "npub1sender-a",
+        2_000,
+        60_000,
+        1,
+    ));
+}
+
+#[test]
+fn rate_window_resets_after_expiry() {
+    let mut windows = std::collections::HashMap::new();
+
+    assert!(allow_in_rate_window(
+        &mut windows,
+        "npub1sender",
+        1_000,
+        10_000,
+        1,
+    ));
+    assert!(!allow_in_rate_window(
+        &mut windows,
+        "npub1sender",
+        10_000,
+        10_000,
+        1,
+    ));
+    assert!(allow_in_rate_window(
+        &mut windows,
+        "npub1sender",
+        11_001,
+        10_000,
+        1,
+    ));
 }
 
 #[test]

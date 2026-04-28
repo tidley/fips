@@ -1431,7 +1431,13 @@ impl Node {
                 }
             };
 
-            match observe_traversal_addresses(&socket, &stun_servers).await {
+            match observe_traversal_addresses(
+                &socket,
+                &stun_servers,
+                self.config.node.discovery.nostr.share_local_candidates,
+            )
+            .await
+            {
                 Ok((Some(reflexive), _, _)) => {
                     if let Ok(addr) = format!("{}:{}", reflexive.ip, reflexive.port).parse() {
                         helper_updates.push((*transport_id, addr));

@@ -101,6 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   systemd units and the OpenWrt procd init script. The daemon now
   loads config before initializing tracing so the configured level
   takes effect; `RUST_LOG` still overrides when set
+- Nostr peer-assisted UDP rendezvous for private chained onboarding,
+  behind the `nostr-discovery` feature. Operators can publish
+  `udp:nat` adverts, opt selected UDP transports into private helper
+  service with `peer_assist`, and tune helper policy with `mode`,
+  `request_policy`, `request_allowlist`, pending-grant limits, grant
+  TTL, and per-sender rate windows. The NAT lab includes an `assist`
+  scenario that validates Alice -> Bob -> Colin -> Dave onboarding,
+  with a Alice <-> David pings.
 
 #### Operator Tooling
 

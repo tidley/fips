@@ -192,7 +192,6 @@ without that feature ignore `udp:nat` bootstrap configuration.
 | `node.discovery.nostr.max_concurrent_incoming_offers` | usize | `16` | Max concurrent inbound traversal offers processed at once (rate limit against offer spam) |
 | `node.discovery.nostr.advert_cache_max_entries` | usize | `2048` | Max cached overlay adverts retained from relay traffic |
 | `node.discovery.nostr.seen_sessions_max_entries` | usize | `2048` | Max seen-session IDs retained for replay detection |
-| `node.discovery.nostr.advertise` | bool | `true` | Publish local endpoint adverts |
 | `node.discovery.nostr.advert_relays` | list[string] | `["wss://relay.damus.io", "wss://nos.lol", "wss://offchain.pub"]` | Relays used for service adverts |
 | `node.discovery.nostr.dm_relays` | list[string] | `["wss://relay.damus.io", "wss://nos.lol", "wss://offchain.pub"]` | Relays used for encrypted signaling events |
 | `node.discovery.nostr.stun_servers` | list[string] | `["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478", "stun:global.stun.twilio.com:3478"]` | STUN servers used for local reflexive address discovery |
@@ -205,16 +204,21 @@ without that feature ignore `udp:nat` bootstrap configuration.
 | `node.discovery.nostr.punch_duration_ms` | u64 | `10000` | How long to keep punching before failure |
 | `node.discovery.nostr.advert_ttl_secs` | u64 | `3600` | Advert TTL in seconds |
 | `node.discovery.nostr.advert_refresh_secs` | u64 | `1800` | How often adverts are refreshed in seconds |
+| `node.discovery.nostr.peer_assist.mode` | string | `"disabled"` | Private helper mode: `disabled`, `fallback_private`, `prefer_private` |
+| `node.discovery.nostr.peer_assist.request_policy` | string | `"open_rate_limited"` | Incoming private-assist request policy: `open_rate_limited` or `allowlist` |
+| `node.discovery.nostr.peer_assist.request_allowlist` | list[string] | `[]` | Npubs allowed to request private assist when `request_policy: allowlist` |
+| `node.discovery.nostr.peer_assist.max_pending_requests` | usize | `64` | Max accepted private-assist grants waiting for probe observation |
+| `node.discovery.nostr.peer_assist.grant_ttl_secs` | u64 | `15` | Private-assist grant/probe/observed-message validity window |
+| `node.discovery.nostr.peer_assist.max_requests_per_peer_per_window` | usize | `8` | Max private-assist requests, and traversal offers, accepted from one sender per rate window |
+| `node.discovery.nostr.peer_assist.request_window_secs` | u64 | `60` | Per-sender rate-limit window for private-assist requests and traversal offers |
 
 If `stun_servers` is omitted, the built-in default list above is used. If it is
 specified in YAML, the configured list fully overrides the defaults.
 Initiators use only this local list for outbound STUN queries; peer-advertised
 STUN values are published for diagnostics/interoperability but are not used as
 arbitrary egress targets.
-The built-in advert and DM relay defaults point at widely-operated public
-relays (Damus, nos.lol, Primal) as best-effort endpoints; operators are
-encouraged to override them with their own relay preferences for production
-deployments.
+These built-in endpoints should be treated as best-effort public defaults that
+operators are expected to review and override for production use.
 Advert freshness is enforced semantically: events with expired NIP-40
 `expiration` tags are dropped, and adverts are also bounded by a created-at
 staleness window derived from `advert_ttl_secs` (with a grace multiplier).
@@ -224,6 +228,51 @@ interface addresses (RFC1918 IPv4 and IPv6 ULA) plus probed local egress
 addresses for the punch socket port.
 During punching, compatible private-subnet candidates and reflexive candidates
 are attempted in parallel; the first successful path wins.
+
+`peer_assist` is for chained private onboarding when a new peer cannot use a
+public STUN-reflexive path but can reach a helper through an already-joined
+peer. It is disabled by default. `fallback_private` tries normal STUN traversal
+first, then asks the remote peer for private assist if needed. `prefer_private`
+tries private assist before STUN when helper metadata is available. Helpers
+must opt in at both levels: enable `node.discovery.nostr.peer_assist.mode` and
+mark at least one advertised private UDP transport with `peer_assist: true`.
+For public deployments, prefer `request_policy: allowlist` and list only npubs
+that are expected to join through the helper.
+
+Safe chained-onboarding example:
+
+```yaml
+node:
+  discovery:
+    nostr:
+      enabled: true
+      policy: configured_only
+      advertise: true
+      peer_assist:
+        mode: fallback_private
+        request_policy: allowlist
+        request_allowlist:
+          - "npub1..."
+        max_pending_requests: 16
+        grant_ttl_secs: 15
+        max_requests_per_peer_per_window: 4
+        request_window_secs: 60
+
+transports:
+  udp:
+    bind_addr: "0.0.0.0:2121"
+    advertise_on_nostr: true
+    public: false
+    peer_assist: true
+
+peers:
+  - npub: "npub1..."
+    alias: "upstream-helper"
+    via_nostr: true
+    addresses:
+      - transport: udp
+        addr: "nat"
+```
 
 ### Spanning Tree (`node.tree.*`)
 

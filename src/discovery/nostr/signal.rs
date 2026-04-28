@@ -347,6 +347,17 @@ pub(super) fn validate_assist_grant_for_request(
             "missing-grant-parameters".to_string(),
         ));
     }
+    if grant.accepted
+        && grant
+            .helper_addr
+            .as_deref()
+            .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+            .is_none()
+    {
+        return Err(BootstrapError::Protocol(
+            "invalid-helper-endpoint".to_string(),
+        ));
+    }
     if !grant.accepted && grant.reason.as_deref().unwrap_or_default().is_empty() {
         return Err(BootstrapError::Protocol(
             "missing-rejection-reason".to_string(),

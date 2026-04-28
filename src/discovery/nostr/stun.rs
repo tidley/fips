@@ -268,8 +268,8 @@ fn private_interface_ips() -> Vec<IpAddr> {
         // SAFETY: `cursor` points at a valid node from the `getifaddrs` list.
         let entry = unsafe { &*cursor };
         let flags = entry.ifa_flags as i32;
-        let is_up = (flags & libc::IFF_UP as i32) != 0;
-        let is_loopback = (flags & libc::IFF_LOOPBACK as i32) != 0;
+        let is_up = (flags & libc::IFF_UP) != 0;
+        let is_loopback = (flags & libc::IFF_LOOPBACK) != 0;
 
         if is_up && !is_loopback && !entry.ifa_addr.is_null() {
             // SAFETY: `ifa_addr` is non-null and its concrete type matches
@@ -344,6 +344,14 @@ fn push_ip(addresses: &mut Vec<String>, ip: IpAddr) {
     }
 }
 
+fn random_txn_id() -> [u8; 12] {
+    let mut txn_id = [0u8; 12];
+    for byte in &mut txn_id {
+        *byte = rand::random::<u8>();
+    }
+    txn_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_private_overlay_candidate_ip;
@@ -380,12 +388,4 @@ mod tests {
             "2001:db8::1".parse::<Ipv6Addr>().unwrap()
         )));
     }
-}
-
-fn random_txn_id() -> [u8; 12] {
-    let mut txn_id = [0u8; 12];
-    for byte in &mut txn_id {
-        *byte = rand::random::<u8>();
-    }
-    txn_id
 }

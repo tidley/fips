@@ -138,6 +138,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (development) packages with sysusers.d/tmpfiles.d integration
   ([#21](https://github.com/jmcorgan/fips/pull/21),
   [@dskvr](https://github.com/dskvr))
+- `packaging/debian/build-deb.sh` now auto-derives a per-commit Debian
+  Version field for dev builds (Cargo.toml version ending in `-dev`)
+  using the form `<base>~dev+git<YYYYMMDD>.<sha>[.dirty]-1`, e.g.
+  `0.3.0~dev+git20260429.6def31b-1`. Each commit produces a uniquely-
+  comparable Version string so `apt install ./*.deb` and
+  `ansible.builtin.apt: deb:` no longer silently no-op when one dev
+  build is installed on top of another. The `~dev` marker sorts
+  pre-`0.3.0` so a tagged release supersedes any prior dev .deb.
+  Tagged release builds (no `-dev` in Cargo.toml) keep the clean
+  `<version>-1` form. Operator override via `--version` still wins
 
 ### Changed
 

@@ -10,27 +10,32 @@ use std::fmt;
 
 /// Handshake message type identifiers.
 ///
-/// These messages are exchanged during Noise IK handshake before link
+/// These messages are exchanged during Noise XX handshake before link
 /// encryption is established. They use the same TLV framing as link
 /// messages but payloads are not encrypted (except Noise-internal encryption).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HandshakeMessageType {
-    /// Noise IK message 1: initiator sends ephemeral + encrypted static.
-    /// Payload: 82 bytes (33 ephemeral + 33 static + 16 tag).
-    NoiseIKMsg1 = 0x01,
+    /// Noise XX message 1: initiator sends ephemeral key.
+    /// Payload: 33 bytes (ephemeral pubkey).
+    Msg1 = 0x01,
 
-    /// Noise IK message 2: responder sends ephemeral.
-    /// Payload: 33 bytes (ephemeral pubkey only).
-    NoiseIKMsg2 = 0x02,
+    /// Noise XX message 2: responder sends ephemeral + encrypted static + epoch.
+    /// Payload: 106+ bytes (33 ephemeral + 49 encrypted static + 24 encrypted epoch + negotiation).
+    Msg2 = 0x02,
+
+    /// Noise XX message 3: initiator sends encrypted static + epoch.
+    /// Payload: 73+ bytes (49 encrypted static + 24 encrypted epoch + negotiation).
+    Msg3 = 0x03,
 }
 
 impl HandshakeMessageType {
     /// Try to convert from a byte.
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
-            0x01 => Some(HandshakeMessageType::NoiseIKMsg1),
-            0x02 => Some(HandshakeMessageType::NoiseIKMsg2),
+            0x01 => Some(HandshakeMessageType::Msg1),
+            0x02 => Some(HandshakeMessageType::Msg2),
+            0x03 => Some(HandshakeMessageType::Msg3),
             _ => None,
         }
     }
@@ -42,15 +47,16 @@ impl HandshakeMessageType {
 
     /// Check if a byte represents a handshake message type.
     pub fn is_handshake(b: u8) -> bool {
-        matches!(b, 0x01 | 0x02)
+        matches!(b, 0x01..=0x03)
     }
 }
 
 impl fmt::Display for HandshakeMessageType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
-            HandshakeMessageType::NoiseIKMsg1 => "NoiseIKMsg1",
-            HandshakeMessageType::NoiseIKMsg2 => "NoiseIKMsg2",
+            HandshakeMessageType::Msg1 => "Msg1",
+            HandshakeMessageType::Msg2 => "Msg2",
+            HandshakeMessageType::Msg3 => "Msg3",
         };
         write!(f, "{}", name)
     }
@@ -64,7 +70,7 @@ impl fmt::Display for HandshakeMessageType {
 ///
 /// These messages are exchanged between directly connected peers over
 /// Noise-encrypted links. All payloads are encrypted with session keys
-/// established during the Noise IK handshake.
+/// established during the Noise XX handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum LinkMessageType {
@@ -84,8 +90,10 @@ pub enum LinkMessageType {
     TreeAnnounce = 0x10,
 
     // Bloom filter (0x20-0x2F)
-    /// Bloom filter reachability update.
+    /// Bloom filter reachability update (full or delta).
     FilterAnnounce = 0x20,
+    /// Request full filter retransmission (NACK for out-of-sequence delta).
+    FilterNack = 0x21,
 
     // Discovery (0x30-0x3F)
     /// Request to discover a node's coordinates.
@@ -110,6 +118,7 @@ impl LinkMessageType {
             0x02 => Some(LinkMessageType::ReceiverReport),
             0x10 => Some(LinkMessageType::TreeAnnounce),
             0x20 => Some(LinkMessageType::FilterAnnounce),
+            0x21 => Some(LinkMessageType::FilterNack),
             0x30 => Some(LinkMessageType::LookupRequest),
             0x31 => Some(LinkMessageType::LookupResponse),
             0x50 => Some(LinkMessageType::Disconnect),
@@ -132,6 +141,7 @@ impl fmt::Display for LinkMessageType {
             LinkMessageType::ReceiverReport => "ReceiverReport",
             LinkMessageType::TreeAnnounce => "TreeAnnounce",
             LinkMessageType::FilterAnnounce => "FilterAnnounce",
+            LinkMessageType::FilterNack => "FilterNack",
             LinkMessageType::LookupRequest => "LookupRequest",
             LinkMessageType::LookupResponse => "LookupResponse",
             LinkMessageType::Disconnect => "Disconnect",
@@ -391,8 +401,9 @@ mod tests {
     #[test]
     fn test_handshake_message_type_roundtrip() {
         let types = [
-            HandshakeMessageType::NoiseIKMsg1,
-            HandshakeMessageType::NoiseIKMsg2,
+            HandshakeMessageType::Msg1,
+            HandshakeMessageType::Msg2,
+            HandshakeMessageType::Msg3,
         ];
 
         for ty in types {
@@ -405,7 +416,7 @@ mod tests {
     #[test]
     fn test_handshake_message_type_invalid() {
         assert!(HandshakeMessageType::from_byte(0x00).is_none());
-        assert!(HandshakeMessageType::from_byte(0x03).is_none());
+        assert!(HandshakeMessageType::from_byte(0x04).is_none());
         assert!(HandshakeMessageType::from_byte(0x10).is_none());
     }
 
@@ -413,7 +424,9 @@ mod tests {
     fn test_handshake_message_type_is_handshake() {
         assert!(HandshakeMessageType::is_handshake(0x01));
         assert!(HandshakeMessageType::is_handshake(0x02));
+        assert!(HandshakeMessageType::is_handshake(0x03));
         assert!(!HandshakeMessageType::is_handshake(0x00));
+        assert!(!HandshakeMessageType::is_handshake(0x04));
         assert!(!HandshakeMessageType::is_handshake(0x10));
     }
 
@@ -424,6 +437,7 @@ mod tests {
         let types = [
             LinkMessageType::TreeAnnounce,
             LinkMessageType::FilterAnnounce,
+            LinkMessageType::FilterNack,
             LinkMessageType::LookupRequest,
             LinkMessageType::LookupResponse,
             LinkMessageType::SessionDatagram,

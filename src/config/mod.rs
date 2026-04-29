@@ -531,6 +531,21 @@ impl Config {
         self.node.leaf_only
     }
 
+    /// Derive the node profile from config.
+    ///
+    /// leaf_only → Leaf (implies non-routing),
+    /// disable_routing → NonRouting,
+    /// otherwise → Full.
+    pub fn node_profile(&self) -> crate::protocol::NodeProfile {
+        if self.node.leaf_only {
+            crate::protocol::NodeProfile::Leaf
+        } else if self.node.disable_routing {
+            crate::protocol::NodeProfile::NonRouting
+        } else {
+            crate::protocol::NodeProfile::Full
+        }
+    }
+
     /// Get the configured peers.
     pub fn peers(&self) -> &[PeerConfig] {
         &self.peers
@@ -1243,6 +1258,7 @@ peers:
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_validate_peer_via_nostr_requires_nostr_enabled() {
         let config = Config {
             peers: vec![PeerConfig {
@@ -1268,6 +1284,7 @@ peers:
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_validate_peer_addresses_required_unless_via_nostr() {
         // Empty addresses + via_nostr=false → error.
         let mut config = Config {

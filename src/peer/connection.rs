@@ -1,11 +1,12 @@
 //! Peer Connection (Handshake Phase)
 //!
 //! Represents an in-progress connection before authentication completes.
-//! PeerConnection tracks the Noise IK handshake state and transitions to
+//! PeerConnection tracks the Noise XX handshake state and transitions to
 //! ActivePeer upon successful authentication.
 
 use crate::PeerIdentity;
 use crate::noise::{self, NoiseError, NoiseSession};
+use crate::protocol::NodeProfile;
 use crate::transport::{LinkDirection, LinkId, LinkStats, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
 use secp256k1::Keypair;
@@ -13,9 +14,9 @@ use std::fmt;
 
 /// Handshake protocol state machine.
 ///
-/// For Noise IK pattern:
-/// - Initiator: Initial → SentMsg1 → Complete
-/// - Responder: Initial → ReceivedMsg1 → Complete
+/// For Noise XX pattern:
+/// - Initiator: Initial → SentMsg1 → Complete (after processing msg2 + sending msg3)
+/// - Responder: Initial → ReceivedMsg1 → Complete (after processing msg3)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandshakeState {
     /// Initial state, ready to start handshake.
@@ -121,6 +122,9 @@ pub struct PeerConnection {
     /// Remote peer's startup epoch (learned from handshake).
     remote_epoch: Option<[u8; 8]>,
 
+    // === Negotiation Results ===
+    /// Peer's node profile (learned from negotiation payload).
+    peer_profile: Option<NodeProfile>,
     // === Handshake Resend ===
     /// Wire-format msg1 bytes for resend (initiator only).
     handshake_msg1: Option<Vec<u8>>,
@@ -161,6 +165,39 @@ impl PeerConnection {
             transport_id: None,
             source_addr: None,
             remote_epoch: None,
+            peer_profile: None,
+
+            handshake_msg1: None,
+            handshake_msg2: None,
+            resend_count: 0,
+            next_resend_at_ms: 0,
+        }
+    }
+
+    /// Create a new outbound connection without pre-known identity.
+    ///
+    /// Used for anonymous discovery on shared-media transports (Ethernet,
+    /// BLE) where the beacon doesn't carry identity. The peer's identity
+    /// is learned from XX msg2 during the handshake.
+    pub fn outbound_anonymous(link_id: LinkId, current_time_ms: u64) -> Self {
+        Self {
+            link_id,
+            direction: LinkDirection::Outbound,
+            handshake_state: HandshakeState::Initial,
+            expected_identity: None,
+            noise_handshake: None,
+            noise_session: None,
+            started_at: current_time_ms,
+            last_activity: current_time_ms,
+
+            link_stats: LinkStats::new(),
+            our_index: None,
+            their_index: None,
+            transport_id: None,
+            source_addr: None,
+            remote_epoch: None,
+            peer_profile: None,
+
             handshake_msg1: None,
             handshake_msg2: None,
             resend_count: 0,
@@ -189,6 +226,8 @@ impl PeerConnection {
             transport_id: None,
             source_addr: None,
             remote_epoch: None,
+            peer_profile: None,
+
             handshake_msg1: None,
             handshake_msg2: None,
             resend_count: 0,
@@ -221,6 +260,8 @@ impl PeerConnection {
             transport_id: Some(transport_id),
             source_addr: Some(source_addr),
             remote_epoch: None,
+            peer_profile: None,
+
             handshake_msg1: None,
             handshake_msg2: None,
             resend_count: 0,
@@ -354,6 +395,18 @@ impl PeerConnection {
         self.remote_epoch
     }
 
+    // === Negotiation Results ===
+
+    /// Get peer's negotiated node profile.
+    pub fn peer_profile(&self) -> Option<NodeProfile> {
+        self.peer_profile
+    }
+
+    /// Store negotiation results from peer's payload.
+    pub fn set_negotiation_results(&mut self, peer_profile: NodeProfile) {
+        self.peer_profile = Some(peer_profile);
+    }
+
     // === Handshake Resend ===
 
     /// Store the wire-format msg1 bytes for resend and schedule the first resend.
@@ -398,8 +451,8 @@ impl PeerConnection {
 
     /// Start the handshake as initiator and generate message 1.
     ///
-    /// For outbound connections only. Returns the handshake message to send.
-    /// The epoch is our startup epoch, encrypted into msg1 for restart detection.
+    /// For outbound connections only. Returns the Noise XX msg1 bytes.
+    /// XX msg1 is ephemeral-only (33 bytes) — no identity or epoch.
     pub fn start_handshake(
         &mut self,
         our_keypair: Keypair,
@@ -420,13 +473,8 @@ impl PeerConnection {
             });
         }
 
-        let remote_static = self
-            .expected_identity
-            .as_ref()
-            .expect("outbound must have expected identity")
-            .pubkey_full();
-
-        let mut hs = noise::HandshakeState::new_initiator(our_keypair, remote_static);
+        // XX initiator: no remote static needed upfront
+        let mut hs = noise::HandshakeState::new_initiator(our_keypair);
         hs.set_local_epoch(epoch);
         let msg1 = hs.write_message_1()?;
 
@@ -439,13 +487,19 @@ impl PeerConnection {
 
     /// Initialize responder and process incoming message 1.
     ///
-    /// For inbound connections only. Returns the handshake message 2 to send.
-    /// The epoch is our startup epoch, encrypted into msg2 for restart detection.
+    /// For inbound connections only. Returns the Noise XX msg2 bytes.
+    /// XX: identity is NOT learned from msg1 (only ephemeral exchange).
+    /// The responder learns the initiator's identity from msg3.
+    /// The handshake remains in ReceivedMsg1 state (not Complete).
+    ///
+    /// If `negotiation_payload` is provided, it is encrypted and appended
+    /// to the returned msg2 bytes.
     pub fn receive_handshake_init(
         &mut self,
         our_keypair: Keypair,
         epoch: [u8; 8],
         message: &[u8],
+        negotiation_payload: Option<&[u8]>,
         current_time_ms: u64,
     ) -> Result<Vec<u8>, NoiseError> {
         if self.direction != LinkDirection::Inbound {
@@ -465,38 +519,42 @@ impl PeerConnection {
         let mut hs = noise::HandshakeState::new_responder(our_keypair);
         hs.set_local_epoch(epoch);
 
-        // Process message 1 (this reveals the initiator's identity and epoch)
+        // Process XX message 1 (ephemeral only — no identity learned)
         hs.read_message_1(message)?;
 
-        // Extract the discovered identity
-        let remote_static = *hs
-            .remote_static()
-            .expect("remote static available after msg1");
-        self.expected_identity = Some(PeerIdentity::from_pubkey_full(remote_static));
+        // Generate XX message 2 (sends our static + epoch)
+        let mut msg2 = hs.write_message_2()?;
 
-        // Capture remote epoch from msg1
-        self.remote_epoch = hs.remote_epoch();
+        // Append encrypted negotiation payload if provided
+        if let Some(payload) = negotiation_payload {
+            let encrypted = hs.encrypt_payload(payload)?;
+            msg2.extend_from_slice(&encrypted);
+        }
 
-        // Generate message 2
-        let msg2 = hs.write_message_2()?;
-
-        // Handshake is complete for responder
-        let session = hs.into_session()?;
-        self.noise_session = Some(session);
-        self.handshake_state = HandshakeState::Complete;
+        // XX: handshake NOT complete yet — need msg3.
+        // Keep the handshake state for complete_handshake_msg3().
+        self.noise_handshake = Some(hs);
+        self.handshake_state = HandshakeState::ReceivedMsg1;
         self.last_activity = current_time_ms;
 
         Ok(msg2)
     }
 
-    /// Complete the handshake by processing message 2.
+    /// Complete the handshake by processing message 2 and generating message 3.
     ///
-    /// For outbound connections only (initiator completing handshake).
+    /// For outbound connections only (initiator). Processes the responder's
+    /// msg2 (learning their identity and epoch), then generates msg3.
+    /// Returns the Noise XX msg3 bytes to send.
+    ///
+    /// If `negotiation_payload` is provided, it is encrypted and appended
+    /// to the returned msg3 bytes. If the received msg2 contains a negotiation
+    /// payload (bytes beyond the base XX msg2), it is decrypted and returned.
     pub fn complete_handshake(
         &mut self,
         message: &[u8],
+        negotiation_payload: Option<&[u8]>,
         current_time_ms: u64,
-    ) -> Result<(), NoiseError> {
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), NoiseError> {
         if self.handshake_state != HandshakeState::SentMsg1 {
             return Err(NoiseError::WrongState {
                 expected: "sent_msg1 state".to_string(),
@@ -509,17 +567,109 @@ impl PeerConnection {
             .take()
             .expect("noise handshake must exist in SentMsg1 state");
 
-        hs.read_message_2(message)?;
+        // Split msg2 into base XX part and optional negotiation
+        let base_size = noise::HANDSHAKE_MSG2_SIZE;
+        let (base_msg2, extra) = if message.len() > base_size {
+            (&message[..base_size], Some(&message[base_size..]))
+        } else {
+            (message, None)
+        };
+
+        // Process XX msg2 (learns responder identity + epoch)
+        hs.read_message_2(base_msg2)?;
+
+        // Decrypt negotiation payload from msg2 if present
+        let received_negotiation = if let Some(encrypted) = extra {
+            Some(hs.decrypt_payload(encrypted)?)
+        } else {
+            None
+        };
+
+        // Learn responder identity from msg2
+        let remote_static = *hs
+            .remote_static()
+            .expect("remote static available after XX msg2");
+        self.expected_identity = Some(PeerIdentity::from_pubkey_full(remote_static));
 
         // Capture remote epoch from msg2
         self.remote_epoch = hs.remote_epoch();
 
+        // Generate XX msg3
+        let mut msg3 = hs.write_message_3()?;
+
+        // Append encrypted negotiation payload if provided
+        if let Some(payload) = negotiation_payload {
+            let encrypted = hs.encrypt_payload(payload)?;
+            msg3.extend_from_slice(&encrypted);
+        }
+
+        // Handshake complete for initiator
         let session = hs.into_session()?;
         self.noise_session = Some(session);
         self.handshake_state = HandshakeState::Complete;
         self.last_activity = current_time_ms;
 
-        Ok(())
+        Ok((msg3, received_negotiation))
+    }
+
+    /// Complete the responder handshake by processing message 3.
+    ///
+    /// For inbound connections only (responder). Processes the initiator's
+    /// msg3, learning their identity and epoch.
+    ///
+    /// If the msg3 contains a negotiation payload (bytes beyond base XX msg3),
+    /// it is decrypted and returned.
+    pub fn complete_handshake_msg3(
+        &mut self,
+        message: &[u8],
+        current_time_ms: u64,
+    ) -> Result<Option<Vec<u8>>, NoiseError> {
+        if self.handshake_state != HandshakeState::ReceivedMsg1 {
+            return Err(NoiseError::WrongState {
+                expected: "received_msg1 state".to_string(),
+                got: self.handshake_state.to_string(),
+            });
+        }
+
+        let mut hs = self
+            .noise_handshake
+            .take()
+            .expect("noise handshake must exist in ReceivedMsg1 state");
+
+        // Split msg3 into base XX part and optional negotiation
+        let base_size = noise::HANDSHAKE_MSG3_SIZE;
+        let (base_msg3, extra) = if message.len() > base_size {
+            (&message[..base_size], Some(&message[base_size..]))
+        } else {
+            (message, None)
+        };
+
+        // Process XX msg3 (learns initiator identity + epoch)
+        hs.read_message_3(base_msg3)?;
+
+        // Decrypt negotiation payload from msg3 if present
+        let received_negotiation = if let Some(encrypted) = extra {
+            Some(hs.decrypt_payload(encrypted)?)
+        } else {
+            None
+        };
+
+        // Learn initiator identity from msg3
+        let remote_static = *hs
+            .remote_static()
+            .expect("remote static available after XX msg3");
+        self.expected_identity = Some(PeerIdentity::from_pubkey_full(remote_static));
+
+        // Capture remote epoch from msg3
+        self.remote_epoch = hs.remote_epoch();
+
+        // Handshake complete for responder
+        let session = hs.into_session()?;
+        self.noise_session = Some(session);
+        self.handshake_state = HandshakeState::Complete;
+        self.last_activity = current_time_ms;
+
+        Ok(received_negotiation)
     }
 
     /// Take the completed Noise session.
@@ -653,31 +803,42 @@ mod tests {
         let mut initiator_conn = PeerConnection::outbound(LinkId::new(1), responder_peer_id, 1000);
         let mut responder_conn = PeerConnection::inbound(LinkId::new(2), 1000);
 
-        // Initiator starts handshake
+        // Initiator starts XX handshake
         let msg1 = initiator_conn
             .start_handshake(initiator_keypair, initiator_epoch, 1100)
             .unwrap();
         assert_eq!(initiator_conn.handshake_state(), HandshakeState::SentMsg1);
 
-        // Responder processes msg1 and sends msg2
+        // Responder processes msg1 and sends msg2 (XX: does NOT complete yet)
         let msg2 = responder_conn
-            .receive_handshake_init(responder_keypair, responder_epoch, &msg1, 1200)
+            .receive_handshake_init(responder_keypair, responder_epoch, &msg1, None, 1200)
             .unwrap();
-        assert_eq!(responder_conn.handshake_state(), HandshakeState::Complete);
+        assert_eq!(
+            responder_conn.handshake_state(),
+            HandshakeState::ReceivedMsg1
+        );
+        // Responder does NOT know initiator's identity yet (XX property)
+        assert!(responder_conn.expected_identity().is_none());
 
-        // Responder learned initiator's identity
-        let discovered = responder_conn.expected_identity().unwrap();
-        assert_eq!(discovered.pubkey(), initiator_identity.pubkey());
-
-        // Responder learned initiator's epoch
-        assert_eq!(responder_conn.remote_epoch(), Some(initiator_epoch));
-
-        // Initiator completes handshake
-        initiator_conn.complete_handshake(&msg2, 1300).unwrap();
+        // Initiator processes msg2 and generates msg3
+        let (msg3, _neg) = initiator_conn
+            .complete_handshake(&msg2, None, 1300)
+            .unwrap();
         assert_eq!(initiator_conn.handshake_state(), HandshakeState::Complete);
 
-        // Initiator learned responder's epoch
+        // Initiator learned responder's identity from msg2
+        let discovered = initiator_conn.expected_identity().unwrap();
+        assert_eq!(discovered.pubkey(), responder_identity.pubkey());
         assert_eq!(initiator_conn.remote_epoch(), Some(responder_epoch));
+
+        // Responder processes msg3 (completes handshake)
+        let _neg = responder_conn.complete_handshake_msg3(&msg3, 1400).unwrap();
+        assert_eq!(responder_conn.handshake_state(), HandshakeState::Complete);
+
+        // Responder learned initiator's identity from msg3
+        let discovered = responder_conn.expected_identity().unwrap();
+        assert_eq!(discovered.pubkey(), initiator_identity.pubkey());
+        assert_eq!(responder_conn.remote_epoch(), Some(initiator_epoch));
 
         // Both have sessions
         assert!(initiator_conn.has_session());
@@ -725,7 +886,7 @@ mod tests {
         let mut outbound = PeerConnection::outbound(LinkId::new(1), identity, 1000);
         assert!(
             outbound
-                .receive_handshake_init(keypair, make_epoch(), &[0u8; 106], 1100)
+                .receive_handshake_init(keypair, make_epoch(), &[0u8; 33], None, 1100)
                 .is_err()
         );
 

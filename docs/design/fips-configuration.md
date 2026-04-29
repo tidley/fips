@@ -104,7 +104,8 @@ to the highest-priority config file for operator visibility, even in ephemeral m
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `node.leaf_only` | bool | `false` | Leaf-only mode: node does not forward traffic or participate in routing |
+| `node.disable_routing` | bool | `false` | Non-routing mode: participates in spanning tree but does not forward transit traffic or send bloom filters |
+| `node.leaf_only` | bool | `false` | Leaf mode: single upstream peer, no tree/bloom/transit participation. Implies `disable_routing: true` |
 | `node.tick_interval_secs` | u64 | `1` | Periodic maintenance tick interval (retry checks, timeout cleanup, tree refresh) |
 | `node.base_rtt_ms` | u64 | `100` | Initial RTT estimate for new links before measurements converge |
 | `node.heartbeat_interval_secs` | u64 | `10` | Heartbeat send interval per peer for liveness detection |
@@ -123,7 +124,7 @@ Controls capacity for connections, peers, and links.
 
 ### Rate Limiting (`node.rate_limit.*`)
 
-Handshake rate limiting protects against DoS on the Noise IK handshake path.
+Handshake rate limiting protects against DoS on the Noise XX handshake path.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -319,7 +320,7 @@ stays set for all subsequent hops to the destination.
 ### Rekey (`node.rekey.*`)
 
 Controls periodic Noise rekey for forward secrecy. When enabled, both FMP
-(link-layer IK) and FSP (session-layer XK) sessions perform fresh Diffie-Hellman
+(link-layer XX) and FSP (session-layer XX) sessions perform fresh Diffie-Hellman
 key exchanges after a time or message count threshold, whichever comes first.
 A 10-second drain window keeps the old session active for decryption during
 cutover.
@@ -353,7 +354,7 @@ Metrics Measurement Protocol for per-peer link measurement. See
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `node.mmp.mode` | string | `"full"` | Operating mode: `full` (sender + receiver reports), `lightweight` (receiver reports only), or `minimal` (spin bit + CE echo only, no reports) |
+| `node.mmp.mode` | string | `"full"` | Operating mode: `full` (sender + receiver reports), `lightweight` (receiver reports only), or `minimal` (CE echo only, no reports) |
 | `node.mmp.log_interval_secs` | u64 | `30` | Periodic operator log interval for link metrics |
 | `node.mmp.owd_window_size` | usize | `32` | One-way delay trend ring buffer size |
 
@@ -784,6 +785,7 @@ node:
   identity:
     nsec: null                       # secret key in nsec or hex (null = depends on persistent)
     persistent: false                # true = load/save fips.key; false = ephemeral each start
+  disable_routing: false
   leaf_only: false
   tick_interval_secs: 1
   base_rtt_ms: 100

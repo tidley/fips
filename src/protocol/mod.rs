@@ -8,7 +8,7 @@
 //! links. Includes spanning tree gossip, bloom filter propagation, discovery
 //! protocol, and forwarding of session-layer datagrams.
 //!
-//! Link-layer peer authentication uses Noise IK (see `noise.rs`), which
+//! Link-layer peer authentication uses Noise XX (see `noise.rs`), which
 //! establishes the encrypted channel before any of these messages are sent.
 //!
 //! ## Session Layer (end-to-end, between FIPS addresses)
@@ -24,16 +24,21 @@ mod discovery;
 mod error;
 mod filter;
 mod link;
+mod negotiation;
 mod session;
 mod tree;
 
 // Re-export all public types at protocol:: level
 pub use discovery::{LookupRequest, LookupResponse};
 pub use error::ProtocolError;
-pub use filter::FilterAnnounce;
+pub use filter::{FilterAnnounce, FilterNack};
 pub use link::{
     Disconnect, DisconnectReason, HandshakeMessageType, LinkMessageType,
     SESSION_DATAGRAM_HEADER_SIZE, SessionDatagram,
+};
+pub use negotiation::{
+    FMP_FEAT_PROFILE_MASK, FMP_FEAT_PROVIDES_RR, FMP_FEAT_PROVIDES_SR, FMP_FEAT_WANTS_RR,
+    FMP_FEAT_WANTS_SR, NEGOTIATION_HEADER_SIZE, NegotiationPayload, NodeProfile, TlvEntry,
 };
 pub use session::{
     COORDS_REQUIRED_SIZE, CoordsRequired, FspFlags, FspInnerFlags, MTU_EXCEEDED_SIZE, MtuExceeded,

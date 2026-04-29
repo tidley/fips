@@ -50,7 +50,7 @@ fn test_session_entry_new_initiating() {
     let identity_a = Identity::generate();
     let identity_b = Identity::generate();
 
-    let handshake = HandshakeState::new_initiator(identity_a.keypair(), identity_b.pubkey_full());
+    let handshake = HandshakeState::new_initiator(identity_a.keypair());
 
     let entry = crate::node::session::SessionEntry::new(
         *identity_b.node_addr(),
@@ -74,7 +74,7 @@ fn test_session_entry_touch() {
     let identity_a = Identity::generate();
     let identity_b = Identity::generate();
 
-    let handshake = HandshakeState::new_initiator(identity_a.keypair(), identity_b.pubkey_full());
+    let handshake = HandshakeState::new_initiator(identity_a.keypair());
 
     let mut entry = crate::node::session::SessionEntry::new(
         *identity_b.node_addr(),
@@ -96,8 +96,7 @@ fn test_session_table_operations() {
     let mut node = make_node();
     let identity_b = Identity::generate();
 
-    let handshake =
-        HandshakeState::new_initiator(node.identity().keypair(), identity_b.pubkey_full());
+    let handshake = HandshakeState::new_initiator(node.identity().keypair());
 
     let dest_addr = *identity_b.node_addr();
     let entry = crate::node::session::SessionEntry::new(
@@ -157,7 +156,7 @@ async fn test_session_direct_peer_handshake() {
     let count = process_available_packets(&mut nodes).await;
     assert!(count > 0, "Expected SessionSetup packet to arrive");
 
-    // Node 1 should now have a session in AwaitingMsg3 state (XK: identity not yet known)
+    // Node 1 should now have a session in AwaitingMsg3 state (XX: identity not yet known)
     assert_eq!(nodes[1].node.session_count(), 1);
     assert!(
         nodes[1]
@@ -213,7 +212,7 @@ async fn test_session_direct_peer_data_transfer() {
     let node1_addr = *nodes[1].node.node_addr();
     let node1_pubkey = nodes[1].node.identity().pubkey_full();
 
-    // Establish session (XK: 3 messages — Setup, Ack, Msg3)
+    // Establish session (XX: 3 messages — Setup, Ack, Msg3)
     nodes[0]
         .node
         .initiate_session(node1_addr, node1_pubkey)
@@ -290,7 +289,7 @@ async fn test_session_3node_forwarded_handshake() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     process_available_packets(&mut nodes).await;
 
-    // Node 2 should have an AwaitingMsg3 session (XK: identity not yet known)
+    // Node 2 should have an AwaitingMsg3 session (XX: identity not yet known)
     assert!(
         nodes[2].node.get_session(&node0_addr).is_some(),
         "Node 2 should have a session entry for Node 0"
@@ -398,7 +397,7 @@ async fn test_session_3node_forwarded_data() {
         process_available_packets(&mut nodes).await;
     }
 
-    // Node 2 should be Established (transitioned during XK handshake msg3)
+    // Node 2 should be Established (transitioned during XX handshake msg3)
     assert!(
         nodes[2]
             .node
@@ -646,7 +645,7 @@ async fn test_session_100_nodes() {
         drain_to_quiescence(&mut nodes).await;
 
         // Reverse: responder → initiator
-        // (Responder should already be Established after XK msg3)
+        // (Responder should already be Established after XX msg3)
         let rev_payload = format!("rev-{}", pair_idx).into_bytes();
         let rev_ipv6 = build_ipv6_packet(&dst_fips, &src_fips, &rev_payload);
         match nodes[dst].node.send_ipv6_packet(&src_addr, &rev_ipv6).await {
@@ -887,7 +886,7 @@ async fn test_session_100_nodes() {
     assert_eq!(send_forward_err, 0, "All forward sends should succeed");
     assert_eq!(
         send_reverse_err, 0,
-        "All reverse sends should succeed (responder Established after XK msg3)"
+        "All reverse sends should succeed (responder Established after XX msg3)"
     );
     assert_eq!(
         fwd_delivered, send_forward_ok,
@@ -986,7 +985,7 @@ async fn test_tun_outbound_established_session() {
     let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
     let dst_fips = crate::FipsAddress::from_node_addr(&node1_addr);
 
-    // Establish session (XK: 3 messages — Setup, Ack, Msg3)
+    // Establish session (XX: 3 messages — Setup, Ack, Msg3)
     nodes[0]
         .node
         .initiate_session(node1_addr, node1_pubkey)
@@ -1256,15 +1255,14 @@ async fn test_tun_outbound_pending_queue_flush() {
 // Unit tests: Session idle timeout
 // ============================================================================
 
-/// Helper: complete a Noise IK handshake and return the initiator's NoiseSession.
+/// Helper: complete a Noise XX handshake and return the initiator's NoiseSession.
 fn make_noise_session(
     our_identity: &Identity,
     remote_identity: &Identity,
 ) -> crate::noise::NoiseSession {
     use crate::noise::HandshakeState;
 
-    let mut initiator =
-        HandshakeState::new_initiator(our_identity.keypair(), remote_identity.pubkey_full());
+    let mut initiator = HandshakeState::new_initiator(our_identity.keypair());
     let mut responder = HandshakeState::new_responder(remote_identity.keypair());
 
     // Set epochs for both sides (required for handshake message encryption)
@@ -1279,6 +1277,8 @@ fn make_noise_session(
     responder.read_message_1(&msg1).unwrap();
     let msg2 = responder.write_message_2().unwrap();
     initiator.read_message_2(&msg2).unwrap();
+    let msg3 = initiator.write_message_3().unwrap();
+    responder.read_message_3(&msg3).unwrap();
 
     initiator.into_session().unwrap()
 }
@@ -1348,7 +1348,7 @@ fn test_purge_idle_sessions_ignores_initiating() {
     let remote = Identity::generate();
     let remote_addr = *remote.node_addr();
 
-    let handshake = HandshakeState::new_initiator(node.identity().keypair(), remote.pubkey_full());
+    let handshake = HandshakeState::new_initiator(node.identity().keypair());
     let entry = crate::node::session::SessionEntry::new(
         remote_addr,
         remote.pubkey_full(),
@@ -1478,7 +1478,7 @@ fn test_coords_warmup_counter_default_zero_on_new() {
     let identity_a = Identity::generate();
     let identity_b = Identity::generate();
 
-    let handshake = HandshakeState::new_initiator(identity_a.keypair(), identity_b.pubkey_full());
+    let handshake = HandshakeState::new_initiator(identity_a.keypair());
 
     let entry = crate::node::session::SessionEntry::new(
         *identity_b.node_addr(),
@@ -1634,7 +1634,7 @@ fn test_session_entry_handshake_payload_storage() {
     let identity_a = Identity::generate();
     let identity_b = Identity::generate();
 
-    let handshake = HandshakeState::new_initiator(identity_a.keypair(), identity_b.pubkey_full());
+    let handshake = HandshakeState::new_initiator(identity_a.keypair());
 
     let mut entry = crate::node::session::SessionEntry::new(
         *identity_b.node_addr(),
@@ -1666,7 +1666,7 @@ fn test_session_entry_resend_tracking() {
     let identity_a = Identity::generate();
     let identity_b = Identity::generate();
 
-    let handshake = HandshakeState::new_initiator(identity_a.keypair(), identity_b.pubkey_full());
+    let handshake = HandshakeState::new_initiator(identity_a.keypair());
 
     let mut entry = crate::node::session::SessionEntry::new(
         *identity_b.node_addr(),
@@ -1697,7 +1697,7 @@ fn test_session_entry_clear_handshake_payload() {
     let identity_a = Identity::generate();
     let identity_b = Identity::generate();
 
-    let handshake = HandshakeState::new_initiator(identity_a.keypair(), identity_b.pubkey_full());
+    let handshake = HandshakeState::new_initiator(identity_a.keypair());
 
     let mut entry = crate::node::session::SessionEntry::new(
         *identity_b.node_addr(),
@@ -1728,8 +1728,7 @@ async fn test_session_handshake_timeout() {
     let mut node = make_node();
 
     let identity_b = Identity::generate();
-    let handshake =
-        HandshakeState::new_initiator(node.identity.keypair(), identity_b.pubkey_full());
+    let handshake = HandshakeState::new_initiator(node.identity.keypair());
 
     let dest_addr = *identity_b.node_addr();
 
@@ -1773,7 +1772,7 @@ async fn test_session_awaiting_msg3_timeout() {
     let identity_a = Identity::generate();
     let identity_b = Identity::generate();
 
-    let handshake = HandshakeState::new_xk_responder(identity_b.keypair());
+    let handshake = HandshakeState::new_responder(identity_b.keypair());
 
     let src_addr = *identity_a.node_addr();
 
@@ -1817,7 +1816,7 @@ async fn test_tun_outbound_path_mtu_generates_ptb() {
     let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
     let dst_fips = crate::FipsAddress::from_node_addr(&node1_addr);
 
-    // Establish session (XK: 3 messages — Setup, Ack, Msg3)
+    // Establish session (XX: 3 messages — Setup, Ack, Msg3)
     nodes[0]
         .node
         .initiate_session(node1_addr, node1_pubkey)

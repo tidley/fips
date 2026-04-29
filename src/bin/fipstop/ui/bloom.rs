@@ -69,7 +69,6 @@ fn draw_stats(frame: &mut Frame, data: &serde_json::Value, area: Rect) {
             &helpers::nested_u64(data, "stats", "decode_error"),
         ),
         helpers::kv_line("Invalid", &helpers::nested_u64(data, "stats", "invalid")),
-        helpers::kv_line("Non-V1", &helpers::nested_u64(data, "stats", "non_v1")),
         helpers::kv_line(
             "Unknown Peer",
             &helpers::nested_u64(data, "stats", "unknown_peer"),
@@ -78,6 +77,26 @@ fn draw_stats(frame: &mut Frame, data: &serde_json::Value, area: Rect) {
         Line::from(""),
         helpers::section_header("Outbound"),
         helpers::kv_line("Sent", &helpers::nested_u64(data, "stats", "sent")),
+        helpers::kv_line(
+            "Full Sends",
+            &helpers::nested_u64(data, "stats", "full_sends"),
+        ),
+        helpers::kv_line(
+            "Deltas Sent",
+            &helpers::nested_u64(data, "stats", "deltas_sent"),
+        ),
+        helpers::kv_line(
+            "NACKs Sent",
+            &helpers::nested_u64(data, "stats", "nacks_sent"),
+        ),
+        helpers::kv_line(
+            "NACKs Received",
+            &helpers::nested_u64(data, "stats", "nacks_received"),
+        ),
+        helpers::kv_line(
+            "Size Changes",
+            &helpers::nested_u64(data, "stats", "size_changes"),
+        ),
         helpers::kv_line(
             "Debounce Suppressed",
             &helpers::nested_u64(data, "stats", "debounce_suppressed"),

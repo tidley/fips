@@ -25,13 +25,13 @@ use self::discovery_rate_limit::{DiscoveryBackoff, DiscoveryForwardRateLimiter};
 use self::rate_limit::HandshakeRateLimiter;
 use self::routing_error_rate_limit::RoutingErrorRateLimiter;
 use self::wire::{
-    FLAG_CE, FLAG_KEY_EPOCH, FLAG_SP, build_encrypted, build_established_header,
-    prepend_inner_header,
+    FLAG_CE, FLAG_KEY_EPOCH, build_encrypted, build_established_header, prepend_inner_header,
 };
 use crate::bloom::BloomState;
 use crate::cache::CoordCache;
 use crate::node::session::SessionEntry;
 use crate::peer::{ActivePeer, PeerConnection};
+use crate::protocol::NodeProfile;
 #[cfg(unix)]
 use crate::transport::ethernet::EthernetTransport;
 use crate::transport::tcp::TcpTransport;
@@ -248,7 +248,9 @@ struct PendingConnect {
     /// The remote address being connected to.
     remote_addr: TransportAddr,
     /// The peer identity (for handshake initiation).
-    peer_identity: PeerIdentity,
+    /// None for anonymous discovery connections where identity isn't
+    /// known until the XX handshake completes.
+    peer_identity: Option<PeerIdentity>,
 }
 
 /// A running FIPS node instance.
@@ -286,6 +288,9 @@ pub struct Node {
 
     /// Whether this is a leaf-only node.
     is_leaf_only: bool,
+
+    /// Node profile derived from config (Full, NonRouting, Leaf).
+    node_profile: NodeProfile,
 
     // === Spanning Tree ===
     /// Local spanning tree state.
@@ -401,6 +406,10 @@ pub struct Node {
     /// Pending outbound handshakes by our sender_idx.
     /// Tracks which LinkId corresponds to which session index.
     pending_outbound: HashMap<(TransportId, u32), LinkId>,
+    /// Pending inbound connections awaiting msg3 (XX pattern), keyed by
+    /// (transport_id, our_index). The responder stores the connection here
+    /// after sending msg2 and awaits msg3 to learn the initiator's identity.
+    pending_inbound: HashMap<(TransportId, u32), LinkId>,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -481,6 +490,7 @@ impl Node {
         let identity = config.create_identity()?;
         let node_addr = *identity.node_addr();
         let is_leaf_only = config.is_leaf_only();
+        let node_profile = config.node_profile();
 
         let mut startup_epoch = [0u8; 8];
         rand::rng().fill_bytes(&mut startup_epoch);
@@ -551,6 +561,7 @@ impl Node {
             config,
             state: NodeState::Created,
             is_leaf_only,
+            node_profile,
             tree_state,
             bloom_state,
             coord_cache,
@@ -587,6 +598,7 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            pending_inbound: HashMap::new(),
             msg1_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
@@ -682,6 +694,7 @@ impl Node {
             config,
             state: NodeState::Created,
             is_leaf_only: false,
+            node_profile: NodeProfile::Full,
             tree_state,
             bloom_state,
             coord_cache,
@@ -718,6 +731,7 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            pending_inbound: HashMap::new(),
             msg1_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
@@ -747,6 +761,7 @@ impl Node {
     pub fn leaf_only(config: Config) -> Result<Self, NodeError> {
         let mut node = Self::new(config)?;
         node.is_leaf_only = true;
+        node.node_profile = NodeProfile::Leaf;
         node.bloom_state = BloomState::leaf_only(*node.identity.node_addr());
         Ok(node)
     }
@@ -783,12 +798,10 @@ impl Node {
                 .iter()
                 .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
                 .collect();
-            let xonly = self.identity.pubkey();
+
             for (name, eth_config) in eth_instances {
                 let transport_id = self.allocate_transport_id();
-                let mut eth =
-                    EthernetTransport::new(transport_id, name, eth_config, packet_tx.clone());
-                eth.set_local_pubkey(xonly);
+                let eth = EthernetTransport::new(transport_id, name, eth_config, packet_tx.clone());
                 transports.push(TransportHandle::Ethernet(eth));
             }
         }
@@ -841,14 +854,13 @@ impl Node {
                 let mtu = ble_config.mtu();
                 match crate::transport::ble::io::BluerIo::new(&adapter, mtu).await {
                     Ok(io) => {
-                        let mut ble = crate::transport::ble::BleTransport::new(
+                        let ble = crate::transport::ble::BleTransport::new(
                             transport_id,
                             name,
                             ble_config,
                             io,
                             packet_tx.clone(),
                         );
-                        ble.set_local_pubkey(self.identity.pubkey().serialize());
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
@@ -1059,6 +1071,22 @@ impl Node {
     /// Check if this is a leaf-only node.
     pub fn is_leaf_only(&self) -> bool {
         self.is_leaf_only
+    }
+
+    /// Get the node's profile (Full, NonRouting, Leaf).
+    pub fn node_profile(&self) -> NodeProfile {
+        self.node_profile
+    }
+
+    /// Collect the set of peers that are not full nodes (non-routing/leaf).
+    ///
+    /// Used by tree and routing functions to skip non-transit peers.
+    fn non_full_peers(&self) -> std::collections::HashSet<NodeAddr> {
+        self.peers
+            .iter()
+            .filter(|(_, p)| p.peer_profile() != NodeProfile::Full)
+            .map(|(addr, _)| *addr)
+            .collect()
     }
 
     // === Tree State ===
@@ -1732,8 +1760,9 @@ impl Node {
             return Some(peer);
         }
 
-        // 4. Greedy tree routing fallback
-        let next_hop_id = self.tree_state.find_next_hop(&dest_coords)?;
+        // 4. Greedy tree routing fallback (skip non-routing/leaf peers)
+        let skip = self.non_full_peers();
+        let next_hop_id = self.tree_state.find_next_hop(&dest_coords, &skip)?;
 
         self.peers.get(&next_hop_id).filter(|p| p.can_send())
     }
@@ -1793,9 +1822,15 @@ impl Node {
         best.map(|(peer, _, _)| peer)
     }
 
-    /// Check if a destination is in any peer's bloom filter.
+    /// Check if a destination is in any full peer's bloom filter.
+    ///
+    /// Skips non-routing and leaf peers (defensive — they shouldn't have
+    /// filters claiming transit reachability, but guard against propagation bugs).
     pub fn destination_in_filters(&self, dest: &NodeAddr) -> Vec<&ActivePeer> {
-        self.peers.values().filter(|p| p.may_reach(dest)).collect()
+        self.peers
+            .values()
+            .filter(|p| p.peer_profile() == NodeProfile::Full && p.may_reach(dest))
+            .collect()
     }
 
     /// Get the TUN packet sender channel.
@@ -1860,9 +1895,7 @@ impl Node {
         // Prepend 4-byte session-relative timestamp (inner header)
         let timestamp_ms = peer.session_elapsed_ms();
 
-        // MMP: read spin bit value before entering session borrow
-        let sp_flag = peer.mmp().map(|mmp| mmp.spin_bit.tx_bit()).unwrap_or(false);
-        let mut flags = if sp_flag { FLAG_SP } else { 0 };
+        let mut flags = 0u8;
         if ce_flag {
             flags |= FLAG_CE;
         }
@@ -1926,6 +1959,63 @@ impl Node {
         }
 
         Ok(())
+    }
+
+    /// Encrypt and send a link-layer message using a raw Noise session.
+    ///
+    /// Unlike `send_encrypted_link_message`, this does not look the peer up
+    /// in `self.peers`. It takes the session and wire parameters directly,
+    /// so it can be used during handshake teardown (before promotion) where
+    /// the peer state lives in `self.connections` rather than `self.peers`.
+    ///
+    /// The inner-header timestamp is set to 0 — the session has just been
+    /// established and no session-elapsed reference is available yet; this
+    /// is acceptable because the frame is a one-shot sent before teardown.
+    /// No MMP stats or K-bit flag are recorded.
+    pub(super) async fn send_encrypted_link_message_raw(
+        &self,
+        node_addr: NodeAddr,
+        transport_id: crate::transport::TransportId,
+        remote_addr: &crate::transport::TransportAddr,
+        session: &mut crate::noise::NoiseSession,
+        their_index: crate::utils::index::SessionIndex,
+        plaintext: &[u8],
+    ) -> Result<(), NodeError> {
+        let inner_plaintext = prepend_inner_header(0, plaintext);
+
+        let counter = session.current_send_counter();
+        let payload_len = inner_plaintext.len() as u16;
+        let header = build_established_header(their_index, counter, 0u8, payload_len);
+
+        let ciphertext = session
+            .encrypt_with_aad(&inner_plaintext, &header)
+            .map_err(|e| NodeError::SendFailed {
+                node_addr,
+                reason: format!("encryption failed: {}", e),
+            })?;
+
+        let wire_packet = build_encrypted(&header, &ciphertext);
+
+        let transport = self
+            .transports
+            .get(&transport_id)
+            .ok_or(NodeError::TransportNotFound(transport_id))?;
+
+        transport
+            .send(remote_addr, &wire_packet)
+            .await
+            .map(|_| ())
+            .map_err(|e| match e {
+                TransportError::MtuExceeded { packet_size, mtu } => NodeError::MtuExceeded {
+                    node_addr,
+                    packet_size,
+                    mtu,
+                },
+                other => NodeError::SendFailed {
+                    node_addr,
+                    reason: format!("transport send: {}", other),
+                },
+            })
     }
 }
 

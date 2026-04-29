@@ -1,7 +1,7 @@
 //! Encrypted frame handling (hot path).
 
 use crate::node::Node;
-use crate::node::wire::{EncryptedHeader, FLAG_CE, FLAG_KEY_EPOCH, FLAG_SP, strip_inner_header};
+use crate::node::wire::{EncryptedHeader, FLAG_CE, FLAG_KEY_EPOCH, strip_inner_header};
 use crate::noise::NoiseError;
 use crate::transport::ReceivedPacket;
 use std::time::Instant;
@@ -52,7 +52,9 @@ impl Node {
         // K-bit flip detection: peer has cut over to the new session.
         // Check and perform cutover in a scoped borrow.
         {
-            let peer = self.peers.get(&node_addr).unwrap();
+            let Some(peer) = self.peers.get(&node_addr) else {
+                return;
+            };
             let k_bit_flipped =
                 received_k_bit != peer.current_k_bit() && peer.pending_new_session().is_some();
 
@@ -63,7 +65,9 @@ impl Node {
                     "Peer K-bit flip detected, promoting new session"
                 );
 
-                let peer = self.peers.get_mut(&node_addr).unwrap();
+                let Some(peer) = self.peers.get_mut(&node_addr) else {
+                    return;
+                };
                 if let Some(_old_our_index) = peer.handle_peer_kbit_flip() {
                     // New index was pre-registered in peers_by_index during
                     // msg1 handling (handshake.rs). Verify, don't duplicate.
@@ -83,7 +87,9 @@ impl Node {
         // Decrypt: try current session first, then previous (drain fallback)
         let ciphertext = &packet.data[header.ciphertext_offset()..];
         let plaintext = {
-            let peer = self.peers.get_mut(&node_addr).unwrap();
+            let Some(peer) = self.peers.get_mut(&node_addr) else {
+                return;
+            };
             let session = match peer.noise_session_mut() {
                 Some(s) => s,
                 None => {
@@ -149,7 +155,6 @@ impl Node {
         // MMP per-frame processing and statistics
         let now = Instant::now();
         let ce_flag = header.flags & FLAG_CE != 0;
-        let sp_flag = header.flags & FLAG_SP != 0;
 
         if let Some(peer) = self.peers.get_mut(&node_addr) {
             if let Some(mmp) = peer.mmp_mut() {
@@ -160,7 +165,6 @@ impl Node {
                     ce_flag,
                     now,
                 );
-                let _spin_rtt = mmp.spin_bit.rx_observe(sp_flag, header.counter, now);
             }
             peer.set_current_addr(packet.transport_id, packet.remote_addr.clone());
             peer.link_stats_mut()

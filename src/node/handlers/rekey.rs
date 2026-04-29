@@ -20,7 +20,7 @@ const DRAIN_WINDOW_SECS: u64 = 10;
 const REKEY_DAMPENING_SECS: u64 = 30;
 
 /// Delay FSP initiator cutover after handshake completion to allow
-/// XK msg3 to reach the responder before K-bit-flipped data arrives.
+/// XX msg3 to reach the responder before K-bit-flipped data arrives.
 const FSP_CUTOVER_DELAY_MS: u64 = 2000;
 
 impl Node {
@@ -128,7 +128,7 @@ impl Node {
 
     /// Initiate an outbound rekey to a peer.
     ///
-    /// Creates a new IK handshake as initiator, sends msg1 over the existing
+    /// Creates a new XX handshake as initiator, sends msg1 over the existing
     /// link (same transport, same remote address), and stores the handshake
     /// state on the ActivePeer. No new Link or PeerConnection is created.
     async fn initiate_rekey(&mut self, node_addr: &NodeAddr) {
@@ -146,7 +146,6 @@ impl Node {
             None => return,
         };
         let link_id = peer.link_id();
-        let peer_pubkey = peer.identity().pubkey_full();
 
         // Allocate a new session index for the rekey
         let our_index = match self.index_allocator.allocate() {
@@ -161,9 +160,9 @@ impl Node {
             }
         };
 
-        // Create IK initiator handshake directly (no PeerConnection)
+        // Create XX initiator handshake directly (no PeerConnection)
         let our_keypair = self.identity.keypair();
-        let mut hs = HandshakeState::new_initiator(our_keypair, peer_pubkey);
+        let mut hs = HandshakeState::new_initiator(our_keypair);
         hs.set_local_epoch(self.startup_epoch);
 
         let noise_msg1 = match hs.write_message_1() {
@@ -233,8 +232,10 @@ impl Node {
             if !peer.rekey_in_progress() || peer.rekey_msg1().is_none() {
                 continue;
             }
-            if peer.needs_msg1_resend(now_ms) {
-                to_resend.push((*node_addr, peer.rekey_msg1().unwrap().to_vec()));
+            if peer.needs_msg1_resend(now_ms)
+                && let Some(msg1) = peer.rekey_msg1()
+            {
+                to_resend.push((*node_addr, msg1.to_vec()));
             }
         }
 
@@ -270,7 +271,7 @@ impl Node {
     /// For each established session:
     /// - If the initiator has a pending session, perform K-bit cutover
     /// - If the drain window has expired, clean up the previous session
-    /// - If the rekey timer/counter fires, initiate a new XK handshake
+    /// - If the rekey timer/counter fires, initiate a new XX handshake
     pub(in crate::node) async fn check_session_rekey(&mut self) {
         if !self.config.node.rekey.enabled {
             return;
@@ -359,7 +360,7 @@ impl Node {
 
     /// Initiate an FSP session rekey.
     ///
-    /// Creates a new XK handshake as initiator, sends SessionSetup msg1
+    /// Creates a new XX handshake as initiator, sends SessionSetup msg1
     /// through the mesh, and stores the handshake state on the existing entry.
     async fn initiate_session_rekey(&mut self, dest_addr: &NodeAddr) {
         // Check route availability before paying crypto cost
@@ -375,20 +376,20 @@ impl Node {
             Some(e) => e,
             None => return,
         };
-        let dest_pubkey = *entry.remote_pubkey();
+        let _dest_pubkey = *entry.remote_pubkey();
 
-        // Create Noise XK initiator handshake
+        // Create Noise XX initiator handshake (rekey: no negotiation payload)
         let our_keypair = self.identity.keypair();
-        let mut handshake = HandshakeState::new_xk_initiator(our_keypair, dest_pubkey);
+        let mut handshake = HandshakeState::new_initiator(our_keypair);
         handshake.set_local_epoch(self.startup_epoch);
 
-        let msg1 = match handshake.write_xk_message_1() {
+        let msg1 = match handshake.write_message_1() {
             Ok(m) => m,
             Err(e) => {
                 warn!(
                     peer = %self.peer_display_name(dest_addr),
                     error = %e,
-                    "Failed to generate FSP rekey XK msg1"
+                    "Failed to generate FSP rekey XX msg1"
                 );
                 return;
             }

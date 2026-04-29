@@ -42,6 +42,10 @@ impl Node {
                 // FilterAnnounce
                 self.handle_filter_announce(from, payload).await;
             }
+            0x21 => {
+                // FilterNack
+                self.handle_filter_nack(from, payload).await;
+            }
             0x30 => {
                 // LookupRequest
                 self.handle_lookup_request(from, payload).await;
@@ -189,7 +193,8 @@ impl Node {
             }
         }
 
-        // Bloom filter cleanup: clear state for removed peer, mark all remaining peers
+        // Bloom filter cleanup: remove dependent (non-routing/leaf peers), clear state
+        self.bloom_state.remove_leaf_dependent(node_addr);
         self.bloom_state.remove_peer_state(node_addr);
         let remaining_peers: Vec<NodeAddr> = self.peers.keys().copied().collect();
         self.bloom_state.mark_all_updates_needed(remaining_peers);

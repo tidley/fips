@@ -2,7 +2,7 @@
 //!
 //! Handles locally-delivered session payloads from SessionDatagram envelopes.
 //! Dispatches based on FSP common prefix phase to specific handlers for
-//! SessionSetup (Noise XK msg1), SessionAck (msg2), SessionMsg3 (msg3),
+//! SessionSetup (Noise XX msg1), SessionAck (msg2), SessionMsg3 (msg3),
 //! encrypted data, and error signals (CoordsRequired, PathBroken).
 
 use crate::NodeAddr;
@@ -16,9 +16,8 @@ use crate::node::session_wire::{
     fsp_strip_inner_header, parse_encrypted_coords,
 };
 use crate::node::{Node, NodeError};
-use crate::noise::{
-    HandshakeState, XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE, XK_HANDSHAKE_MSG3_SIZE,
-};
+use crate::noise::{HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE, HANDSHAKE_MSG3_SIZE, HandshakeState};
+use crate::protocol::NegotiationPayload;
 use crate::protocol::{
     CoordsRequired, FspInnerFlags, MtuExceeded, PathBroken, PathMtuNotification, SessionAck,
     SessionDatagram, SessionMessageType, SessionMsg3, SessionReceiverReport, SessionSenderReport,
@@ -37,7 +36,7 @@ impl Node {
     ///
     /// - Phase 0x1 → SessionSetup (handshake msg1)
     /// - Phase 0x2 → SessionAck (handshake msg2)
-    /// - Phase 0x3 → SessionMsg3 (XK handshake msg3)
+    /// - Phase 0x3 → SessionMsg3 (XX handshake msg3)
     /// - Phase 0x0 + U flag → plaintext error signal (CoordsRequired/PathBroken)
     /// - Phase 0x0 + !U → encrypted session message (data, reports, etc.)
     pub(in crate::node) async fn handle_session_payload(
@@ -167,7 +166,7 @@ impl Node {
                 }
             };
             // Drop encrypted data if session is not yet established.
-            // With XK, the responder must wait for msg3 before it can decrypt.
+            // With XX, the responder must wait for msg3 before it can decrypt.
             if !entry.is_established() {
                 debug!(
                     src = %self.peer_display_name(src_addr),
@@ -180,7 +179,9 @@ impl Node {
         // K-bit flip detection: peer has cut over to the new session.
         let received_k_bit = header.flags & FSP_FLAG_K != 0;
         {
-            let entry = self.sessions.get(src_addr).unwrap();
+            let Some(entry) = self.sessions.get(src_addr) else {
+                return;
+            };
             let k_bit_flipped =
                 received_k_bit != entry.current_k_bit() && entry.pending_new_session().is_some();
 
@@ -191,7 +192,9 @@ impl Node {
                     "Peer FSP K-bit flip detected, promoting new session"
                 );
                 let now_ms = Self::now_ms();
-                let entry = self.sessions.get_mut(src_addr).unwrap();
+                let Some(entry) = self.sessions.get_mut(src_addr) else {
+                    return;
+                };
                 entry.handle_peer_kbit_flip(now_ms);
             }
         }
@@ -265,13 +268,7 @@ impl Node {
             let now = std::time::Instant::now();
             mmp.receiver
                 .record_recv(header.counter, timestamp, plaintext.len(), ce_flag, now);
-            // Spin bit: advance state machine for correct TX reflection.
-            // RTT samples not fed into SRTT — timestamp-echo provides
-            // accurate RTT; spin bit includes variable inter-frame delays.
-            let inner_flags = FspInnerFlags::from_byte(inner_flags_byte);
-            let _spin_rtt = mmp
-                .spin_bit
-                .rx_observe(inner_flags.spin_bit, header.counter, now);
+            let _inner_flags = FspInnerFlags::from_byte(inner_flags_byte);
         }
 
         // Feed path_mtu from datagram envelope to MMP path MTU tracking.
@@ -374,10 +371,10 @@ impl Node {
         self.flush_pending_packets(src_addr).await;
     }
 
-    /// Handle an incoming SessionSetup (Noise XK msg1).
+    /// Handle an incoming SessionSetup (Noise XX msg1).
     ///
     /// The remote node wants to establish an end-to-end session with us.
-    /// We create an XK responder handshake, process msg1, send SessionAck with msg2,
+    /// We create an XX responder handshake, process msg1, send SessionAck with msg2,
     /// and transition to AwaitingMsg3.
     async fn handle_session_setup(&mut self, src_addr: &NodeAddr, inner: &[u8]) {
         let setup = match SessionSetup::decode(inner) {
@@ -388,10 +385,10 @@ impl Node {
             }
         };
 
-        if setup.handshake_payload.len() != XK_HANDSHAKE_MSG1_SIZE {
+        if setup.handshake_payload.len() != HANDSHAKE_MSG1_SIZE {
             debug!(
                 len = setup.handshake_payload.len(),
-                expected = XK_HANDSHAKE_MSG1_SIZE,
+                expected = HANDSHAKE_MSG1_SIZE,
                 "Invalid handshake payload size in SessionSetup"
             );
             return;
@@ -452,8 +449,9 @@ impl Node {
                             src = %self.peer_display_name(src_addr),
                             "Dual FSP rekey initiation: we lose (larger addr), abandoning ours"
                         );
-                        let entry = self.sessions.get_mut(src_addr).unwrap();
-                        entry.abandon_rekey();
+                        if let Some(entry) = self.sessions.get_mut(src_addr) {
+                            entry.abandon_rekey();
+                        }
                     } else if has_pending {
                         // Guard: already have a pending session waiting for K-bit cutover
                         debug!(
@@ -463,19 +461,19 @@ impl Node {
                         return;
                     }
                     let our_keypair = self.identity.keypair();
-                    let mut handshake = HandshakeState::new_xk_responder(our_keypair);
+                    let mut handshake = HandshakeState::new_responder(our_keypair);
                     handshake.set_local_epoch(self.startup_epoch);
 
-                    if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
-                        debug!(error = %e, "Failed to process rekey XK msg1");
+                    if let Err(e) = handshake.read_message_1(&setup.handshake_payload) {
+                        debug!(error = %e, "Failed to process rekey XX msg1");
                         return;
                     }
 
                     // Generate msg2
-                    let msg2 = match handshake.write_xk_message_2() {
+                    let msg2 = match handshake.write_message_2() {
                         Ok(m) => m,
                         Err(e) => {
-                            debug!(error = %e, "Failed to generate rekey XK msg2");
+                            debug!(error = %e, "Failed to generate rekey XX msg2");
                             return;
                         }
                     };
@@ -495,9 +493,10 @@ impl Node {
 
                     // Store rekey state on the existing entry
                     let now_ms = Self::now_ms();
-                    let entry = self.sessions.get_mut(src_addr).unwrap();
-                    entry.set_rekey_state(handshake, false);
-                    entry.record_peer_rekey(now_ms);
+                    if let Some(entry) = self.sessions.get_mut(src_addr) {
+                        entry.set_rekey_state(handshake, false);
+                        entry.record_peer_rekey(now_ms);
+                    }
 
                     debug!(
                         src = %self.peer_display_name(src_addr),
@@ -511,28 +510,38 @@ impl Node {
             }
         }
 
-        // Create XK responder handshake and process msg1
+        // Create XX responder handshake and process msg1
         let our_keypair = self.identity.keypair();
-        let mut handshake = HandshakeState::new_xk_responder(our_keypair);
+        let mut handshake = HandshakeState::new_responder(our_keypair);
         handshake.set_local_epoch(self.startup_epoch);
 
-        if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
-            debug!(error = %e, "Failed to process Noise XK msg1 in SessionSetup");
+        if let Err(e) = handshake.read_message_1(&setup.handshake_payload) {
+            debug!(error = %e, "Failed to process Noise XX msg1 in SessionSetup");
             return;
         }
 
-        // XK: responder does NOT learn initiator's identity until msg3
+        // XX: responder does NOT learn initiator's identity until msg3
         // Use a placeholder pubkey from src_addr for the session entry.
         // The real pubkey will be registered when msg3 arrives.
 
-        // Generate msg2
-        let msg2 = match handshake.write_xk_message_2() {
+        // Generate msg2 with negotiation payload
+        let mut msg2 = match handshake.write_message_2() {
             Ok(m) => m,
             Err(e) => {
-                debug!(error = %e, "Failed to generate Noise XK msg2 for SessionAck");
+                debug!(error = %e, "Failed to generate Noise XX msg2 for SessionAck");
                 return;
             }
         };
+
+        // Encrypt FSP negotiation payload (version [0,0], features=0)
+        let neg_payload = NegotiationPayload::new(0, 0, 0).encode();
+        match handshake.encrypt_payload(&neg_payload) {
+            Ok(encrypted) => msg2.extend_from_slice(&encrypted),
+            Err(e) => {
+                debug!(error = %e, "Failed to encrypt negotiation payload for SessionAck");
+                return;
+            }
+        }
 
         // Build and send SessionAck (include initiator's coords for return-path warming)
         let our_coords = self.tree_state.my_coords().clone();
@@ -564,10 +573,10 @@ impl Node {
         entry.set_handshake_payload(ack_payload, now_ms + resend_interval);
         self.sessions.insert(*src_addr, entry);
 
-        debug!(src = %self.peer_display_name(src_addr), "SessionSetup processed (XK), SessionAck sent, awaiting msg3");
+        debug!(src = %self.peer_display_name(src_addr), "SessionSetup processed (XX), SessionAck sent, awaiting msg3");
     }
 
-    /// Handle an incoming SessionAck (Noise XK msg2).
+    /// Handle an incoming SessionAck (Noise XX msg2).
     ///
     /// Processes msg2, generates and sends msg3, then transitions to Established.
     async fn handle_session_ack(&mut self, src_addr: &NodeAddr, inner: &[u8]) {
@@ -579,11 +588,11 @@ impl Node {
             }
         };
 
-        if ack.handshake_payload.len() != XK_HANDSHAKE_MSG2_SIZE {
+        if ack.handshake_payload.len() < HANDSHAKE_MSG2_SIZE {
             debug!(
                 len = ack.handshake_payload.len(),
-                expected = XK_HANDSHAKE_MSG2_SIZE,
-                "Invalid handshake payload size in SessionAck"
+                min = HANDSHAKE_MSG2_SIZE,
+                "Handshake payload too short in SessionAck"
             );
             return;
         }
@@ -607,19 +616,19 @@ impl Node {
                 }
             };
 
-            // Process XK msg2
-            if let Err(e) = handshake.read_xk_message_2(&ack.handshake_payload) {
-                debug!(error = %e, "Failed to process rekey XK msg2");
+            // Process XX msg2
+            if let Err(e) = handshake.read_message_2(&ack.handshake_payload) {
+                debug!(error = %e, "Failed to process rekey XX msg2");
                 entry.abandon_rekey();
                 self.sessions.insert(*src_addr, entry);
                 return;
             }
 
-            // Generate XK msg3
-            let msg3 = match handshake.write_xk_message_3() {
+            // Generate XX msg3
+            let msg3 = match handshake.write_message_3() {
                 Ok(m) => m,
                 Err(e) => {
-                    debug!(error = %e, "Failed to generate rekey XK msg3");
+                    debug!(error = %e, "Failed to generate rekey XX msg3");
                     entry.abandon_rekey();
                     self.sessions.insert(*src_addr, entry);
                     return;
@@ -644,7 +653,7 @@ impl Node {
             let session = match handshake.into_session() {
                 Ok(s) => s,
                 Err(e) => {
-                    debug!(error = %e, "Failed to create session from rekey XK");
+                    debug!(error = %e, "Failed to create session from rekey XX");
                     entry.abandon_rekey();
                     self.sessions.insert(*src_addr, entry);
                     return;
@@ -657,7 +666,7 @@ impl Node {
 
             debug!(
                 src = %self.peer_display_name(src_addr),
-                "FSP rekey: completed XK as initiator, pending cutover"
+                "FSP rekey: completed XX as initiator, pending cutover"
             );
             return;
         }
@@ -673,20 +682,67 @@ impl Node {
             _ => unreachable!("checked is_initiating above"),
         };
 
-        // Process XK msg2: read_xk_message_2 (extracts responder's epoch)
-        if let Err(e) = handshake.read_xk_message_2(&ack.handshake_payload) {
-            debug!(error = %e, "Failed to process Noise XK msg2 in SessionAck");
-            return; // Entry was already removed, don't put back a broken session
+        // Split msg2 into base XX part and optional negotiation payload
+        let (base_msg2, neg_bytes) = if ack.handshake_payload.len() > HANDSHAKE_MSG2_SIZE {
+            (
+                &ack.handshake_payload[..HANDSHAKE_MSG2_SIZE],
+                Some(&ack.handshake_payload[HANDSHAKE_MSG2_SIZE..]),
+            )
+        } else {
+            (ack.handshake_payload.as_slice(), None)
+        };
+
+        // Process XX msg2 (learns responder's identity and epoch)
+        if let Err(e) = handshake.read_message_2(base_msg2) {
+            debug!(error = %e, "Failed to process Noise XX msg2 in SessionAck");
+            return;
         }
 
-        // Generate XK msg3: write_xk_message_3 (sends encrypted static + epoch)
-        let msg3 = match handshake.write_xk_message_3() {
+        // Decrypt negotiation payload from msg2 if present
+        if let Some(encrypted_neg) = neg_bytes {
+            match handshake.decrypt_payload(encrypted_neg) {
+                Ok(_negotiation) => {
+                    // FSP negotiation payload received — currently unused (version [0,0])
+                }
+                Err(e) => {
+                    debug!(error = %e, "Failed to decrypt negotiation payload from SessionAck");
+                    return;
+                }
+            }
+        }
+
+        // XX: verify responder's identity matches the target we intended to reach.
+        // Compare x-only keys to avoid parity mismatch: npub-derived keys always
+        // have even parity (0x02), but the Noise handshake reveals the real parity.
+        let expected_xonly = entry.remote_pubkey().x_only_public_key().0;
+        if let Some(remote_pk) = handshake.remote_static()
+            && remote_pk.x_only_public_key().0 != expected_xonly
+        {
+            debug!(
+                src = %self.peer_display_name(src_addr),
+                "Responder identity mismatch in SessionAck — disconnecting"
+            );
+            return;
+        }
+
+        // Generate XX msg3 with negotiation payload
+        let mut msg3 = match handshake.write_message_3() {
             Ok(m) => m,
             Err(e) => {
-                debug!(error = %e, "Failed to generate Noise XK msg3");
+                debug!(error = %e, "Failed to generate Noise XX msg3");
                 return;
             }
         };
+
+        // Encrypt FSP negotiation payload for msg3
+        let neg_payload = NegotiationPayload::new(0, 0, 0).encode();
+        match handshake.encrypt_payload(&neg_payload) {
+            Ok(encrypted) => msg3.extend_from_slice(&encrypted),
+            Err(e) => {
+                debug!(error = %e, "Failed to encrypt negotiation payload for SessionMsg3");
+                return;
+            }
+        }
 
         // Send SessionMsg3 (phase 0x3)
         let msg3_wire = SessionMsg3::new(msg3);
@@ -704,7 +760,7 @@ impl Node {
         let session = match handshake.into_session() {
             Ok(s) => s,
             Err(e) => {
-                debug!(error = %e, "Failed to create session after XK msg3");
+                debug!(error = %e, "Failed to create session after XX msg3");
                 return;
             }
         };
@@ -722,10 +778,10 @@ impl Node {
         // Flush any queued outbound packets for this destination
         self.flush_pending_packets(src_addr).await;
 
-        info!(src = %self.peer_display_name(src_addr), "Session established (initiator, XK)");
+        info!(src = %self.peer_display_name(src_addr), "Session established (initiator, XX)");
     }
 
-    /// Handle an incoming SessionMsg3 (Noise XK msg3).
+    /// Handle an incoming SessionMsg3 (Noise XX msg3).
     ///
     /// The initiator reveals their encrypted static key. The responder
     /// processes msg3, learns the initiator's identity, and transitions
@@ -739,11 +795,11 @@ impl Node {
             }
         };
 
-        if msg3.handshake_payload.len() != XK_HANDSHAKE_MSG3_SIZE {
+        if msg3.handshake_payload.len() < HANDSHAKE_MSG3_SIZE {
             debug!(
                 len = msg3.handshake_payload.len(),
-                expected = XK_HANDSHAKE_MSG3_SIZE,
-                "Invalid handshake payload size in SessionMsg3"
+                min = HANDSHAKE_MSG3_SIZE,
+                "Handshake payload too short in SessionMsg3"
             );
             return;
         }
@@ -767,9 +823,9 @@ impl Node {
                 }
             };
 
-            // Process XK msg3
-            if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
-                debug!(error = %e, "Failed to process rekey XK msg3");
+            // Process XX msg3
+            if let Err(e) = handshake.read_message_3(&msg3.handshake_payload) {
+                debug!(error = %e, "Failed to process rekey XX msg3");
                 entry.abandon_rekey();
                 self.sessions.insert(*src_addr, entry);
                 return;
@@ -779,7 +835,7 @@ impl Node {
             let session = match handshake.into_session() {
                 Ok(s) => s,
                 Err(e) => {
-                    debug!(error = %e, "Failed to create session from rekey XK msg3");
+                    debug!(error = %e, "Failed to create session from rekey XX msg3");
                     entry.abandon_rekey();
                     self.sessions.insert(*src_addr, entry);
                     return;
@@ -791,7 +847,7 @@ impl Node {
 
             debug!(
                 src = %self.peer_display_name(src_addr),
-                "FSP rekey: completed XK as responder, pending cutover"
+                "FSP rekey: completed XX as responder, pending cutover"
             );
             return;
         }
@@ -807,17 +863,40 @@ impl Node {
             _ => unreachable!("checked is_awaiting_msg3 above"),
         };
 
-        // Process XK msg3: read_xk_message_3 (extracts initiator's static key and epoch)
-        if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
-            debug!(error = %e, "Failed to process Noise XK msg3");
-            return; // Entry was already removed
+        // Split msg3 into base XX part and optional negotiation payload
+        let (base_msg3, neg_bytes) = if msg3.handshake_payload.len() > HANDSHAKE_MSG3_SIZE {
+            (
+                &msg3.handshake_payload[..HANDSHAKE_MSG3_SIZE],
+                Some(&msg3.handshake_payload[HANDSHAKE_MSG3_SIZE..]),
+            )
+        } else {
+            (msg3.handshake_payload.as_slice(), None)
+        };
+
+        // Process XX msg3 (learns initiator's identity and epoch)
+        if let Err(e) = handshake.read_message_3(base_msg3) {
+            debug!(error = %e, "Failed to process Noise XX msg3");
+            return;
+        }
+
+        // Decrypt negotiation payload from msg3 if present
+        if let Some(encrypted_neg) = neg_bytes {
+            match handshake.decrypt_payload(encrypted_neg) {
+                Ok(_negotiation) => {
+                    // FSP negotiation payload received — currently unused (version [0,0])
+                }
+                Err(e) => {
+                    debug!(error = %e, "Failed to decrypt negotiation payload from SessionMsg3");
+                    return;
+                }
+            }
         }
 
         // Extract the initiator's static public key (now available after msg3)
         let remote_pubkey = match handshake.remote_static() {
             Some(pk) => *pk,
             None => {
-                debug!("No remote static key after processing XK msg3");
+                debug!("No remote static key after processing XX msg3");
                 return;
             }
         };
@@ -829,7 +908,7 @@ impl Node {
         let session = match handshake.into_session() {
             Ok(s) => s,
             Err(e) => {
-                debug!(error = %e, "Failed to create session from XK handshake");
+                debug!(error = %e, "Failed to create session from XX handshake");
                 return;
             }
         };
@@ -852,7 +931,7 @@ impl Node {
         // Flush any pending packets
         self.flush_pending_packets(src_addr).await;
 
-        info!(src = %self.peer_display_name(src_addr), "Session established (responder, XK)");
+        info!(src = %self.peer_display_name(src_addr), "Session established (responder, XX)");
     }
 
     // === Session-layer MMP report handlers ===
@@ -873,6 +952,7 @@ impl Node {
         trace!(
             src = %self.peer_display_name(src_addr),
             cum_pkts = sr.cumulative_packets_sent,
+            interval_pkts = sr.interval_packets_sent,
             interval_bytes = sr.interval_bytes_sent,
             "Received SessionSenderReport"
         );
@@ -1092,7 +1172,7 @@ impl Node {
 
         // Trigger re-discovery to get fresh coordinates, but only if we have
         // the target's identity cached — otherwise we can't verify the
-        // LookupResponse proof. This avoids a race when the XK responder
+        // LookupResponse proof. This avoids a race when the XX responder
         // receives PathBroken before msg3 completes (identity unknown).
         if self.has_cached_identity(&msg.dest_addr) {
             self.maybe_initiate_lookup(&msg.dest_addr).await;
@@ -1161,7 +1241,7 @@ impl Node {
 
     /// Initiate an end-to-end session with a remote node.
     ///
-    /// Creates a Noise XK handshake as initiator, wraps msg1 in a
+    /// Creates a Noise XX handshake as initiator, wraps msg1 in a
     /// SessionSetup, encapsulates in a SessionDatagram, and routes
     /// toward the destination.
     pub(in crate::node) async fn initiate_session(
@@ -1176,15 +1256,15 @@ impl Node {
             return Ok(());
         }
 
-        // Create Noise XK initiator handshake
+        // Create Noise XX initiator handshake
         let our_keypair = self.identity.keypair();
-        let mut handshake = HandshakeState::new_xk_initiator(our_keypair, dest_pubkey);
+        let mut handshake = HandshakeState::new_initiator(our_keypair);
         handshake.set_local_epoch(self.startup_epoch);
         let msg1 = handshake
-            .write_xk_message_1()
+            .write_message_1()
             .map_err(|e| NodeError::SendFailed {
                 node_addr: dest_addr,
-                reason: format!("Noise XK msg1 generation failed: {}", e),
+                reason: format!("Noise XX msg1 generation failed: {}", e),
             })?;
 
         // Build SessionSetup with coordinates
@@ -1249,7 +1329,6 @@ impl Node {
             })?;
         let wants_coords = entry.coords_warmup_remaining() > 0;
         let timestamp = entry.session_timestamp(now_ms);
-        let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
         if !entry.is_established() {
             return Err(NodeError::SendFailed {
                 node_addr: *dest_addr,
@@ -1265,7 +1344,7 @@ impl Node {
 
         // Build inner plaintext (doesn't depend on counter)
         let msg_type = SessionMessageType::DataPacket.to_byte(); // 0x10
-        let inner_flags = FspInnerFlags { spin_bit }.to_byte();
+        let inner_flags = FspInnerFlags::new().to_byte();
         let inner_plaintext =
             fsp_prepend_inner_header(timestamp, msg_type, inner_flags, &port_payload);
 
@@ -1410,10 +1489,8 @@ impl Node {
                 reason: "no session".into(),
             })?;
         let timestamp = entry.session_timestamp(now_ms);
-        let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
 
-        // Build inner flags with spin bit
-        let inner_flags = FspInnerFlags { spin_bit }.to_byte();
+        let inner_flags = FspInnerFlags::new().to_byte();
 
         // Get mutable access for encryption
         let entry = self
@@ -1497,7 +1574,6 @@ impl Node {
                 reason: "no session".into(),
             })?;
         let timestamp = entry.session_timestamp(now_ms);
-        let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
 
         // Get mutable access for encryption
         let entry = self
@@ -1521,7 +1597,7 @@ impl Node {
 
         // FSP inner header only, no body payload
         let msg_type = SessionMessageType::CoordsWarmup.to_byte();
-        let inner_flags = FspInnerFlags { spin_bit }.to_byte();
+        let inner_flags = FspInnerFlags::new().to_byte();
         let inner_plaintext = fsp_prepend_inner_header(timestamp, msg_type, inner_flags, &[]);
 
         // Build FSP header with CP flag
@@ -1739,6 +1815,7 @@ impl Node {
         if original_packet.len() < 40 {
             return;
         }
+        // SAFETY: slice is exactly 16 bytes; length validated above (>= 40)
         let src_addr = Ipv6Addr::from(<[u8; 16]>::try_from(&original_packet[8..24]).unwrap());
 
         // Rate limit ICMP PTB messages per source
@@ -1754,6 +1831,7 @@ impl Node {
         // kernel sees the PTB coming from a remote router, not from itself.
         // Linux ignores PTBs whose source matches a local address, which
         // causes a PMTUD blackhole when both src and ICMP-src are local.
+        // SAFETY: slice is exactly 16 bytes; length validated above (>= 40)
         let dest_addr = Ipv6Addr::from(<[u8; 16]>::try_from(&original_packet[24..40]).unwrap());
         if let Some(response) = build_packet_too_big(original_packet, mtu, dest_addr)
             && let Some(tun_tx) = &self.tun_tx

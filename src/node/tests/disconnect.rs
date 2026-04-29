@@ -253,13 +253,12 @@ async fn test_disconnect_clears_session() {
     let node1_addr = *nodes[1].node.node_addr();
 
     // Inject a synthetic Established session entry into node 1's session table
-    // to simulate the state after a completed XK handshake with node 0.
+    // to simulate the state after a completed XX handshake with node 0.
     let remote_identity = Identity::generate();
     {
         let our_identity = nodes[1].node.identity();
 
-        let mut initiator =
-            HandshakeState::new_initiator(our_identity.keypair(), remote_identity.pubkey_full());
+        let mut initiator = HandshakeState::new_initiator(our_identity.keypair());
         let mut responder = HandshakeState::new_responder(remote_identity.keypair());
         let mut init_epoch = [0u8; 8];
         rand::Rng::fill_bytes(&mut rand::rng(), &mut init_epoch);
@@ -271,6 +270,8 @@ async fn test_disconnect_clears_session() {
         responder.read_message_1(&msg1).unwrap();
         let msg2 = responder.write_message_2().unwrap();
         initiator.read_message_2(&msg2).unwrap();
+        let msg3 = initiator.write_message_3().unwrap();
+        responder.read_message_3(&msg3).unwrap();
         let session = initiator.into_session().unwrap();
 
         let entry = SessionEntry::new(

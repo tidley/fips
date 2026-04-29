@@ -6,6 +6,7 @@
 use crate::bloom::BloomFilter;
 use crate::mmp::{MmpConfig, MmpPeerState};
 use crate::noise::{HandshakeState as NoiseHandshakeState, NoiseError, NoiseSession};
+use crate::protocol::{NegotiationPayload, NodeProfile};
 use crate::transport::{LinkId, LinkStats, TransportAddr, TransportId};
 use crate::tree::{ParentDeclaration, TreeCoordinate};
 use crate::utils::index::SessionIndex;
@@ -134,6 +135,14 @@ pub struct ActivePeer {
     /// Remote peer's startup epoch (from handshake). Used to detect restarts.
     remote_epoch: Option<[u8; 8]>,
 
+    // === Negotiated Profile ===
+    /// Peer's node profile (Full, NonRouting, Leaf).
+    peer_profile: NodeProfile,
+    /// Whether to send sender reports to this peer (our provides_sr AND peer wants_sr).
+    send_sr: bool,
+    /// Whether to send receiver reports to this peer (our provides_rr AND peer wants_rr).
+    send_rr: bool,
+
     // === MMP ===
     /// Per-peer MMP state (None for legacy peers without Noise sessions).
     mmp: Option<MmpPeerState>,
@@ -182,6 +191,11 @@ pub struct ActivePeer {
     rekey_msg1: Option<Vec<u8>>,
     /// In-progress rekey: next resend timestamp (Unix ms).
     rekey_msg1_next_resend: u64,
+    // === Rekey Responder State (XX pattern) ===
+    /// In-progress rekey responder: Noise handshake state awaiting msg3.
+    rekey_responder_handshake: Option<NoiseHandshakeState>,
+    /// In-progress rekey responder: our new session index.
+    rekey_responder_our_index: Option<SessionIndex>,
 }
 
 impl ActivePeer {
@@ -214,6 +228,9 @@ impl ActivePeer {
             authenticated_at,
             last_seen: authenticated_at,
             remote_epoch: None,
+            peer_profile: NodeProfile::Full,
+            send_sr: true,
+            send_rr: true,
             mmp: None,
             last_heartbeat_sent: None,
             handshake_msg2: None,
@@ -233,6 +250,8 @@ impl ActivePeer {
             rekey_our_index: None,
             rekey_msg1: None,
             rekey_msg1_next_resend: 0,
+            rekey_responder_handshake: None,
+            rekey_responder_our_index: None,
         }
     }
 
@@ -269,7 +288,15 @@ impl ActivePeer {
         is_initiator: bool,
         mmp_config: &MmpConfig,
         remote_epoch: Option<[u8; 8]>,
+        our_profile: NodeProfile,
+        peer_profile: NodeProfile,
     ) -> Self {
+        // Compute MMP report gating: A sends to B iff A.provides AND B.wants
+        let our_neg = NegotiationPayload::fmp(0, 0, our_profile);
+        let their_neg = NegotiationPayload::fmp(0, 0, peer_profile);
+        let send_sr = our_neg.provides_sr() && their_neg.wants_sr();
+        let send_rr = our_neg.provides_rr() && their_neg.wants_rr();
+
         let now = Instant::now();
         Self {
             identity,
@@ -294,6 +321,9 @@ impl ActivePeer {
             authenticated_at,
             last_seen: authenticated_at,
             remote_epoch,
+            peer_profile,
+            send_sr,
+            send_rr,
             mmp: Some(MmpPeerState::new(mmp_config, is_initiator)),
             last_heartbeat_sent: None,
             handshake_msg2: None,
@@ -313,6 +343,8 @@ impl ActivePeer {
             rekey_our_index: None,
             rekey_msg1: None,
             rekey_msg1_next_resend: 0,
+            rekey_responder_handshake: None,
+            rekey_responder_our_index: None,
         }
     }
 
@@ -505,6 +537,23 @@ impl ActivePeer {
     /// Get the remote peer's startup epoch (from handshake).
     pub fn remote_epoch(&self) -> Option<[u8; 8]> {
         self.remote_epoch
+    }
+
+    // === Negotiated Profile ===
+
+    /// Get peer's node profile.
+    pub fn peer_profile(&self) -> NodeProfile {
+        self.peer_profile
+    }
+
+    /// Whether to send sender reports to this peer.
+    pub fn send_sr(&self) -> bool {
+        self.send_sr
+    }
+
+    /// Whether to send receiver reports to this peer.
+    pub fn send_rr(&self) -> bool {
+        self.send_rr
     }
 
     // === Tree Accessors ===
@@ -996,12 +1045,16 @@ impl ActivePeer {
         self.rekey_our_index
     }
 
-    /// Complete the rekey by processing msg2 (initiator side).
+    /// Complete the rekey by processing msg2 (initiator side, XX pattern).
     ///
-    /// Takes the stored handshake state, reads msg2, and returns the
-    /// completed NoiseSession. Clears the handshake-related fields but
-    /// leaves rekey_our_index for set_pending_session to use.
-    pub fn complete_rekey_msg2(&mut self, msg2_bytes: &[u8]) -> Result<NoiseSession, NoiseError> {
+    /// Takes the stored handshake state, reads XX msg2, generates XX msg3,
+    /// and returns (msg3_bytes, completed NoiseSession). Clears the
+    /// handshake-related fields but leaves rekey_our_index for
+    /// set_pending_session to use.
+    pub fn complete_rekey_msg2(
+        &mut self,
+        msg2_bytes: &[u8],
+    ) -> Result<(Vec<u8>, NoiseSession), NoiseError> {
         let mut hs = self
             .rekey_handshake
             .take()
@@ -1010,12 +1063,64 @@ impl ActivePeer {
                 got: "no handshake state".to_string(),
             })?;
 
-        hs.read_message_2(msg2_bytes)?;
+        // Split msg2 into base XX part and any extra (negotiation payload)
+        let base_size = crate::noise::HANDSHAKE_MSG2_SIZE;
+        let (base_msg2, extra) = if msg2_bytes.len() > base_size {
+            (&msg2_bytes[..base_size], Some(&msg2_bytes[base_size..]))
+        } else {
+            (msg2_bytes, None)
+        };
+
+        hs.read_message_2(base_msg2)?;
+
+        // Must decrypt negotiation payload (if present) to keep hash chain
+        // in sync, even though rekey doesn't use the negotiation result.
+        if let Some(encrypted_neg) = extra {
+            let _ = hs.decrypt_payload(encrypted_neg)?;
+        }
+
+        let msg3 = hs.write_message_3()?;
         let session = hs.into_session()?;
 
         // Clear msg1 resend state
         self.rekey_msg1 = None;
         self.rekey_msg1_next_resend = 0;
+
+        Ok((msg3, session))
+    }
+
+    /// Complete the rekey by processing msg3 (responder side, XX pattern).
+    ///
+    /// Takes the stored responder handshake state, reads XX msg3, and returns
+    /// the completed NoiseSession.
+    pub fn complete_rekey_msg3(&mut self, msg3_bytes: &[u8]) -> Result<NoiseSession, NoiseError> {
+        let mut hs =
+            self.rekey_responder_handshake
+                .take()
+                .ok_or_else(|| NoiseError::WrongState {
+                    expected: "rekey responder handshake awaiting msg3".to_string(),
+                    got: "no responder handshake state".to_string(),
+                })?;
+
+        // Split msg3 into base XX part and any extra (negotiation payload)
+        let base_size = crate::noise::HANDSHAKE_MSG3_SIZE;
+        let (base_msg3, extra) = if msg3_bytes.len() > base_size {
+            (&msg3_bytes[..base_size], Some(&msg3_bytes[base_size..]))
+        } else {
+            (msg3_bytes, None)
+        };
+
+        hs.read_message_3(base_msg3)?;
+
+        // Must decrypt negotiation payload (if present) to keep hash chain
+        // in sync, even though rekey doesn't use the negotiation result.
+        if let Some(encrypted_neg) = extra {
+            let _ = hs.decrypt_payload(encrypted_neg)?;
+        }
+
+        let session = hs.into_session()?;
+
+        self.rekey_responder_our_index = None;
 
         Ok(session)
     }
@@ -1033,6 +1138,37 @@ impl ActivePeer {
     /// Update next resend timestamp.
     pub fn set_msg1_next_resend(&mut self, next_ms: u64) {
         self.rekey_msg1_next_resend = next_ms;
+    }
+
+    // === Rekey Responder State (XX pattern) ===
+
+    /// Whether this peer has a rekey responder handshake awaiting msg3.
+    pub fn has_rekey_responder_handshake(&self) -> bool {
+        self.rekey_responder_handshake.is_some()
+    }
+
+    /// Get the rekey responder our_index.
+    pub fn rekey_responder_our_index(&self) -> Option<SessionIndex> {
+        self.rekey_responder_our_index
+    }
+
+    /// Store rekey responder handshake state after sending msg2.
+    ///
+    /// Called when processing a rekey msg1 from the peer. The handshake
+    /// state is held here until msg3 arrives to complete the rekey.
+    pub fn set_rekey_responder_state(
+        &mut self,
+        handshake: NoiseHandshakeState,
+        our_index: SessionIndex,
+    ) {
+        self.rekey_responder_handshake = Some(handshake);
+        self.rekey_responder_our_index = Some(our_index);
+    }
+
+    /// Clear rekey responder state (on failure or abandonment).
+    pub fn clear_rekey_responder(&mut self) {
+        self.rekey_responder_handshake = None;
+        self.rekey_responder_our_index = None;
     }
 }
 

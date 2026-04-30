@@ -72,28 +72,55 @@ async fn perform_stun(
     stun_server: &str,
 ) -> Result<Option<SocketAddr>, BootstrapError> {
     let endpoint = parse_stun_url(stun_server)?;
-    let txn_id = random_txn_id();
-    let request = create_stun_binding_request(txn_id);
-    let addr = resolve_udp_target(&endpoint.host, endpoint.port)
-        .await?
-        .ok_or_else(|| BootstrapError::Stun(format!("no address for {}", stun_server)))?;
+    let local_addr = socket.local_addr()?;
+    let targets = compatible_udp_targets(
+        local_addr,
+        resolve_udp_targets(&endpoint.host, endpoint.port).await?,
+    );
+    if targets.is_empty() {
+        return Err(BootstrapError::Stun(format!(
+            "no address compatible with local socket {} for {}",
+            local_addr, stun_server
+        )));
+    }
+
     let udp = UdpSocket::from_std(socket.try_clone()?)?;
-    udp.send_to(&request, addr).await?;
     let mut buf = [0u8; 2048];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let result = tokio::time::timeout_at(deadline, udp.recv_from(&mut buf)).await;
-        let Ok(Ok((len, _remote))) = result else {
-            break;
-        };
-        if let Some(mapped) = parse_stun_binding_success(&buf[..len], &txn_id) {
-            return Ok(Some(mapped));
+    let mut last_error = None;
+
+    for addr in targets {
+        let txn_id = random_txn_id();
+        let request = create_stun_binding_request(txn_id);
+        if let Err(err) = udp.send_to(&request, addr).await {
+            last_error = Some(BootstrapError::Io(err));
+            continue;
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout_at(deadline, udp.recv_from(&mut buf)).await {
+                Ok(Ok((len, _remote))) => {
+                    if let Some(mapped) = parse_stun_binding_success(&buf[..len], &txn_id) {
+                        return Ok(Some(mapped));
+                    }
+                }
+                Ok(Err(err)) => {
+                    last_error = Some(BootstrapError::Io(err));
+                    break;
+                }
+                Err(_) => {
+                    last_error = Some(BootstrapError::Stun(format!(
+                        "timed out waiting for {} via {}",
+                        stun_server, addr
+                    )));
+                    break;
+                }
+            }
         }
     }
-    Err(BootstrapError::Stun(format!(
-        "timed out waiting for {}",
-        stun_server
-    )))
+
+    Err(last_error
+        .unwrap_or_else(|| BootstrapError::Stun(format!("no address for {}", stun_server))))
 }
 
 pub(super) fn parse_stun_url(input: &str) -> Result<StunEndpoint, BootstrapError> {
@@ -222,17 +249,28 @@ fn parse_xor_mapped_address(value: &[u8], txn_id: &[u8; 12]) -> Option<SocketAdd
     }
 }
 
-async fn resolve_udp_target(host: &str, port: u16) -> Result<Option<SocketAddr>, BootstrapError> {
+async fn resolve_udp_targets(host: &str, port: u16) -> Result<Vec<SocketAddr>, BootstrapError> {
     let normalized_host = host
         .strip_prefix('[')
         .and_then(|trimmed| trimmed.strip_suffix(']'))
         .unwrap_or(host);
 
     if let Ok(ip) = normalized_host.parse::<IpAddr>() {
-        return Ok(Some(SocketAddr::new(ip, port)));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    let mut results = lookup_host((normalized_host, port)).await?;
-    Ok(results.next())
+    Ok(lookup_host((normalized_host, port)).await?.collect())
+}
+
+fn compatible_udp_targets(
+    local_addr: SocketAddr,
+    targets: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    targets
+        .into_iter()
+        .filter(|target| {
+            (local_addr.is_ipv4() && target.is_ipv4()) || (local_addr.is_ipv6() && target.is_ipv6())
+        })
+        .collect()
 }
 
 fn local_addresses_from_port(port: u16) -> Vec<String> {
@@ -354,8 +392,8 @@ fn random_txn_id() -> [u8; 12] {
 
 #[cfg(test)]
 mod tests {
-    use super::is_private_overlay_candidate_ip;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use super::{compatible_udp_targets, is_private_overlay_candidate_ip};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]
     fn private_overlay_candidate_filter_includes_rfc1918_and_ula() {
@@ -387,5 +425,22 @@ mod tests {
         assert!(!is_private_overlay_candidate_ip(IpAddr::V6(
             "2001:db8::1".parse::<Ipv6Addr>().unwrap()
         )));
+    }
+
+    #[test]
+    fn compatible_udp_targets_match_bound_socket_family() {
+        let targets = vec![
+            "[2001:db8::1]:3478".parse::<SocketAddr>().unwrap(),
+            "192.0.2.1:3478".parse::<SocketAddr>().unwrap(),
+        ];
+
+        assert_eq!(
+            compatible_udp_targets("0.0.0.0:12345".parse().unwrap(), targets.clone()),
+            vec!["192.0.2.1:3478".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            compatible_udp_targets("[::]:12345".parse().unwrap(), targets),
+            vec!["[2001:db8::1]:3478".parse::<SocketAddr>().unwrap()]
+        );
     }
 }

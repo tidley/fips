@@ -600,13 +600,18 @@ impl NostrDiscovery {
     }
 
     async fn subscribe(&self) -> Result<(), BootstrapError> {
+        let signal_since = Timestamp::from(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(self.config.signal_ttl_secs.max(1)),
+        );
         self.client
             .subscribe_to(
                 self.config.dm_relays.clone(),
                 Filter::new()
                     .kind(Kind::Custom(SIGNAL_KIND))
                     .pubkey(self.pubkey)
-                    .limit(0),
+                    .since(signal_since),
                 None,
             )
             .await
@@ -994,6 +999,12 @@ impl NostrDiscovery {
                 return Err(err);
             }
         };
+        debug!(
+            peer = %short_npub(&peer_config.npub),
+            relays = relays.len(),
+            event = %short_id(&request_event.id.to_string()),
+            "private assist: request sent"
+        );
 
         let grant = match tokio::time::timeout(
             Duration::from_secs(self.config.peer_assist.grant_ttl_secs),
@@ -1022,6 +1033,12 @@ impl NostrDiscovery {
             &grant.sender_npub,
             &self.npub,
         )?;
+        debug!(
+            peer = %short_npub(&peer_config.npub),
+            accepted = grant.payload.accepted,
+            reason = %grant.payload.reason.as_deref().unwrap_or("-"),
+            "private assist: grant received"
+        );
         if !grant.payload.accepted {
             return Err(BootstrapError::Protocol(
                 grant
@@ -1094,6 +1111,13 @@ impl NostrDiscovery {
             &observed.sender_npub,
             &self.npub,
         )?;
+        debug!(
+            peer = %short_npub(&peer_config.npub),
+            accepted = observed.payload.accepted,
+            reason = %observed.payload.reason.as_deref().unwrap_or("-"),
+            observed = %observed.payload.observed_address.as_ref().map(|addr| format!("{}:{}", addr.ip, addr.port)).unwrap_or_else(|| "-".to_string()),
+            "private assist: observed endpoint received"
+        );
         if !observed.payload.accepted {
             return Err(BootstrapError::Protocol(
                 observed
@@ -1265,13 +1289,26 @@ impl NostrDiscovery {
         self.mark_session_seen(&request.request_id).await?;
 
         let relays = self.preferred_signal_relays(sender, None).await?;
+        debug!(
+            requester = %short_npub(&sender_npub),
+            relays = relays.len(),
+            "private assist: request received"
+        );
         if !self.config.peer_assist.helper_enabled() {
+            debug!(
+                requester = %short_npub(&sender_npub),
+                "private assist: rejecting request: disabled"
+            );
             self.send_assist_rejection(&relays, sender, &request, "peer-assist disabled")
                 .await?;
             return Ok(());
         }
 
         if !self.requester_allowed(&sender_npub).await {
+            debug!(
+                requester = %short_npub(&sender_npub),
+                "private assist: rejecting request: requester not allowed"
+            );
             self.send_assist_rejection(
                 &relays,
                 sender,
@@ -1283,6 +1320,10 @@ impl NostrDiscovery {
         }
 
         let Some(helper_addr) = self.peer_assist.first_helper_endpoint().await else {
+            debug!(
+                requester = %short_npub(&sender_npub),
+                "private assist: rejecting request: no eligible helper transport"
+            );
             self.send_assist_rejection(&relays, sender, &request, "no eligible helper transport")
                 .await?;
             return Ok(());
@@ -1312,6 +1353,10 @@ impl NostrDiscovery {
             )
             .await
         {
+            debug!(
+                requester = %short_npub(&sender_npub),
+                "private assist: rejecting request: helper at capacity"
+            );
             self.send_assist_rejection(
                 &relays,
                 sender,
@@ -1341,6 +1386,12 @@ impl NostrDiscovery {
             self.peer_assist.remove_private_grant(&grant_id).await;
             return Err(err);
         }
+        debug!(
+            requester = %short_npub(&sender_npub),
+            helper = %helper_addr,
+            relays = relays.len(),
+            "private assist: grant sent"
+        );
         Ok(())
     }
 

@@ -1358,6 +1358,7 @@ impl Node {
 
         let mut endpoints = Vec::new();
         let mut has_udp_nat = false;
+        let has_private_helper_endpoint = !self.peer_assist_endpoints.is_empty();
 
         for handle in self.transports.values() {
             if !handle.is_operational() {
@@ -1381,7 +1382,17 @@ impl Node {
                                 addr: addr.to_string(),
                             });
                         }
-                    } else {
+                    } else if !self.config.node.discovery.nostr.stun_servers.is_empty()
+                        || (self
+                            .config
+                            .node
+                            .discovery
+                            .nostr
+                            .peer_assist
+                            .helper_enabled()
+                            && cfg.peer_assist_enabled()
+                            && has_private_helper_endpoint)
+                    {
                         endpoints.push(OverlayEndpointAdvert {
                             transport: OverlayTransportKind::Udp,
                             addr: "nat".to_string(),
@@ -1447,7 +1458,7 @@ impl Node {
                 .discovery
                 .nostr
                 .peer_assist
-                .private_enabled()
+                .helper_enabled()
             || self.config.node.discovery.nostr.stun_servers.is_empty()
         {
             return;
@@ -1735,10 +1746,10 @@ impl Node {
             .transport_config
             .as_ref()
             .is_some_and(|cfg| cfg.peer_assist_enabled())
-            && let Some(public_endpoint) = traversal.public_endpoint
+            && let Some(observed_endpoint) = traversal.observed_endpoint
         {
             self.peer_assist_endpoints
-                .insert(transport_id, public_endpoint);
+                .insert(transport_id, observed_endpoint);
         }
         #[cfg(feature = "nostr-discovery")]
         if let Some(runtime) = self.nostr_discovery.clone()

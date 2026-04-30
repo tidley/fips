@@ -1,6 +1,12 @@
 use nostr::prelude::{EventBuilder, Kind, Tag, Timestamp};
 
-use super::runtime::{NostrDiscovery, allow_in_rate_window};
+use crate::Identity;
+use crate::config::{
+    NostrDiscoveryConfig, PeerAssistDialMode, PeerAssistRequestPolicy, PeerConfig,
+};
+
+use super::assist::{RATE_LIMIT_MAX_KEYS, allow_in_rate_window};
+use super::runtime::NostrDiscovery;
 use super::signal::{
     build_peer_assist_probe, build_signal_event, create_assist_grant, create_assist_observed,
     create_assist_request, create_traversal_answer, create_traversal_offer,
@@ -10,7 +16,7 @@ use super::signal::{
 };
 use super::stun::{parse_stun_binding_success, parse_stun_url};
 use super::traversal::{
-    PunchStrategy, build_punch_packet, parse_punch_packet, plan_punch_targets,
+    PunchStrategy, build_punch_packet, now_ms, parse_punch_packet, plan_punch_targets,
     planned_remote_endpoints, session_hash,
 };
 use super::{
@@ -740,6 +746,61 @@ fn rate_window_resets_after_expiry() {
 }
 
 #[test]
+fn rate_window_rejects_zero_limit_without_tracking_sender() {
+    let mut windows = std::collections::HashMap::new();
+
+    assert!(!allow_in_rate_window(
+        &mut windows,
+        "npub1sender",
+        1_000,
+        60_000,
+        0,
+    ));
+    assert!(windows.is_empty());
+}
+
+#[test]
+fn rate_window_prunes_expired_keys_and_bounds_sender_count() {
+    let mut windows = std::collections::HashMap::new();
+
+    assert!(allow_in_rate_window(
+        &mut windows,
+        "npub1expired",
+        1_000,
+        1_000,
+        1,
+    ));
+    assert!(allow_in_rate_window(
+        &mut windows,
+        "npub1fresh",
+        3_000,
+        1_000,
+        1,
+    ));
+    assert!(!windows.contains_key("npub1expired"));
+
+    for i in 0..RATE_LIMIT_MAX_KEYS {
+        assert!(allow_in_rate_window(
+            &mut windows,
+            &format!("npub1sender{i}"),
+            4_000 + i as u64,
+            60_000,
+            1,
+        ));
+    }
+    assert!(windows.len() <= RATE_LIMIT_MAX_KEYS);
+    assert!(allow_in_rate_window(
+        &mut windows,
+        "npub1new",
+        10_000,
+        60_000,
+        1,
+    ));
+    assert!(windows.len() <= RATE_LIMIT_MAX_KEYS);
+    assert!(windows.contains_key("npub1new"));
+}
+
+#[test]
 fn plans_reflexive_targets_before_lan() {
     let planned = plan_punch_targets(
         &[addr("192.168.1.10", 62000)],
@@ -822,4 +883,205 @@ async fn signal_events_use_current_timestamps() {
 
     assert!(created_at >= before);
     assert!(created_at <= after);
+}
+
+#[tokio::test]
+async fn local_advert_removal_retracts_previous_advert() {
+    let identity = Identity::generate();
+    let config = NostrDiscoveryConfig {
+        enabled: true,
+        advert_relays: vec!["wss://relay.example".to_string()],
+        ..Default::default()
+    };
+    let runtime = NostrDiscovery::new_for_test(&identity, config);
+    let advert = OverlayAdvert {
+        identifier: ADVERT_IDENTIFIER.to_string(),
+        version: ADVERT_VERSION,
+        endpoints: vec![OverlayEndpointAdvert {
+            transport: OverlayTransportKind::Tcp,
+            addr: "203.0.113.10:443".to_string(),
+        }],
+        signal_relays: None,
+        stun_servers: None,
+    };
+
+    runtime
+        .update_local_advert(Some(advert))
+        .await
+        .expect("initial advert should publish");
+    let published = runtime
+        .current_advert_event_id_for_test()
+        .await
+        .expect("publish should track current advert")
+        .to_string();
+
+    runtime
+        .update_local_advert(None)
+        .await
+        .expect("removing local advert should retract previous event");
+
+    assert!(runtime.current_advert_event_id_for_test().await.is_none());
+    assert_eq!(runtime.drain_test_deletes().await, vec![vec![published]]);
+}
+
+#[tokio::test]
+async fn peer_assist_helper_rejects_when_no_helper_transport_available() {
+    let helper_identity = Identity::generate();
+    let requester_identity = Identity::generate();
+    let requester_keys =
+        nostr::Keys::parse(&hex::encode(requester_identity.keypair().secret_bytes()))
+            .expect("parse requester nostr keys");
+
+    let mut config = NostrDiscoveryConfig {
+        enabled: true,
+        dm_relays: vec!["wss://relay.example".to_string()],
+        ..Default::default()
+    };
+    config.peer_assist.helper.enabled = true;
+    config.peer_assist.helper.request_policy = PeerAssistRequestPolicy::OpenRateLimited;
+
+    let runtime = NostrDiscovery::new_for_test(&helper_identity, config);
+    let request = create_assist_request(
+        "assist-no-helper".to_string(),
+        now_ms(),
+        60_000,
+        "request-no-helper".to_string(),
+        requester_identity.npub(),
+        helper_identity.npub(),
+    );
+
+    runtime
+        .clone()
+        .handle_incoming_assist_request_for_test(
+            request,
+            requester_keys.public_key(),
+            requester_identity.npub(),
+        )
+        .await
+        .expect("request should be rejected explicitly");
+
+    let grant = runtime
+        .drain_test_signals()
+        .await
+        .into_iter()
+        .find_map(|payload| serde_json::from_str::<super::AssistGrant>(&payload).ok())
+        .expect("helper should publish rejection grant");
+    assert!(!grant.accepted);
+    assert_eq!(
+        grant.reason.as_deref(),
+        Some("no eligible helper transport")
+    );
+}
+
+#[tokio::test]
+async fn peer_assist_allowlisted_requesters_are_still_rate_limited() {
+    let helper_identity = Identity::generate();
+    let requester_identity = Identity::generate();
+    let requester_npub = requester_identity.npub();
+    let requester_keys =
+        nostr::Keys::parse(&hex::encode(requester_identity.keypair().secret_bytes()))
+            .expect("parse requester nostr keys");
+
+    let mut config = NostrDiscoveryConfig {
+        enabled: true,
+        dm_relays: vec!["wss://relay.example".to_string()],
+        ..Default::default()
+    };
+    config.peer_assist.helper.enabled = true;
+    config.peer_assist.helper.request_policy = PeerAssistRequestPolicy::Allowlist;
+    config.peer_assist.helper.request_allowlist = vec![requester_npub.clone()];
+    config.peer_assist.helper.max_requests_per_peer_per_window = 1;
+    config.peer_assist.helper.request_window_secs = 60;
+
+    let runtime = NostrDiscovery::new_for_test(&helper_identity, config);
+    runtime
+        .update_private_helper_endpoints(vec!["127.0.0.1:12345".parse().unwrap()])
+        .await;
+
+    for request_id in ["assist-allowed-1", "assist-allowed-2"] {
+        let request = create_assist_request(
+            request_id.to_string(),
+            now_ms(),
+            60_000,
+            format!("{request_id}-nonce"),
+            requester_npub.clone(),
+            helper_identity.npub(),
+        );
+        runtime
+            .clone()
+            .handle_incoming_assist_request_for_test(
+                request,
+                requester_keys.public_key(),
+                requester_npub.clone(),
+            )
+            .await
+            .expect("request should be handled");
+    }
+
+    let grants = runtime
+        .drain_test_signals()
+        .await
+        .into_iter()
+        .filter_map(|payload| serde_json::from_str::<super::AssistGrant>(&payload).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(grants.len(), 2);
+    assert!(grants[0].accepted);
+    assert!(!grants[1].accepted);
+}
+
+#[tokio::test]
+async fn fallback_private_tries_peer_assist_after_normal_traversal_timeout() {
+    let local_identity = Identity::generate();
+    let peer_identity = Identity::generate();
+    let peer_npub = peer_identity.npub();
+
+    let mut config = NostrDiscoveryConfig {
+        enabled: true,
+        signal_ttl_secs: 1,
+        stun_servers: vec!["invalid-stun-url".to_string()],
+        dm_relays: vec!["wss://relay.example".to_string()],
+        ..Default::default()
+    };
+    config.peer_assist.dial_mode = PeerAssistDialMode::FallbackPrivate;
+    config.peer_assist.grant_ttl_secs = 1;
+
+    let runtime = NostrDiscovery::new_for_test(&local_identity, config);
+    runtime
+        .inject_advert_for_test(
+            peer_npub.clone(),
+            OverlayAdvert {
+                identifier: ADVERT_IDENTIFIER.to_string(),
+                version: ADVERT_VERSION,
+                endpoints: vec![OverlayEndpointAdvert {
+                    transport: OverlayTransportKind::Udp,
+                    addr: "nat".to_string(),
+                }],
+                signal_relays: Some(vec!["wss://relay.example".to_string()]),
+                stun_servers: Some(vec!["stun:example.invalid:3478".to_string()]),
+            },
+        )
+        .await;
+
+    let result = runtime
+        .connect_peer_for_test(PeerConfig {
+            npub: peer_npub,
+            via_nostr: true,
+            ..Default::default()
+        })
+        .await;
+    assert!(result.is_err());
+
+    let signals = runtime.drain_test_signals().await;
+    assert!(
+        signals
+            .iter()
+            .any(|payload| serde_json::from_str::<super::TraversalOffer>(payload).is_ok()),
+        "normal traversal should send an offer first"
+    );
+    assert!(
+        signals
+            .iter()
+            .any(|payload| serde_json::from_str::<super::AssistRequest>(payload).is_ok()),
+        "fallback_private should send a peer-assist request after normal traversal fails"
+    );
 }

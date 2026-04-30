@@ -34,9 +34,9 @@ use thiserror::Error;
 pub use gateway::{ConntrackConfig, GatewayConfig, GatewayDnsConfig, PortForward, Proto};
 pub use node::{
     BloomConfig, BuffersConfig, CacheConfig, ControlConfig, DiscoveryConfig, LimitsConfig,
-    NodeConfig, NostrDiscoveryConfig, NostrDiscoveryPolicy, PeerAssistConfig, PeerAssistMode,
-    PeerAssistRequestPolicy, RateLimitConfig, RekeyConfig, RetryConfig, SessionConfig,
-    SessionMmpConfig, TreeConfig,
+    NodeConfig, NostrDiscoveryConfig, NostrDiscoveryPolicy, PeerAssistConfig, PeerAssistDialMode,
+    PeerAssistHelperConfig, PeerAssistMode, PeerAssistRequestPolicy, RateLimitConfig, RekeyConfig,
+    RetryConfig, SessionConfig, SessionMmpConfig, TreeConfig,
 };
 pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
 pub use transport::{
@@ -602,6 +602,9 @@ impl Config {
             .udp
             .iter()
             .any(|(_, cfg)| cfg.advertise_on_nostr() && !cfg.is_public());
+        let has_peer_assist_udp_helper = self.transports.udp.iter().any(|(_, cfg)| {
+            cfg.advertise_on_nostr() && !cfg.is_public() && cfg.peer_assist_enabled()
+        });
 
         if nostr.enabled && has_nat_udp_advert {
             if nostr.dm_relays.is_empty() {
@@ -609,10 +612,17 @@ impl Config {
                     "NAT UDP advert publishing requires `node.discovery.nostr.dm_relays` to be non-empty".to_string(),
                 ));
             }
-            if nostr.stun_servers.is_empty() && !nostr.peer_assist.private_enabled() {
-                return Err(ConfigError::Validation(
-                    "NAT UDP advert publishing requires `node.discovery.nostr.stun_servers` or private peer assist to be enabled".to_string(),
-                ));
+            if nostr.stun_servers.is_empty() {
+                if !nostr.peer_assist.helper_enabled() {
+                    return Err(ConfigError::Validation(
+                        "NAT UDP advert publishing requires `node.discovery.nostr.stun_servers` or peer-assist helper mode to be enabled".to_string(),
+                    ));
+                }
+                if !has_peer_assist_udp_helper {
+                    return Err(ConfigError::Validation(
+                        "NAT UDP advert publishing without STUN requires at least one advertised private UDP transport with `peer_assist = true`".to_string(),
+                    ));
+                }
             }
         }
 
@@ -1200,6 +1210,8 @@ node:
       advertise: false
       policy: configured_only
       open_discovery_max_pending: 12
+      max_offers_per_peer_per_window: 7
+      offer_window_secs: 19
       app: "fips.nat.test.v1"
       signal_ttl_secs: 45
       advert_relays:
@@ -1208,6 +1220,17 @@ node:
         - "wss://relay-b.example"
       stun_servers:
         - "stun:stun.example.org:3478"
+      peer_assist:
+        dial_mode: prefer_private
+        grant_ttl_secs: 23
+        helper:
+          enabled: true
+          request_policy: open_rate_limited
+          request_allowlist:
+            - "npub1helper"
+          max_pending_requests: 11
+          max_requests_per_peer_per_window: 13
+          request_window_secs: 17
 peers:
   - npub: "npub1peer"
     via_nostr: true
@@ -1226,6 +1249,11 @@ peers:
         );
         assert_eq!(config.node.discovery.nostr.open_discovery_max_pending, 12);
         assert_eq!(
+            config.node.discovery.nostr.max_offers_per_peer_per_window,
+            7
+        );
+        assert_eq!(config.node.discovery.nostr.offer_window_secs, 19);
+        assert_eq!(
             config.node.discovery.nostr.advert_relays,
             vec!["wss://relay-a.example".to_string()]
         );
@@ -1238,10 +1266,177 @@ peers:
             vec!["stun:stun.example.org:3478".to_string()]
         );
         assert_eq!(
+            config.node.discovery.nostr.peer_assist.dial_mode,
+            PeerAssistDialMode::PreferPrivate
+        );
+        assert_eq!(config.node.discovery.nostr.peer_assist.grant_ttl_secs, 23);
+        assert!(config.node.discovery.nostr.peer_assist.helper.enabled);
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .request_policy,
+            PeerAssistRequestPolicy::OpenRateLimited
+        );
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .request_allowlist,
+            vec!["npub1helper".to_string()]
+        );
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .max_pending_requests,
+            11
+        );
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .max_requests_per_peer_per_window,
+            13
+        );
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .request_window_secs,
+            17
+        );
+        assert_eq!(
             config.peers[0].addresses[0].addr, "nat",
             "udp:nat address should parse without special-casing in YAML"
         );
         assert!(config.peers[0].via_nostr);
+    }
+
+    #[test]
+    fn test_peer_assist_helper_partial_defaults_fail_closed() {
+        let yaml = r#"
+node:
+  discovery:
+    nostr:
+      peer_assist:
+        helper:
+          enabled: true
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(config.node.discovery.nostr.peer_assist.helper.enabled);
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .request_policy,
+            PeerAssistRequestPolicy::Allowlist
+        );
+        assert!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .request_allowlist
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_peer_assist_legacy_flat_config_deserializes() {
+        let yaml = r#"
+node:
+  discovery:
+    nostr:
+      peer_assist:
+        mode: fallback_private
+        request_policy: allowlist
+        request_allowlist:
+          - "npub1legacy"
+        max_pending_requests: 3
+        grant_ttl_secs: 4
+        max_requests_per_peer_per_window: 5
+        request_window_secs: 6
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(
+            config.node.discovery.nostr.peer_assist.dial_mode,
+            PeerAssistDialMode::FallbackPrivate
+        );
+        assert!(config.node.discovery.nostr.peer_assist.helper.enabled);
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .request_policy,
+            PeerAssistRequestPolicy::Allowlist
+        );
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .request_allowlist,
+            vec!["npub1legacy".to_string()]
+        );
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .max_pending_requests,
+            3
+        );
+        assert_eq!(config.node.discovery.nostr.peer_assist.grant_ttl_secs, 4);
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .max_requests_per_peer_per_window,
+            5
+        );
+        assert_eq!(
+            config
+                .node
+                .discovery
+                .nostr
+                .peer_assist
+                .helper
+                .request_window_secs,
+            6
+        );
     }
 
     #[test]
@@ -1323,5 +1518,19 @@ peers:
         config.node.discovery.nostr.stun_servers.clear();
         let err = config.validate().expect_err("validation should fail");
         assert!(err.to_string().contains("stun_servers"));
+
+        config.node.discovery.nostr.peer_assist.helper.enabled = true;
+        let err = config.validate().expect_err("validation should fail");
+        assert!(err.to_string().contains("peer_assist"));
+
+        config.transports.udp = TransportInstances::Single(UdpConfig {
+            advertise_on_nostr: Some(true),
+            public: Some(false),
+            peer_assist: Some(true),
+            ..Default::default()
+        });
+        config
+            .validate()
+            .expect("helper transport should allow deferred no-STUN NAT adverts");
     }
 }

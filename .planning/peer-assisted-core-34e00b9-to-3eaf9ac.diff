@@ -1,0 +1,2866 @@
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index 1c911b1..5ca317b 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -34,8 +34,9 @@ use thiserror::Error;
+ pub use gateway::{ConntrackConfig, GatewayConfig, GatewayDnsConfig, PortForward, Proto};
+ pub use node::{
+     BloomConfig, BuffersConfig, CacheConfig, ControlConfig, DiscoveryConfig, LimitsConfig,
+-    NodeConfig, NostrDiscoveryConfig, NostrDiscoveryPolicy, RateLimitConfig, RekeyConfig,
+-    RetryConfig, SessionConfig, SessionMmpConfig, TreeConfig,
++    NodeConfig, NostrDiscoveryConfig, NostrDiscoveryPolicy, PeerAssistConfig, PeerAssistMode,
++    PeerAssistRequestPolicy, RateLimitConfig, RekeyConfig, RetryConfig, SessionConfig,
++    SessionMmpConfig, TreeConfig,
+ };
+ pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
+ pub use transport::{
+@@ -593,9 +594,9 @@ impl Config {
+                     "NAT UDP advert publishing requires `node.discovery.nostr.dm_relays` to be non-empty".to_string(),
+                 ));
+             }
+-            if nostr.stun_servers.is_empty() {
++            if nostr.stun_servers.is_empty() && !nostr.peer_assist.private_enabled() {
+                 return Err(ConfigError::Validation(
+-                    "NAT UDP advert publishing requires `node.discovery.nostr.stun_servers` to be non-empty".to_string(),
++                    "NAT UDP advert publishing requires `node.discovery.nostr.stun_servers` or private peer assist to be enabled".to_string(),
+                 ));
+             }
+         }
+@@ -1243,13 +1244,24 @@ peers:
+ 
+     #[test]
+     fn test_validate_peer_via_nostr_requires_nostr_enabled() {
+-        let mut config = Config::default();
+-        config.peers = vec![PeerConfig {
+-            npub: "npub1peer".to_string(),
+-            via_nostr: true,
++        let config = Config {
++            peers: vec![PeerConfig {
++                npub: "npub1peer".to_string(),
++                via_nostr: true,
++                ..Default::default()
++            }],
++            node: NodeConfig {
++                discovery: DiscoveryConfig {
++                    nostr: NostrDiscoveryConfig {
++                        enabled: false,
++                        ..Default::default()
++                    },
++                    ..Default::default()
++                },
++                ..Default::default()
++            },
+             ..Default::default()
+-        }];
+-        config.node.discovery.nostr.enabled = false;
++        };
+ 
+         let err = config.validate().expect_err("validation should fail");
+         assert!(err.to_string().contains("via_nostr"));
+@@ -1258,11 +1270,13 @@ peers:
+     #[test]
+     fn test_validate_peer_addresses_required_unless_via_nostr() {
+         // Empty addresses + via_nostr=false → error.
+-        let mut config = Config::default();
+-        config.peers = vec![PeerConfig {
+-            npub: "npub1peer".to_string(),
++        let mut config = Config {
++            peers: vec![PeerConfig {
++                npub: "npub1peer".to_string(),
++                ..Default::default()
++            }],
+             ..Default::default()
+-        }];
++        };
+         let err = config.validate().expect_err("validation should fail");
+         assert!(err.to_string().contains("at least one address"));
+ 
+diff --git a/src/config/node.rs b/src/config/node.rs
+index 619e098..c7453f3 100644
+--- a/src/config/node.rs
++++ b/src/config/node.rs
+@@ -275,6 +275,81 @@ pub enum NostrDiscoveryPolicy {
+     Open,
+ }
+ 
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum PeerAssistMode {
++    #[default]
++    Disabled,
++    FallbackPrivate,
++    PreferPrivate,
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum PeerAssistRequestPolicy {
++    #[default]
++    OpenRateLimited,
++    Allowlist,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct PeerAssistConfig {
++    #[serde(default)]
++    pub mode: PeerAssistMode,
++    #[serde(default)]
++    pub request_policy: PeerAssistRequestPolicy,
++    #[serde(default)]
++    pub request_allowlist: Vec<String>,
++    #[serde(default = "PeerAssistConfig::default_max_pending_requests")]
++    pub max_pending_requests: usize,
++    #[serde(default = "PeerAssistConfig::default_grant_ttl_secs")]
++    pub grant_ttl_secs: u64,
++    #[serde(default = "PeerAssistConfig::default_max_requests_per_peer_per_window")]
++    pub max_requests_per_peer_per_window: usize,
++    #[serde(default = "PeerAssistConfig::default_request_window_secs")]
++    pub request_window_secs: u64,
++}
++
++impl Default for PeerAssistConfig {
++    fn default() -> Self {
++        Self {
++            mode: PeerAssistMode::Disabled,
++            request_policy: PeerAssistRequestPolicy::OpenRateLimited,
++            request_allowlist: Vec::new(),
++            max_pending_requests: Self::default_max_pending_requests(),
++            grant_ttl_secs: Self::default_grant_ttl_secs(),
++            max_requests_per_peer_per_window: Self::default_max_requests_per_peer_per_window(),
++            request_window_secs: Self::default_request_window_secs(),
++        }
++    }
++}
++
++impl PeerAssistConfig {
++    fn default_max_pending_requests() -> usize {
++        64
++    }
++
++    fn default_grant_ttl_secs() -> u64 {
++        15
++    }
++
++    fn default_max_requests_per_peer_per_window() -> usize {
++        8
++    }
++
++    fn default_request_window_secs() -> u64 {
++        60
++    }
++
++    pub fn private_enabled(&self) -> bool {
++        matches!(
++            self.mode,
++            PeerAssistMode::FallbackPrivate | PeerAssistMode::PreferPrivate
++        )
++    }
++}
++
+ /// Nostr-mediated overlay endpoint discovery (`node.discovery.nostr.*`).
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -353,6 +428,9 @@ pub struct NostrDiscoveryConfig {
+     /// How often adverts are refreshed in seconds.
+     #[serde(default = "NostrDiscoveryConfig::default_advert_refresh_secs")]
+     pub advert_refresh_secs: u64,
++    /// Private peer-assist helper policy and rate limiting.
++    #[serde(default)]
++    pub peer_assist: PeerAssistConfig,
+ }
+ 
+ impl Default for NostrDiscoveryConfig {
+@@ -378,6 +456,7 @@ impl Default for NostrDiscoveryConfig {
+             punch_duration_ms: Self::default_punch_duration_ms(),
+             advert_ttl_secs: Self::default_advert_ttl_secs(),
+             advert_refresh_secs: Self::default_advert_refresh_secs(),
++            peer_assist: PeerAssistConfig::default(),
+         }
+     }
+ }
+diff --git a/src/config/transport.rs b/src/config/transport.rs
+index 8257159..6530de5 100644
+--- a/src/config/transport.rs
++++ b/src/config/transport.rs
+@@ -51,6 +51,13 @@ pub struct UdpConfig {
+     /// Default: false.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub public: Option<bool>,
++
++    /// Whether this UDP transport may be used as a private peer-assist helper
++    /// surface once a public endpoint for the live socket is known.
++    ///
++    /// Default: false.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub peer_assist: Option<bool>,
+ }
+ 
+ impl UdpConfig {
+@@ -83,6 +90,11 @@ impl UdpConfig {
+     pub fn is_public(&self) -> bool {
+         self.public.unwrap_or(false)
+     }
++
++    /// Whether this UDP transport may be used as a private peer-assist helper.
++    pub fn peer_assist_enabled(&self) -> bool {
++        self.peer_assist.unwrap_or(false)
++    }
+ }
+ 
+ /// Transport instances - either a single config or named instances.
+diff --git a/src/discovery.rs b/src/discovery.rs
+index 838b8f2..f918d05 100644
+--- a/src/discovery.rs
++++ b/src/discovery.rs
+@@ -42,6 +42,11 @@ pub struct EstablishedTraversal {
+     pub remote_addr: SocketAddr,
+     /// The live UDP socket carrying the established mapping.
+     pub socket: UdpSocket,
++    /// Public endpoint for this socket as observed during rendezvous.
++    ///
++    /// When present, this can be advertised so other peers may use the live
++    /// transport as a peer-assisted rendezvous helper.
++    pub public_endpoint: Option<SocketAddr>,
+     /// Optional name for the adopted UDP transport.
+     pub transport_name: Option<String>,
+     /// Optional UDP transport tuning overrides.
+@@ -61,11 +66,18 @@ impl EstablishedTraversal {
+             peer_npub: peer_npub.into(),
+             remote_addr,
+             socket,
++            public_endpoint: None,
+             transport_name: None,
+             transport_config: None,
+         }
+     }
+ 
++    /// Attach an observed public endpoint for this live socket.
++    pub fn with_public_endpoint(mut self, addr: SocketAddr) -> Self {
++        self.public_endpoint = Some(addr);
++        self
++    }
++
+     /// Attach an explicit transport name to the adopted UDP transport.
+     pub fn with_transport_name(mut self, name: impl Into<String>) -> Self {
+         self.transport_name = Some(name.into());
+diff --git a/src/discovery/nostr/mod.rs b/src/discovery/nostr/mod.rs
+index fcae598..b864a4a 100644
+--- a/src/discovery/nostr/mod.rs
++++ b/src/discovery/nostr/mod.rs
+@@ -2,7 +2,7 @@
+ 
+ mod runtime;
+ mod signal;
+-mod stun;
++pub(crate) mod stun;
+ mod traversal;
+ mod types;
+ 
+@@ -11,8 +11,9 @@ mod tests;
+ 
+ pub use runtime::NostrDiscovery;
+ pub use types::{
+-    ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, BootstrapError, BootstrapEvent,
+-    CachedOverlayAdvert, OverlayAdvert, OverlayEndpointAdvert, OverlayTransportKind,
+-    PROTOCOL_VERSION, PUNCH_ACK_MAGIC, PUNCH_MAGIC, PunchHint, PunchPacket, PunchPacketKind,
+-    SIGNAL_KIND, TraversalAddress, TraversalAnswer, TraversalOffer,
++    ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, AssistGrant, AssistObserved, AssistRequest,
++    BootstrapError, BootstrapEvent, CachedOverlayAdvert, OverlayAdvert, OverlayEndpointAdvert,
++    OverlayTransportKind, PEER_ASSIST_MAGIC, PROTOCOL_VERSION, PUNCH_ACK_MAGIC, PUNCH_MAGIC,
++    PunchHint, PunchPacket, PunchPacketKind, SIGNAL_KIND, TraversalAddress, TraversalAnswer,
++    TraversalOffer,
+ };
+diff --git a/src/discovery/nostr/runtime.rs b/src/discovery/nostr/runtime.rs
+index b577181..aa27f97 100644
+--- a/src/discovery/nostr/runtime.rs
++++ b/src/discovery/nostr/runtime.rs
+@@ -15,17 +15,20 @@ use tokio::task::JoinHandle;
+ use tracing::{debug, trace, warn};
+ 
+ use super::signal::{
+-    SignalEnvelope, build_signal_event, create_traversal_answer, create_traversal_offer,
+-    unwrap_signal_event, validate_offer_freshness, validate_traversal_answer_for_offer,
++    SignalEnvelope, build_peer_assist_probe, build_signal_event, create_assist_grant,
++    create_assist_observed, create_assist_request, create_traversal_answer, create_traversal_offer,
++    parse_peer_assist_probe, unwrap_signal_event, validate_assist_grant_for_request,
++    validate_assist_observed_for_grant, validate_assist_request_freshness,
++    validate_offer_freshness, validate_traversal_answer_for_offer,
+ };
+ use super::stun::observe_traversal_addresses;
+ use super::traversal::{nonce, now_ms, planned_remote_endpoints, run_punch_attempt};
+ use super::types::{
+-    ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, BootstrapError, BootstrapEvent,
+-    CachedOverlayAdvert, OverlayAdvert, OverlayEndpointAdvert, PROTOCOL_VERSION, PunchHint,
+-    SIGNAL_KIND, TraversalAnswer, TraversalOffer,
++    ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, AssistGrant, AssistObserved, AssistRequest,
++    BootstrapError, BootstrapEvent, CachedOverlayAdvert, OverlayAdvert, OverlayEndpointAdvert,
++    PROTOCOL_VERSION, PunchHint, SIGNAL_KIND, TraversalAddress, TraversalAnswer, TraversalOffer,
+ };
+-use crate::config::{NostrDiscoveryConfig, PeerConfig};
++use crate::config::{NostrDiscoveryConfig, PeerAssistRequestPolicy, PeerConfig, UdpConfig};
+ use crate::discovery::EstablishedTraversal;
+ 
+ const ADVERT_CACHE_STALE_GRACE_MULTIPLIER: u64 = 2;
+@@ -53,6 +56,21 @@ fn endpoint_summary(endpoints: &[OverlayEndpointAdvert]) -> String {
+         .join(",")
+ }
+ 
++#[derive(Debug, Clone)]
++struct PendingPrivateAssistGrant {
++    request_id: String,
++    grant_id: String,
++    grant_nonce: String,
++    probe_token: String,
++    sender_pubkey: PublicKey,
++    sender_npub: String,
++    helper_addr: String,
++    relays: Vec<String>,
++    expires_at: u64,
++}
++
++type RateLimitWindow = HashMap<String, Vec<u64>>;
++
+ pub struct NostrDiscovery {
+     client: Client,
+     keys: nostr::Keys,
+@@ -63,6 +81,13 @@ pub struct NostrDiscovery {
+     local_advert: RwLock<Option<OverlayAdvert>>,
+     current_advert_event_id: RwLock<Option<EventId>>,
+     pending_answers: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<TraversalAnswer>>>>,
++    pending_assist_grants: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<AssistGrant>>>>,
++    pending_assist_observed:
++        Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<AssistObserved>>>>,
++    pending_private_assist_grants: Mutex<HashMap<String, PendingPrivateAssistGrant>>,
++    helper_endpoints: RwLock<Vec<std::net::SocketAddr>>,
++    assist_request_windows: Mutex<RateLimitWindow>,
++    traversal_offer_windows: Mutex<RateLimitWindow>,
+     active_initiators: Mutex<HashSet<String>>,
+     seen_sessions: Mutex<HashMap<String, u64>>,
+     offer_slots: Arc<Semaphore>,
+@@ -70,6 +95,10 @@ pub struct NostrDiscovery {
+     event_rx: Mutex<mpsc::UnboundedReceiver<BootstrapEvent>>,
+     notify_task: Mutex<Option<JoinHandle<()>>>,
+     advertise_task: Mutex<Option<JoinHandle<()>>>,
++    #[cfg(test)]
++    test_capture_outgoing: bool,
++    #[cfg(test)]
++    test_sent_signals: Mutex<Vec<String>>,
+ }
+ 
+ impl NostrDiscovery {
+@@ -114,6 +143,12 @@ impl NostrDiscovery {
+             local_advert: RwLock::new(None),
+             current_advert_event_id: RwLock::new(None),
+             pending_answers: Mutex::new(HashMap::new()),
++            pending_assist_grants: Mutex::new(HashMap::new()),
++            pending_assist_observed: Mutex::new(HashMap::new()),
++            pending_private_assist_grants: Mutex::new(HashMap::new()),
++            helper_endpoints: RwLock::new(Vec::new()),
++            assist_request_windows: Mutex::new(HashMap::new()),
++            traversal_offer_windows: Mutex::new(HashMap::new()),
+             active_initiators: Mutex::new(HashSet::new()),
+             seen_sessions: Mutex::new(HashMap::new()),
+             offer_slots,
+@@ -121,6 +156,10 @@ impl NostrDiscovery {
+             event_rx: Mutex::new(event_rx),
+             notify_task: Mutex::new(None),
+             advertise_task: Mutex::new(None),
++            #[cfg(test)]
++            test_capture_outgoing: false,
++            #[cfg(test)]
++            test_sent_signals: Mutex::new(Vec::new()),
+         });
+ 
+         runtime.subscribe().await?;
+@@ -131,6 +170,49 @@ impl NostrDiscovery {
+         Ok(runtime)
+     }
+ 
++    #[cfg(test)]
++    pub(crate) fn new_for_test(
++        identity: &crate::Identity,
++        config: NostrDiscoveryConfig,
++    ) -> Arc<Self> {
++        let keys = nostr::Keys::parse(&hex::encode(identity.keypair().secret_bytes()))
++            .expect("parse nostr keys");
++        let client = Client::builder()
++            .signer(keys.clone())
++            .opts(ClientOptions::new().autoconnect(false))
++            .build();
++        let pubkey = keys.public_key();
++        let npub = crate::encode_npub(&identity.pubkey());
++        let (event_tx, event_rx) = mpsc::unbounded_channel();
++        let offer_slots = Arc::new(Semaphore::new(config.max_concurrent_incoming_offers));
++        Arc::new(Self {
++            client,
++            keys,
++            pubkey,
++            npub,
++            config,
++            advert_cache: RwLock::new(HashMap::new()),
++            local_advert: RwLock::new(None),
++            current_advert_event_id: RwLock::new(None),
++            pending_answers: Mutex::new(HashMap::new()),
++            pending_assist_grants: Mutex::new(HashMap::new()),
++            pending_assist_observed: Mutex::new(HashMap::new()),
++            pending_private_assist_grants: Mutex::new(HashMap::new()),
++            helper_endpoints: RwLock::new(Vec::new()),
++            assist_request_windows: Mutex::new(HashMap::new()),
++            traversal_offer_windows: Mutex::new(HashMap::new()),
++            active_initiators: Mutex::new(HashSet::new()),
++            seen_sessions: Mutex::new(HashMap::new()),
++            offer_slots,
++            event_tx,
++            event_rx: Mutex::new(event_rx),
++            notify_task: Mutex::new(None),
++            advertise_task: Mutex::new(None),
++            test_capture_outgoing: true,
++            test_sent_signals: Mutex::new(Vec::new()),
++        })
++    }
++
+     pub async fn request_connect(self: &Arc<Self>, peer_config: PeerConfig) {
+         let peer_npub = peer_config.npub.clone();
+         {
+@@ -163,6 +245,89 @@ impl NostrDiscovery {
+         out
+     }
+ 
++    #[cfg(test)]
++    pub(crate) async fn drain_test_signals(&self) -> Vec<String> {
++        let mut signals = self.test_sent_signals.lock().await;
++        std::mem::take(&mut *signals)
++    }
++
++    pub async fn update_private_helper_endpoints(&self, mut endpoints: Vec<std::net::SocketAddr>) {
++        endpoints.sort();
++        endpoints.dedup();
++        *self.helper_endpoints.write().await = endpoints;
++    }
++
++    #[cfg(test)]
++    pub(crate) async fn connect_peer_via_private_assist_for_test(
++        &self,
++        peer_config: PeerConfig,
++        advert: OverlayAdvert,
++    ) -> Result<EstablishedTraversal, BootstrapError> {
++        let target_pubkey =
++            PublicKey::parse(&peer_config.npub).map_err(|e| BootstrapError::InvalidPeerNpub {
++                npub: peer_config.npub.clone(),
++                reason: e.to_string(),
++            })?;
++        let relays = if let Some(relays) = advert.signal_relays.clone() {
++            relays
++        } else {
++            self.config.dm_relays.clone()
++        };
++        self.connect_peer_via_private_assist(peer_config, target_pubkey, &relays)
++            .await
++    }
++
++    #[cfg(test)]
++    pub(crate) async fn handle_incoming_assist_request_for_test(
++        self: Arc<Self>,
++        request: AssistRequest,
++        sender: PublicKey,
++        sender_npub: String,
++    ) -> Result<(), BootstrapError> {
++        self.handle_incoming_assist_request(request, sender, sender_npub)
++            .await
++    }
++
++    #[cfg(test)]
++    pub(crate) async fn inject_assist_grant_for_test(
++        &self,
++        grant: AssistGrant,
++        sender_npub: String,
++    ) {
++        if let Some(tx) = self
++            .pending_assist_grants
++            .lock()
++            .await
++            .remove(&grant.in_reply_to)
++        {
++            let _ = tx.send(SignalEnvelope {
++                payload: grant,
++                event_id: EventId::all_zeros(),
++                sender_npub,
++            });
++        }
++    }
++
++    #[cfg(test)]
++    pub(crate) async fn inject_assist_observed_for_test(
++        &self,
++        observed: AssistObserved,
++        sender_npub: String,
++    ) {
++        if let Some(tx) = self
++            .pending_assist_observed
++            .lock()
++            .await
++            .remove(&observed.in_reply_to)
++        {
++            let _ = tx.send(SignalEnvelope {
++                payload: observed,
++                event_id: EventId::all_zeros(),
++                sender_npub,
++            });
++        }
++    }
++
+     pub async fn update_local_advert(
+         &self,
+         advert: Option<OverlayAdvert>,
+@@ -310,11 +475,54 @@ impl NostrDiscovery {
+                         continue;
+                     }
+ 
++                    if let Ok(grant) = serde_json::from_str::<AssistGrant>(&unwrapped.rumor.content)
++                        && grant.message_type == "assist-grant"
++                        && grant.recipient_npub == self.npub
++                    {
++                        if let Some(tx) = self
++                            .pending_assist_grants
++                            .lock()
++                            .await
++                            .remove(&grant.in_reply_to)
++                        {
++                            let _ = tx.send(SignalEnvelope {
++                                payload: grant,
++                                event_id: event.id,
++                                sender_npub: sender_npub.clone(),
++                            });
++                        }
++                        continue;
++                    }
++
++                    if let Ok(observed) =
++                        serde_json::from_str::<AssistObserved>(&unwrapped.rumor.content)
++                        && observed.message_type == "assist-observed"
++                        && observed.recipient_npub == self.npub
++                    {
++                        if let Some(tx) = self
++                            .pending_assist_observed
++                            .lock()
++                            .await
++                            .remove(&observed.in_reply_to)
++                        {
++                            let _ = tx.send(SignalEnvelope {
++                                payload: observed,
++                                event_id: event.id,
++                                sender_npub: sender_npub.clone(),
++                            });
++                        }
++                        continue;
++                    }
++
+                     if let Ok(offer) =
+                         serde_json::from_str::<TraversalOffer>(&unwrapped.rumor.content)
+                         && offer.message_type == "offer"
+                         && offer.recipient_npub == self.npub
+                     {
++                        if !self.traversal_offer_allowed(&sender_npub).await {
++                            warn!(sender_npub = %sender_npub, "dropping traversal offer because sender exceeded the rate limit");
++                            continue;
++                        }
+                         let Ok(permit) = self.offer_slots.clone().try_acquire_owned() else {
+                             warn!(
+                                 sender_npub = %sender_npub,
+@@ -333,6 +541,27 @@ impl NostrDiscovery {
+                                 debug!(error = %err, "failed to handle traversal offer");
+                             }
+                         });
++                        continue;
++                    }
++
++                    if let Ok(request) =
++                        serde_json::from_str::<AssistRequest>(&unwrapped.rumor.content)
++                        && request.message_type == "assist-request"
++                        && request.recipient_npub == self.npub
++                    {
++                        let runtime = Arc::clone(&self);
++                        tokio::spawn(async move {
++                            if let Err(err) = runtime
++                                .handle_incoming_assist_request(
++                                    request,
++                                    unwrapped.sender,
++                                    sender_npub,
++                                )
++                                .await
++                            {
++                                warn!(error = %err, "failed to handle assist request");
++                            }
++                        });
+                     }
+                 }
+             }
+@@ -454,10 +683,11 @@ impl NostrDiscovery {
+                     "udp:nat endpoint requires non-empty signalRelays".to_string(),
+                 ));
+             }
+-            if advert
+-                .stun_servers
+-                .as_ref()
+-                .is_none_or(|servers| servers.is_empty())
++            if !self.config.peer_assist.private_enabled()
++                && advert
++                    .stun_servers
++                    .as_ref()
++                    .is_none_or(|servers| servers.is_empty())
+             {
+                 return Err(BootstrapError::InvalidAdvert(
+                     "udp:nat endpoint requires non-empty stunServers".to_string(),
+@@ -513,9 +743,6 @@ impl NostrDiscovery {
+                 reason: e.to_string(),
+             })?;
+         let advert = self.fetch_advert(&peer_config.npub, target_pubkey).await?;
+-        if !advert.has_udp_nat_endpoint() {
+-            return Err(BootstrapError::MissingNatEndpoint(peer_config.npub.clone()));
+-        }
+         let relays = self
+             .preferred_signal_relays(target_pubkey, Some(&advert))
+             .await?;
+@@ -523,6 +750,29 @@ impl NostrDiscovery {
+             return Err(BootstrapError::MissingRelays(peer_config.npub));
+         }
+ 
++        let private_assist_enabled = self.config.peer_assist.private_enabled();
++        if !advert.has_udp_nat_endpoint() {
++            return Err(BootstrapError::MissingNatEndpoint(peer_config.npub));
++        }
++
++        if private_assist_enabled && self.config.stun_servers.is_empty() {
++            return self
++                .connect_peer_via_private_assist(peer_config, target_pubkey, &relays)
++                .await;
++        }
++
++        if private_assist_enabled
++            && matches!(
++                self.config.peer_assist.mode,
++                crate::config::PeerAssistMode::PreferPrivate
++            )
++            && let Ok(traversal) = self
++                .connect_peer_via_private_assist(peer_config.clone(), target_pubkey, &relays)
++                .await
++        {
++            return Ok(traversal);
++        }
++
+         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+         base_socket.set_nonblocking(true)?;
+ 
+@@ -547,7 +797,7 @@ impl NostrDiscovery {
+             session_id.clone(),
+             self.npub.clone(),
+             peer_config.npub.clone(),
+-            reflexive_address,
++            reflexive_address.clone(),
+             local_addresses,
+             stun_server,
+         );
+@@ -639,10 +889,196 @@ impl NostrDiscovery {
+ 
+         Ok(
+             EstablishedTraversal::new(session_id, peer_config.npub, remote_addr, base_socket)
++                .with_public_endpoint(
++                    reflexive_address
++                        .as_ref()
++                        .and_then(Self::traversal_address_to_socket)
++                        .ok_or_else(|| {
++                            BootstrapError::Protocol(
++                                "missing reflexive address for established traversal".to_string(),
++                            )
++                        })?,
++                )
+                 .with_transport_name("nostr-nat"),
+         )
+     }
+ 
++    async fn connect_peer_via_private_assist(
++        &self,
++        peer_config: PeerConfig,
++        target_pubkey: PublicKey,
++        relays: &[String],
++    ) -> Result<EstablishedTraversal, BootstrapError> {
++        let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
++        base_socket.set_nonblocking(true)?;
++
++        let request_id = nonce();
++        let request = create_assist_request(
++            request_id.clone(),
++            now_ms(),
++            self.config.peer_assist.grant_ttl_secs * 1000,
++            nonce(),
++            self.npub.clone(),
++            peer_config.npub.clone(),
++        );
++
++        let (grant_tx, grant_rx) = oneshot::channel();
++        self.pending_assist_grants
++            .lock()
++            .await
++            .insert(request.nonce.clone(), grant_tx);
++        let request_event = self.send_signal(relays, target_pubkey, &request).await?;
++
++        let grant = match tokio::time::timeout(
++            Duration::from_secs(self.config.peer_assist.grant_ttl_secs),
++            grant_rx,
++        )
++        .await
++        {
++            Ok(Ok(grant)) => grant,
++            Ok(Err(_)) => {
++                let _ = self
++                    .pending_assist_grants
++                    .lock()
++                    .await
++                    .remove(&request.nonce);
++                return Err(BootstrapError::Protocol(
++                    "assist grant channel closed".to_string(),
++                ));
++            }
++            Err(_) => {
++                let _ = self
++                    .pending_assist_grants
++                    .lock()
++                    .await
++                    .remove(&request.nonce);
++                return Err(BootstrapError::SignalTimeout(peer_config.npub));
++            }
++        };
++
++        validate_assist_grant_for_request(
++            &request,
++            &grant.payload,
++            now_ms(),
++            self.config.peer_assist.grant_ttl_secs * 1000,
++            &grant.sender_npub,
++            &self.npub,
++        )?;
++        if !grant.payload.accepted {
++            return Err(BootstrapError::Protocol(
++                grant
++                    .payload
++                    .reason
++                    .unwrap_or_else(|| "remote rejected private assist".to_string()),
++            ));
++        }
++
++        let helper_addr = grant
++            .payload
++            .helper_addr
++            .as_deref()
++            .ok_or_else(|| {
++                BootstrapError::Protocol("missing helper endpoint in grant".to_string())
++            })?
++            .parse::<std::net::SocketAddr>()
++            .map_err(|e| BootstrapError::Protocol(format!("invalid helper endpoint: {e}")))?;
++        let grant_id = grant.payload.grant_id.clone();
++        let probe_token =
++            grant.payload.probe_token.clone().ok_or_else(|| {
++                BootstrapError::Protocol("missing probe token in grant".to_string())
++            })?;
++
++        let (observed_tx, observed_rx) = oneshot::channel();
++        self.pending_assist_observed
++            .lock()
++            .await
++            .insert(grant.payload.nonce.clone(), observed_tx);
++
++        let probe_socket = base_socket.try_clone()?;
++        let probe_task = tokio::spawn(async move {
++            let probe = build_peer_assist_probe(&grant_id, &probe_token);
++            loop {
++                let _ = probe_socket.send_to(&probe, helper_addr);
++                tokio::time::sleep(Duration::from_millis(250)).await;
++            }
++        });
++
++        let observed = match tokio::time::timeout(
++            Duration::from_secs(self.config.peer_assist.grant_ttl_secs),
++            observed_rx,
++        )
++        .await
++        {
++            Ok(Ok(observed)) => observed,
++            Ok(Err(_)) => {
++                let _ = self
++                    .pending_assist_observed
++                    .lock()
++                    .await
++                    .remove(&grant.payload.nonce);
++                probe_task.abort();
++                return Err(BootstrapError::Protocol(
++                    "assist observed channel closed".to_string(),
++                ));
++            }
++            Err(_) => {
++                let _ = self
++                    .pending_assist_observed
++                    .lock()
++                    .await
++                    .remove(&grant.payload.nonce);
++                probe_task.abort();
++                return Err(BootstrapError::SignalTimeout(peer_config.npub));
++            }
++        };
++        probe_task.abort();
++
++        validate_assist_observed_for_grant(
++            &grant.payload,
++            &observed.payload,
++            now_ms(),
++            self.config.peer_assist.grant_ttl_secs * 1000,
++            &observed.sender_npub,
++            &self.npub,
++        )?;
++        if !observed.payload.accepted {
++            return Err(BootstrapError::Protocol(
++                observed
++                    .payload
++                    .reason
++                    .unwrap_or_else(|| "remote rejected observed endpoint".to_string()),
++            ));
++        }
++
++        let _ = self
++            .publish_delete(
++                relays,
++                [request_event.id, grant.event_id, observed.event_id],
++            )
++            .await;
++
++        let observed_endpoint = observed
++            .payload
++            .observed_address
++            .as_ref()
++            .and_then(Self::traversal_address_to_socket)
++            .ok_or_else(|| {
++                BootstrapError::Protocol(
++                    "missing observed address for accepted peer-assist answer".to_string(),
++                )
++            })?;
++
++        Ok(
++            EstablishedTraversal::new(request_id, peer_config.npub, helper_addr, base_socket)
++                .with_public_endpoint(observed_endpoint)
++                .with_transport_name("nostr-assist")
++                .with_transport_config(UdpConfig {
++                    peer_assist: Some(true),
++                    ..Default::default()
++                }),
++        )
++    }
++
+     async fn handle_incoming_offer(
+         self: Arc<Self>,
+         offer: TraversalOffer,
+@@ -692,7 +1128,7 @@ impl NostrDiscovery {
+             offer.sender_npub.clone(),
+             offer.nonce.clone(),
+             accepted,
+-            reflexive_address,
++            reflexive_address.clone(),
+             local_addresses,
+             stun_server,
+             accepted.then(|| self.punch_hint()),
+@@ -745,6 +1181,12 @@ impl NostrDiscovery {
+                     remote_addr,
+                     base_socket,
+                 )
++                .with_public_endpoint(
++                    reflexive_address
++                        .as_ref()
++                        .and_then(Self::traversal_address_to_socket)
++                        .unwrap_or(remote_addr),
++                )
+                 .with_transport_name("nostr-nat"),
+             });
+         }
+@@ -753,6 +1195,236 @@ impl NostrDiscovery {
+         Ok(())
+     }
+ 
++    async fn handle_incoming_assist_request(
++        self: Arc<Self>,
++        request: AssistRequest,
++        sender: PublicKey,
++        sender_npub: String,
++    ) -> Result<(), BootstrapError> {
++        validate_assist_request_freshness(
++            &request,
++            now_ms(),
++            self.config.signal_ttl_secs * 1000,
++            &sender_npub,
++            &self.npub,
++        )?;
++        self.mark_session_seen(&request.request_id).await?;
++
++        let relays = self.preferred_signal_relays(sender, None).await?;
++        if !self.config.peer_assist.private_enabled() {
++            let grant = create_assist_grant(
++                request.request_id,
++                nonce(),
++                now_ms(),
++                self.config.peer_assist.grant_ttl_secs * 1000,
++                nonce(),
++                self.npub.clone(),
++                request.sender_npub,
++                request.nonce,
++                false,
++                None,
++                None,
++                None,
++                Some("peer-assist disabled".to_string()),
++            );
++            let _ = self.send_signal(&relays, sender, &grant).await?;
++            return Ok(());
++        }
++
++        if !self.requester_allowed(&sender_npub).await {
++            let grant = create_assist_grant(
++                request.request_id,
++                nonce(),
++                now_ms(),
++                self.config.peer_assist.grant_ttl_secs * 1000,
++                nonce(),
++                self.npub.clone(),
++                request.sender_npub,
++                request.nonce,
++                false,
++                None,
++                None,
++                None,
++                Some("peer-assist requester not allowed".to_string()),
++            );
++            let _ = self.send_signal(&relays, sender, &grant).await?;
++            return Ok(());
++        }
++
++        let helper_addr = self
++            .helper_endpoints
++            .read()
++            .await
++            .first()
++            .copied()
++            .ok_or_else(|| BootstrapError::Protocol("no eligible helper transport".to_string()))?;
++
++        let pending_count = self.pending_private_assist_grants.lock().await.len();
++        if pending_count >= self.config.peer_assist.max_pending_requests {
++            let grant = create_assist_grant(
++                request.request_id,
++                nonce(),
++                now_ms(),
++                self.config.peer_assist.grant_ttl_secs * 1000,
++                nonce(),
++                self.npub.clone(),
++                request.sender_npub,
++                request.nonce,
++                false,
++                None,
++                None,
++                None,
++                Some("peer-assist helper is at capacity".to_string()),
++            );
++            let _ = self.send_signal(&relays, sender, &grant).await?;
++            return Ok(());
++        }
++
++        let grant_id = nonce();
++        let grant_nonce = nonce();
++        let probe_token = nonce();
++        self.pending_private_assist_grants.lock().await.insert(
++            grant_id.clone(),
++            PendingPrivateAssistGrant {
++                request_id: request.request_id.clone(),
++                grant_id: grant_id.clone(),
++                grant_nonce: grant_nonce.clone(),
++                probe_token: probe_token.clone(),
++                sender_pubkey: sender,
++                sender_npub: sender_npub.clone(),
++                helper_addr: helper_addr.to_string(),
++                relays: relays.clone(),
++                expires_at: now_ms() + self.config.peer_assist.grant_ttl_secs * 1000,
++            },
++        );
++
++        let grant = create_assist_grant(
++            request.request_id,
++            grant_id,
++            now_ms(),
++            self.config.peer_assist.grant_ttl_secs * 1000,
++            grant_nonce,
++            self.npub.clone(),
++            request.sender_npub,
++            request.nonce,
++            true,
++            Some(helper_addr.to_string()),
++            Some(probe_token),
++            Some(1),
++            None,
++        );
++        let _ = self.send_signal(&relays, sender, &grant).await?;
++        Ok(())
++    }
++
++    pub async fn observe_peer_assist_probe(
++        &self,
++        helper_addr: std::net::SocketAddr,
++        remote_addr: std::net::SocketAddr,
++        data: &[u8],
++    ) -> bool {
++        let Some(probe) = parse_peer_assist_probe(data) else {
++            return false;
++        };
++        let now = now_ms();
++        let pending = {
++            let mut pending = self.pending_private_assist_grants.lock().await;
++            pending.retain(|_, entry| entry.expires_at > now);
++            let Some(entry) = pending.remove(&probe.grant_id) else {
++                return false;
++            };
++            if entry.helper_addr != helper_addr.to_string() || entry.probe_token != probe.token {
++                pending.insert(entry.grant_id.clone(), entry);
++                return false;
++            }
++            entry
++        };
++
++        let observed = create_assist_observed(
++            pending.request_id,
++            pending.grant_id,
++            now,
++            self.config.peer_assist.grant_ttl_secs * 1000,
++            nonce(),
++            self.npub.clone(),
++            pending.sender_npub.clone(),
++            pending.grant_nonce,
++            true,
++            helper_addr.to_string(),
++            Some(TraversalAddress {
++                protocol: "udp".to_string(),
++                ip: remote_addr.ip().to_string(),
++                port: remote_addr.port(),
++            }),
++            None,
++        );
++        match self
++            .send_signal(&pending.relays, pending.sender_pubkey, &observed)
++            .await
++        {
++            Ok(_) => true,
++            Err(err) => {
++                debug!(
++                    sender_npub = %pending.sender_npub,
++                    error = %err,
++                    "failed to send peer-assist answer"
++                );
++                false
++            }
++        }
++    }
++
++    async fn requester_allowed(&self, sender_npub: &str) -> bool {
++        match self.config.peer_assist.request_policy {
++            PeerAssistRequestPolicy::Allowlist => self
++                .config
++                .peer_assist
++                .request_allowlist
++                .iter()
++                .any(|allowed| allowed == sender_npub),
++            PeerAssistRequestPolicy::OpenRateLimited => {
++                let now = now_ms();
++                let window_ms = self
++                    .config
++                    .peer_assist
++                    .request_window_secs
++                    .saturating_mul(1000);
++                let mut windows = self.assist_request_windows.lock().await;
++                allow_in_rate_window(
++                    &mut windows,
++                    sender_npub,
++                    now,
++                    window_ms,
++                    self.config.peer_assist.max_requests_per_peer_per_window,
++                )
++            }
++        }
++    }
++
++    async fn traversal_offer_allowed(&self, sender_npub: &str) -> bool {
++        let now = now_ms();
++        let window_ms = self
++            .config
++            .peer_assist
++            .request_window_secs
++            .saturating_mul(1000);
++        let mut windows = self.traversal_offer_windows.lock().await;
++        allow_in_rate_window(
++            &mut windows,
++            sender_npub,
++            now,
++            window_ms,
++            self.config.peer_assist.max_requests_per_peer_per_window,
++        )
++    }
++
++    fn traversal_address_to_socket(addr: &TraversalAddress) -> Option<std::net::SocketAddr> {
++        if !addr.protocol.eq_ignore_ascii_case("udp") {
++            return None;
++        }
++        format!("{}:{}", addr.ip, addr.port).parse().ok()
++    }
++
+     async fn fetch_advert(
+         &self,
+         peer_npub: &str,
+@@ -829,12 +1501,12 @@ impl NostrDiscovery {
+         advert: Option<&OverlayAdvert>,
+     ) -> Result<Vec<String>, BootstrapError> {
+         let mut merged = self.find_recipient_inbox_relays(target_pubkey).await?;
+-        if let Some(advert) = advert {
+-            if let Some(relays) = advert.signal_relays.as_ref() {
+-                for relay in relays {
+-                    if !merged.contains(relay) {
+-                        merged.push(relay.clone());
+-                    }
++        if let Some(advert) = advert
++            && let Some(relays) = advert.signal_relays.as_ref()
++        {
++            for relay in relays {
++                if !merged.contains(relay) {
++                    merged.push(relay.clone());
+                 }
+             }
+         }
+@@ -949,15 +1621,6 @@ impl NostrDiscovery {
+                     "udp:nat endpoint requires signalRelays".to_string(),
+                 ));
+             }
+-            if advert
+-                .stun_servers
+-                .as_ref()
+-                .is_none_or(|servers| servers.is_empty())
+-            {
+-                return Err(BootstrapError::InvalidAdvert(
+-                    "udp:nat endpoint requires stunServers".to_string(),
+-                ));
+-            }
+         } else {
+             advert.signal_relays = None;
+             advert.stun_servers = None;
+@@ -1042,6 +1705,14 @@ impl NostrDiscovery {
+             Timestamp::from((now_ms() + self.config.signal_ttl_secs * 1000) / 1000),
+         )
+         .await?;
++        #[cfg(test)]
++        if self.test_capture_outgoing {
++            self.test_sent_signals
++                .lock()
++                .await
++                .push(serde_json::to_string(payload)?);
++            return Ok(signal);
++        }
+         self.client
+             .send_event_to(relays.to_vec(), &signal)
+             .await
+@@ -1094,3 +1765,22 @@ impl NostrDiscovery {
+         Ok(())
+     }
+ }
++
++pub(super) fn allow_in_rate_window(
++    windows: &mut RateLimitWindow,
++    key: &str,
++    now: u64,
++    window_ms: u64,
++    max_requests: usize,
++) -> bool {
++    if max_requests == 0 {
++        return false;
++    }
++    let entry = windows.entry(key.to_string()).or_default();
++    entry.retain(|timestamp| now.saturating_sub(*timestamp) <= window_ms);
++    if entry.len() >= max_requests {
++        return false;
++    }
++    entry.push(now);
++    true
++}
+diff --git a/src/discovery/nostr/signal.rs b/src/discovery/nostr/signal.rs
+index bf57053..2c51f93 100644
+--- a/src/discovery/nostr/signal.rs
++++ b/src/discovery/nostr/signal.rs
+@@ -4,7 +4,10 @@ use nostr::prelude::{
+     Event, EventBuilder, JsonUtil, Kind, NostrSigner, PublicKey, Tag, Timestamp, UnsignedEvent,
+ };
+ 
+-use super::types::{BootstrapError, PunchHint, SIGNAL_KIND, TraversalAnswer, TraversalOffer};
++use super::types::{
++    AssistGrant, AssistObserved, AssistRequest, BootstrapError, PEER_ASSIST_MAGIC, PeerAssistProbe,
++    PunchHint, SIGNAL_KIND, TraversalAnswer, TraversalOffer,
++};
+ 
+ pub(super) struct SignalEnvelope<T> {
+     pub(super) payload: T,
+@@ -154,6 +157,92 @@ pub(super) fn create_traversal_answer(
+     }
+ }
+ 
++#[allow(clippy::too_many_arguments)]
++pub(super) fn create_assist_request(
++    request_id: String,
++    issued_at: u64,
++    ttl_ms: u64,
++    nonce: String,
++    sender_npub: String,
++    recipient_npub: String,
++) -> AssistRequest {
++    AssistRequest {
++        message_type: "assist-request".to_string(),
++        request_id,
++        issued_at,
++        expires_at: issued_at + ttl_ms,
++        nonce,
++        sender_npub,
++        recipient_npub,
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(super) fn create_assist_grant(
++    request_id: String,
++    grant_id: String,
++    issued_at: u64,
++    ttl_ms: u64,
++    nonce: String,
++    sender_npub: String,
++    recipient_npub: String,
++    in_reply_to: String,
++    accepted: bool,
++    helper_addr: Option<String>,
++    probe_token: Option<String>,
++    max_uses: Option<u8>,
++    reason: Option<String>,
++) -> AssistGrant {
++    AssistGrant {
++        message_type: "assist-grant".to_string(),
++        request_id,
++        grant_id,
++        issued_at,
++        expires_at: issued_at + ttl_ms,
++        nonce,
++        sender_npub,
++        recipient_npub,
++        in_reply_to,
++        accepted,
++        helper_addr,
++        probe_token,
++        max_uses,
++        reason,
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(super) fn create_assist_observed(
++    request_id: String,
++    grant_id: String,
++    issued_at: u64,
++    ttl_ms: u64,
++    nonce: String,
++    sender_npub: String,
++    recipient_npub: String,
++    in_reply_to: String,
++    accepted: bool,
++    helper_addr: String,
++    observed_address: Option<super::TraversalAddress>,
++    reason: Option<String>,
++) -> AssistObserved {
++    AssistObserved {
++        message_type: "assist-observed".to_string(),
++        request_id,
++        grant_id,
++        issued_at,
++        expires_at: issued_at + ttl_ms,
++        nonce,
++        sender_npub,
++        recipient_npub,
++        in_reply_to,
++        accepted,
++        helper_addr,
++        observed_address,
++        reason,
++    }
++}
++
+ pub(super) fn validate_traversal_answer_for_offer(
+     offer: &TraversalOffer,
+     answer: &TraversalAnswer,
+@@ -191,3 +280,163 @@ pub(super) fn validate_traversal_answer_for_offer(
+     }
+     Ok(())
+ }
++
++pub(super) fn validate_assist_request_freshness(
++    request: &AssistRequest,
++    now: u64,
++    signal_ttl_ms: u64,
++    actual_sender_npub: &str,
++    local_npub: &str,
++) -> Result<(), BootstrapError> {
++    if request.message_type != "assist-request" {
++        return Err(BootstrapError::Protocol(
++            "invalid-assist-request".to_string(),
++        ));
++    }
++    if request.expires_at <= now || now.saturating_sub(request.issued_at) > signal_ttl_ms {
++        return Err(BootstrapError::Protocol(
++            "expired-assist-request".to_string(),
++        ));
++    }
++    if request.sender_npub != actual_sender_npub || request.recipient_npub != local_npub {
++        return Err(BootstrapError::Protocol("identity-mismatch".to_string()));
++    }
++    if request.request_id.trim().is_empty() || request.nonce.trim().is_empty() {
++        return Err(BootstrapError::Protocol(
++            "missing-assist-request-fields".to_string(),
++        ));
++    }
++    Ok(())
++}
++
++pub(super) fn validate_assist_grant_for_request(
++    request: &AssistRequest,
++    grant: &AssistGrant,
++    now: u64,
++    signal_ttl_ms: u64,
++    actual_sender_npub: &str,
++    local_npub: &str,
++) -> Result<(), BootstrapError> {
++    if grant.message_type != "assist-grant" {
++        return Err(BootstrapError::Protocol("invalid-assist-grant".to_string()));
++    }
++    if grant.expires_at <= now || now.saturating_sub(grant.issued_at) > signal_ttl_ms {
++        return Err(BootstrapError::Protocol("expired-assist-grant".to_string()));
++    }
++    if grant.request_id != request.request_id || grant.in_reply_to != request.nonce {
++        return Err(BootstrapError::Protocol("session-mismatch".to_string()));
++    }
++    if grant.sender_npub != actual_sender_npub
++        || grant.recipient_npub != local_npub
++        || request.sender_npub != local_npub
++        || request.recipient_npub != actual_sender_npub
++    {
++        return Err(BootstrapError::Protocol("identity-mismatch".to_string()));
++    }
++    if grant.accepted
++        && (grant
++            .helper_addr
++            .as_deref()
++            .is_none_or(|value| value.trim().is_empty())
++            || grant
++                .probe_token
++                .as_deref()
++                .is_none_or(|value| value.trim().is_empty()))
++    {
++        return Err(BootstrapError::Protocol(
++            "missing-grant-parameters".to_string(),
++        ));
++    }
++    if grant.accepted
++        && grant
++            .helper_addr
++            .as_deref()
++            .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
++            .is_none()
++    {
++        return Err(BootstrapError::Protocol(
++            "invalid-helper-endpoint".to_string(),
++        ));
++    }
++    if !grant.accepted && grant.reason.as_deref().unwrap_or_default().is_empty() {
++        return Err(BootstrapError::Protocol(
++            "missing-rejection-reason".to_string(),
++        ));
++    }
++    Ok(())
++}
++
++pub(super) fn validate_assist_observed_for_grant(
++    grant: &AssistGrant,
++    observed: &AssistObserved,
++    now: u64,
++    signal_ttl_ms: u64,
++    actual_sender_npub: &str,
++    local_npub: &str,
++) -> Result<(), BootstrapError> {
++    if observed.message_type != "assist-observed" {
++        return Err(BootstrapError::Protocol(
++            "invalid-assist-observed".to_string(),
++        ));
++    }
++    if observed.expires_at <= now || now.saturating_sub(observed.issued_at) > signal_ttl_ms {
++        return Err(BootstrapError::Protocol(
++            "expired-assist-observed".to_string(),
++        ));
++    }
++    if observed.request_id != grant.request_id
++        || observed.grant_id != grant.grant_id
++        || observed.in_reply_to != grant.nonce
++    {
++        return Err(BootstrapError::Protocol("session-mismatch".to_string()));
++    }
++    if observed.sender_npub != actual_sender_npub
++        || observed.recipient_npub != local_npub
++        || grant.sender_npub != actual_sender_npub
++        || grant.recipient_npub != local_npub
++    {
++        return Err(BootstrapError::Protocol("identity-mismatch".to_string()));
++    }
++    if observed.accepted && observed.observed_address.is_none() {
++        return Err(BootstrapError::Protocol(
++            "missing-observed-address".to_string(),
++        ));
++    }
++    if !observed.accepted && observed.reason.as_deref().unwrap_or_default().is_empty() {
++        return Err(BootstrapError::Protocol(
++            "missing-rejection-reason".to_string(),
++        ));
++    }
++    Ok(())
++}
++
++pub(super) fn build_peer_assist_probe(grant_id: &str, token: &str) -> Vec<u8> {
++    let mut packet = Vec::with_capacity(8 + grant_id.len() + token.len());
++    packet.extend_from_slice(&PEER_ASSIST_MAGIC.to_be_bytes());
++    packet.extend_from_slice(&(grant_id.len() as u16).to_be_bytes());
++    packet.extend_from_slice(&(token.len() as u16).to_be_bytes());
++    packet.extend_from_slice(grant_id.as_bytes());
++    packet.extend_from_slice(token.as_bytes());
++    packet
++}
++
++pub(super) fn parse_peer_assist_probe(data: &[u8]) -> Option<PeerAssistProbe> {
++    if data.len() < 8 {
++        return None;
++    }
++    if u32::from_be_bytes(data[0..4].try_into().ok()?) != PEER_ASSIST_MAGIC {
++        return None;
++    }
++    let grant_id_len = u16::from_be_bytes(data[4..6].try_into().ok()?) as usize;
++    let token_len = u16::from_be_bytes(data[6..8].try_into().ok()?) as usize;
++    if grant_id_len == 0 || token_len == 0 || data.len() != 8 + grant_id_len + token_len {
++        return None;
++    }
++    let grant_id = std::str::from_utf8(&data[8..8 + grant_id_len])
++        .ok()?
++        .to_string();
++    let token = std::str::from_utf8(&data[8 + grant_id_len..])
++        .ok()?
++        .to_string();
++    Some(PeerAssistProbe { grant_id, token })
++}
+diff --git a/src/discovery/nostr/stun.rs b/src/discovery/nostr/stun.rs
+index 7225428..0b4def2 100644
+--- a/src/discovery/nostr/stun.rs
++++ b/src/discovery/nostr/stun.rs
+@@ -11,7 +11,7 @@ use super::types::{BootstrapError, TraversalAddress};
+ // Local interface discovery remains best-effort and may still be incomplete
+ // on dual-stack, NAT64, or heavily firewalled hosts.
+ 
+-pub(super) async fn observe_traversal_addresses(
++pub(crate) async fn observe_traversal_addresses(
+     socket: &std::net::UdpSocket,
+     stun_servers: &[String],
+     share_local_candidates: bool,
+@@ -268,8 +268,8 @@ fn private_interface_ips() -> Vec<IpAddr> {
+         // SAFETY: `cursor` points at a valid node from the `getifaddrs` list.
+         let entry = unsafe { &*cursor };
+         let flags = entry.ifa_flags as i32;
+-        let is_up = (flags & libc::IFF_UP as i32) != 0;
+-        let is_loopback = (flags & libc::IFF_LOOPBACK as i32) != 0;
++        let is_up = (flags & libc::IFF_UP) != 0;
++        let is_loopback = (flags & libc::IFF_LOOPBACK) != 0;
+ 
+         if is_up && !is_loopback && !entry.ifa_addr.is_null() {
+             // SAFETY: `ifa_addr` is non-null and its concrete type matches
+@@ -344,6 +344,14 @@ fn push_ip(addresses: &mut Vec<String>, ip: IpAddr) {
+     }
+ }
+ 
++fn random_txn_id() -> [u8; 12] {
++    let mut txn_id = [0u8; 12];
++    for byte in &mut txn_id {
++        *byte = rand::random::<u8>();
++    }
++    txn_id
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::is_private_overlay_candidate_ip;
+@@ -381,11 +389,3 @@ mod tests {
+         )));
+     }
+ }
+-
+-fn random_txn_id() -> [u8; 12] {
+-    let mut txn_id = [0u8; 12];
+-    for byte in &mut txn_id {
+-        *byte = rand::random::<u8>();
+-    }
+-    txn_id
+-}
+diff --git a/src/discovery/nostr/tests.rs b/src/discovery/nostr/tests.rs
+index ec7f77c..16f71e7 100644
+--- a/src/discovery/nostr/tests.rs
++++ b/src/discovery/nostr/tests.rs
+@@ -1,8 +1,11 @@
+ use nostr::prelude::{EventBuilder, Kind, Tag, Timestamp};
+ 
+-use super::runtime::NostrDiscovery;
++use super::runtime::{NostrDiscovery, allow_in_rate_window};
+ use super::signal::{
+-    build_signal_event, create_traversal_answer, create_traversal_offer, validate_offer_freshness,
++    build_peer_assist_probe, build_signal_event, create_assist_grant, create_assist_observed,
++    create_assist_request, create_traversal_answer, create_traversal_offer,
++    parse_peer_assist_probe, validate_assist_grant_for_request, validate_assist_observed_for_grant,
++    validate_assist_request_freshness, validate_offer_freshness,
+     validate_traversal_answer_for_offer,
+ };
+ use super::stun::{parse_stun_binding_success, parse_stun_url};
+@@ -116,6 +119,15 @@ fn rejects_invalid_overlay_adverts() {
+         stun_servers: None,
+     };
+     assert!(NostrDiscovery::validate_overlay_advert(wrong_identifier).is_err());
++
++    let missing_all_endpoints = OverlayAdvert {
++        identifier: ADVERT_IDENTIFIER.to_string(),
++        version: ADVERT_VERSION,
++        endpoints: vec![],
++        signal_relays: None,
++        stun_servers: None,
++    };
++    assert!(NostrDiscovery::validate_overlay_advert(missing_all_endpoints).is_err());
+ }
+ 
+ #[test]
+@@ -255,6 +267,327 @@ fn validates_offer_answer_pair() {
+     );
+ }
+ 
++#[test]
++fn validates_assist_request_grant_observed_flow() {
++    let request = create_assist_request(
++        "assist-1".to_string(),
++        1_700_000_000_000,
++        60_000,
++        "request-1".to_string(),
++        "npub1client".to_string(),
++        "npub1server".to_string(),
++    );
++    let grant = create_assist_grant(
++        "assist-1".to_string(),
++        "grant-1".to_string(),
++        1_700_000_000_500,
++        60_000,
++        "grant-nonce".to_string(),
++        "npub1server".to_string(),
++        "npub1client".to_string(),
++        "request-1".to_string(),
++        true,
++        Some("198.51.100.20:44750".to_string()),
++        Some("probe-1".to_string()),
++        Some(1),
++        None,
++    );
++    let observed = create_assist_observed(
++        "assist-1".to_string(),
++        "grant-1".to_string(),
++        1_700_000_000_700,
++        60_000,
++        "observed-1".to_string(),
++        "npub1server".to_string(),
++        "npub1client".to_string(),
++        "grant-nonce".to_string(),
++        true,
++        "198.51.100.20:44750".to_string(),
++        Some(addr("203.0.113.99", 39000)),
++        None,
++    );
++
++    assert!(
++        validate_assist_request_freshness(
++            &request,
++            1_700_000_000_100,
++            60_000,
++            "npub1client",
++            "npub1server",
++        )
++        .is_ok()
++    );
++    assert!(
++        validate_assist_grant_for_request(
++            &request,
++            &grant,
++            1_700_000_000_900,
++            60_000,
++            "npub1server",
++            "npub1client",
++        )
++        .is_ok()
++    );
++    assert!(
++        validate_assist_observed_for_grant(
++            &grant,
++            &observed,
++            1_700_000_000_900,
++            60_000,
++            "npub1server",
++            "npub1client",
++        )
++        .is_ok()
++    );
++}
++
++#[test]
++fn builds_and_parses_peer_assist_probe_packets() {
++    let packet = build_peer_assist_probe("grant-1", "probe-token");
++    let parsed = parse_peer_assist_probe(&packet).unwrap();
++    assert_eq!(parsed.grant_id, "grant-1");
++    assert_eq!(parsed.token, "probe-token");
++}
++
++#[test]
++fn rejects_accepted_assist_observed_without_observed_address() {
++    let request = create_assist_request(
++        "assist-1".to_string(),
++        1_700_000_000_000,
++        60_000,
++        "request-1".to_string(),
++        "npub1client".to_string(),
++        "npub1server".to_string(),
++    );
++    let grant = create_assist_grant(
++        "assist-1".to_string(),
++        "grant-1".to_string(),
++        1_700_000_000_500,
++        60_000,
++        "grant-1".to_string(),
++        "npub1server".to_string(),
++        "npub1client".to_string(),
++        "request-1".to_string(),
++        true,
++        Some("198.51.100.20:44750".to_string()),
++        Some("probe-1".to_string()),
++        Some(1),
++        None,
++    );
++    let observed = create_assist_observed(
++        "assist-1".to_string(),
++        "grant-1".to_string(),
++        1_700_000_000_700,
++        60_000,
++        "observed-1".to_string(),
++        "npub1server".to_string(),
++        "npub1client".to_string(),
++        "grant-1".to_string(),
++        true,
++        "198.51.100.20:44750".to_string(),
++        None,
++        None,
++    );
++
++    assert!(
++        validate_assist_grant_for_request(
++            &request,
++            &grant,
++            1_700_000_000_900,
++            60_000,
++            "npub1server",
++            "npub1client",
++        )
++        .is_ok()
++    );
++
++    assert!(
++        validate_assist_observed_for_grant(
++            &grant,
++            &observed,
++            1_700_000_000_900,
++            60_000,
++            "npub1server",
++            "npub1client",
++        )
++        .is_err()
++    );
++}
++
++#[test]
++fn rejects_expired_assist_request() {
++    let request = create_assist_request(
++        "assist-1".to_string(),
++        1_700_000_000_000,
++        60_000,
++        "request-1".to_string(),
++        "npub1client".to_string(),
++        "npub1server".to_string(),
++    );
++
++    let result = validate_assist_request_freshness(
++        &request,
++        1_700_000_061_000,
++        60_000,
++        "npub1client",
++        "npub1server",
++    );
++
++    assert!(result.is_err());
++}
++
++#[test]
++fn rejects_expired_assist_grant() {
++    let request = create_assist_request(
++        "assist-1".to_string(),
++        1_700_000_000_000,
++        60_000,
++        "request-1".to_string(),
++        "npub1client".to_string(),
++        "npub1server".to_string(),
++    );
++    let grant = create_assist_grant(
++        "assist-1".to_string(),
++        "grant-1".to_string(),
++        1_700_000_000_500,
++        60_000,
++        "grant-1".to_string(),
++        "npub1server".to_string(),
++        "npub1client".to_string(),
++        "request-1".to_string(),
++        true,
++        Some("198.51.100.20:44750".to_string()),
++        Some("probe-1".to_string()),
++        Some(1),
++        None,
++    );
++
++    let result = validate_assist_grant_for_request(
++        &request,
++        &grant,
++        1_700_000_061_000,
++        60_000,
++        "npub1server",
++        "npub1client",
++    );
++
++    assert!(result.is_err());
++}
++
++#[test]
++fn rejects_assist_grant_with_mismatched_request() {
++    let request = create_assist_request(
++        "assist-1".to_string(),
++        1_700_000_000_000,
++        60_000,
++        "request-1".to_string(),
++        "npub1client".to_string(),
++        "npub1server".to_string(),
++    );
++    let grant = create_assist_grant(
++        "assist-2".to_string(),
++        "grant-1".to_string(),
++        1_700_000_000_500,
++        60_000,
++        "grant-1".to_string(),
++        "npub1server".to_string(),
++        "npub1client".to_string(),
++        "wrong-request-nonce".to_string(),
++        true,
++        Some("198.51.100.20:44750".to_string()),
++        Some("probe-1".to_string()),
++        Some(1),
++        None,
++    );
++
++    let result = validate_assist_grant_for_request(
++        &request,
++        &grant,
++        1_700_000_000_900,
++        60_000,
++        "npub1server",
++        "npub1client",
++    );
++
++    assert!(result.is_err());
++}
++
++#[test]
++fn rejects_assist_grant_with_invalid_helper_endpoint() {
++    let request = create_assist_request(
++        "assist-1".to_string(),
++        1_700_000_000_000,
++        60_000,
++        "request-1".to_string(),
++        "npub1client".to_string(),
++        "npub1server".to_string(),
++    );
++    let grant = create_assist_grant(
++        "assist-1".to_string(),
++        "grant-1".to_string(),
++        1_700_000_000_500,
++        60_000,
++        "grant-1".to_string(),
++        "npub1server".to_string(),
++        "npub1client".to_string(),
++        "request-1".to_string(),
++        true,
++        Some("not-a-socket".to_string()),
++        Some("probe-1".to_string()),
++        Some(1),
++        None,
++    );
++
++    let result = validate_assist_grant_for_request(
++        &request,
++        &grant,
++        1_700_000_000_900,
++        60_000,
++        "npub1server",
++        "npub1client",
++    );
++
++    assert!(result.is_err());
++}
++
++#[test]
++fn accepts_rejected_assist_grant_with_reason() {
++    let request = create_assist_request(
++        "assist-1".to_string(),
++        1_700_000_000_000,
++        60_000,
++        "request-1".to_string(),
++        "npub1client".to_string(),
++        "npub1server".to_string(),
++    );
++    let grant = create_assist_grant(
++        "assist-1".to_string(),
++        "grant-1".to_string(),
++        1_700_000_000_500,
++        60_000,
++        "grant-1".to_string(),
++        "npub1server".to_string(),
++        "npub1client".to_string(),
++        "request-1".to_string(),
++        false,
++        None,
++        None,
++        None,
++        Some("peer-assist requester not allowed".to_string()),
++    );
++
++    let result = validate_assist_grant_for_request(
++        &request,
++        &grant,
++        1_700_000_000_900,
++        60_000,
++        "npub1server",
++        "npub1client",
++    );
++
++    assert!(result.is_ok());
++}
++
+ #[test]
+ fn rejects_offer_with_mismatched_actual_sender() {
+     let offer = create_traversal_offer(
+@@ -325,6 +658,87 @@ fn rejects_answer_with_mismatched_actual_sender() {
+     assert!(result.is_err());
+ }
+ 
++#[test]
++fn rate_window_allows_until_sender_limit() {
++    let mut windows = std::collections::HashMap::new();
++
++    assert!(allow_in_rate_window(
++        &mut windows,
++        "npub1sender",
++        1_000,
++        60_000,
++        2,
++    ));
++    assert!(allow_in_rate_window(
++        &mut windows,
++        "npub1sender",
++        2_000,
++        60_000,
++        2,
++    ));
++    assert!(!allow_in_rate_window(
++        &mut windows,
++        "npub1sender",
++        3_000,
++        60_000,
++        2,
++    ));
++}
++
++#[test]
++fn rate_window_is_per_sender() {
++    let mut windows = std::collections::HashMap::new();
++
++    assert!(allow_in_rate_window(
++        &mut windows,
++        "npub1sender-a",
++        1_000,
++        60_000,
++        1,
++    ));
++    assert!(allow_in_rate_window(
++        &mut windows,
++        "npub1sender-b",
++        1_000,
++        60_000,
++        1,
++    ));
++    assert!(!allow_in_rate_window(
++        &mut windows,
++        "npub1sender-a",
++        2_000,
++        60_000,
++        1,
++    ));
++}
++
++#[test]
++fn rate_window_resets_after_expiry() {
++    let mut windows = std::collections::HashMap::new();
++
++    assert!(allow_in_rate_window(
++        &mut windows,
++        "npub1sender",
++        1_000,
++        10_000,
++        1,
++    ));
++    assert!(!allow_in_rate_window(
++        &mut windows,
++        "npub1sender",
++        10_000,
++        10_000,
++        1,
++    ));
++    assert!(allow_in_rate_window(
++        &mut windows,
++        "npub1sender",
++        11_001,
++        10_000,
++        1,
++    ));
++}
++
+ #[test]
+ fn plans_reflexive_targets_before_lan() {
+     let planned = plan_punch_targets(
+diff --git a/src/discovery/nostr/types.rs b/src/discovery/nostr/types.rs
+index fda8b48..743ed17 100644
+--- a/src/discovery/nostr/types.rs
++++ b/src/discovery/nostr/types.rs
+@@ -8,6 +8,7 @@ pub const ADVERT_VERSION: u32 = 1;
+ pub const SIGNAL_KIND: u16 = 21059;
+ pub const PUNCH_MAGIC: u32 = 0x4E505443;
+ pub const PUNCH_ACK_MAGIC: u32 = 0x4E505441;
++pub const PEER_ASSIST_MAGIC: u32 = 0x4E504153;
+ pub const PROTOCOL_VERSION: &str = "1";
+ 
+ #[derive(Debug, thiserror::Error)]
+@@ -165,6 +166,85 @@ pub struct TraversalAnswer {
+     pub reason: Option<String>,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AssistRequest {
++    #[serde(rename = "type")]
++    pub message_type: String,
++    #[serde(rename = "requestId")]
++    pub request_id: String,
++    #[serde(rename = "issuedAt")]
++    pub issued_at: u64,
++    #[serde(rename = "expiresAt")]
++    pub expires_at: u64,
++    pub nonce: String,
++    #[serde(rename = "senderNpub")]
++    pub sender_npub: String,
++    #[serde(rename = "recipientNpub")]
++    pub recipient_npub: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AssistGrant {
++    #[serde(rename = "type")]
++    pub message_type: String,
++    #[serde(rename = "requestId")]
++    pub request_id: String,
++    #[serde(rename = "grantId")]
++    pub grant_id: String,
++    #[serde(rename = "issuedAt")]
++    pub issued_at: u64,
++    #[serde(rename = "expiresAt")]
++    pub expires_at: u64,
++    pub nonce: String,
++    #[serde(rename = "senderNpub")]
++    pub sender_npub: String,
++    #[serde(rename = "recipientNpub")]
++    pub recipient_npub: String,
++    #[serde(rename = "inReplyTo")]
++    pub in_reply_to: String,
++    pub accepted: bool,
++    #[serde(rename = "helperAddr")]
++    pub helper_addr: Option<String>,
++    #[serde(rename = "probeToken")]
++    pub probe_token: Option<String>,
++    #[serde(rename = "maxUses")]
++    pub max_uses: Option<u8>,
++    pub reason: Option<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct PeerAssistProbe {
++    pub grant_id: String,
++    pub token: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AssistObserved {
++    #[serde(rename = "type")]
++    pub message_type: String,
++    #[serde(rename = "requestId")]
++    pub request_id: String,
++    #[serde(rename = "grantId")]
++    pub grant_id: String,
++    #[serde(rename = "issuedAt")]
++    pub issued_at: u64,
++    #[serde(rename = "expiresAt")]
++    pub expires_at: u64,
++    pub nonce: String,
++    #[serde(rename = "senderNpub")]
++    pub sender_npub: String,
++    #[serde(rename = "recipientNpub")]
++    pub recipient_npub: String,
++    #[serde(rename = "inReplyTo")]
++    pub in_reply_to: String,
++    pub accepted: bool,
++    #[serde(rename = "helperAddr")]
++    pub helper_addr: String,
++    #[serde(rename = "observedAddress")]
++    pub observed_address: Option<TraversalAddress>,
++    pub reason: Option<String>,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum PunchPacketKind {
+     Probe,
+diff --git a/src/node/handlers/rx_loop.rs b/src/node/handlers/rx_loop.rs
+index 334055a..90d76ed 100644
+--- a/src/node/handlers/rx_loop.rs
++++ b/src/node/handlers/rx_loop.rs
+@@ -147,15 +147,22 @@ impl Node {
+     /// Dispatches based on the phase field in the 4-byte common prefix.
+     async fn process_packet(&mut self, packet: ReceivedPacket) {
+         if packet.data.len() < COMMON_PREFIX_SIZE {
++            let _ = self.try_handle_peer_assist_probe(&packet).await;
+             return; // Drop packets too short for common prefix
+         }
+ 
+         let prefix = match CommonPrefix::parse(&packet.data) {
+             Some(p) => p,
+-            None => return, // Malformed prefix
++            None => {
++                let _ = self.try_handle_peer_assist_probe(&packet).await;
++                return; // Malformed prefix
++            }
+         };
+ 
+         if prefix.version != FMP_VERSION {
++            if self.try_handle_peer_assist_probe(&packet).await {
++                return;
++            }
+             debug!(
+                 version = prefix.version,
+                 transport_id = %packet.transport_id,
+@@ -175,6 +182,9 @@ impl Node {
+                 self.handle_msg2(packet).await;
+             }
+             _ => {
++                if self.try_handle_peer_assist_probe(&packet).await {
++                    return;
++                }
+                 debug!(
+                     phase = prefix.phase,
+                     transport_id = %packet.transport_id,
+@@ -183,4 +193,43 @@ impl Node {
+             }
+         }
+     }
++
++    #[cfg(feature = "nostr-discovery")]
++    async fn try_handle_peer_assist_probe(&self, packet: &ReceivedPacket) -> bool {
++        if !self
++            .config
++            .node
++            .discovery
++            .nostr
++            .peer_assist
++            .private_enabled()
++        {
++            return false;
++        }
++        let Some(public_addr) = self
++            .peer_assist_endpoints
++            .get(&packet.transport_id)
++            .copied()
++        else {
++            return false;
++        };
++        let Some(remote_addr) = packet
++            .remote_addr
++            .as_str()
++            .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
++        else {
++            return false;
++        };
++        let Some(runtime) = self.nostr_discovery.clone() else {
++            return false;
++        };
++        runtime
++            .observe_peer_assist_probe(public_addr, remote_addr, &packet.data)
++            .await
++    }
++
++    #[cfg(not(feature = "nostr-discovery"))]
++    async fn try_handle_peer_assist_probe(&self, _packet: &ReceivedPacket) -> bool {
++        false
++    }
+ }
+diff --git a/src/node/lifecycle.rs b/src/node/lifecycle.rs
+index 574d3eb..a01efe7 100644
+--- a/src/node/lifecycle.rs
++++ b/src/node/lifecycle.rs
+@@ -3,6 +3,8 @@
+ use super::{Node, NodeError, NodeState};
+ use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
+ #[cfg(feature = "nostr-discovery")]
++use crate::discovery::nostr::stun::observe_traversal_addresses;
++#[cfg(feature = "nostr-discovery")]
+ use crate::discovery::nostr::{
+     ADVERT_IDENTIFIER, ADVERT_VERSION, BootstrapEvent, NostrDiscovery, OverlayAdvert,
+     OverlayEndpointAdvert, OverlayTransportKind,
+@@ -575,6 +577,7 @@ impl Node {
+                 .await
+             {
+                 Ok(runtime) => {
++                    self.refresh_base_udp_helper_endpoints().await;
+                     if let Err(err) = self.refresh_overlay_advert(&runtime).await {
+                         warn!(error = %err, "Failed to publish initial Nostr overlay advert");
+                     }
+@@ -1299,7 +1302,7 @@ impl Node {
+     }
+ 
+     #[cfg(feature = "nostr-discovery")]
+-    fn build_overlay_advert(&self) -> Option<OverlayAdvert> {
++    pub(in crate::node) fn build_overlay_advert(&self) -> Option<OverlayAdvert> {
+         if !self.config.node.discovery.nostr.enabled {
+             return None;
+         }
+@@ -1381,15 +1384,96 @@ impl Node {
+             endpoints,
+             signal_relays: has_udp_nat.then(|| self.config.node.discovery.nostr.dm_relays.clone()),
+             stun_servers: has_udp_nat
+-                .then(|| self.config.node.discovery.nostr.stun_servers.clone()),
++                .then(|| self.config.node.discovery.nostr.stun_servers.clone())
++                .filter(|servers| !servers.is_empty()),
+         })
+     }
+ 
++    #[cfg(feature = "nostr-discovery")]
++    async fn refresh_base_udp_helper_endpoints(&mut self) {
++        if !self.config.node.discovery.nostr.enabled
++            || !self
++                .config
++                .node
++                .discovery
++                .nostr
++                .peer_assist
++                .private_enabled()
++            || self.config.node.discovery.nostr.stun_servers.is_empty()
++        {
++            return;
++        }
++
++        let mut helper_updates = Vec::new();
++        let stun_servers = self.config.node.discovery.nostr.stun_servers.clone();
++
++        for (transport_id, handle) in &self.transports {
++            if handle.transport_type().name != "udp" || !handle.is_operational() {
++                continue;
++            }
++
++            let Some(cfg) = self.lookup_udp_config(handle.name()) else {
++                continue;
++            };
++            if !cfg.advertise_on_nostr() || cfg.is_public() || !cfg.peer_assist_enabled() {
++                continue;
++            }
++
++            let socket = match handle.try_clone_udp_socket() {
++                Ok(socket) => socket,
++                Err(err) => {
++                    debug!(
++                        transport_id = %transport_id,
++                        error = %err,
++                        "Failed to clone UDP socket for helper endpoint observation"
++                    );
++                    continue;
++                }
++            };
++
++            match observe_traversal_addresses(
++                &socket,
++                &stun_servers,
++                self.config.node.discovery.nostr.share_local_candidates,
++            )
++            .await
++            {
++                Ok((Some(reflexive), _, _)) => {
++                    if let Ok(addr) = format!("{}:{}", reflexive.ip, reflexive.port).parse() {
++                        helper_updates.push((*transport_id, addr));
++                    }
++                }
++                Ok((None, _, _)) => {}
++                Err(err) => {
++                    debug!(
++                        transport_id = %transport_id,
++                        error = %err,
++                        "Failed to observe helper endpoint for UDP transport"
++                    );
++                }
++            }
++        }
++
++        for (transport_id, addr) in helper_updates {
++            self.peer_assist_endpoints.insert(transport_id, addr);
++        }
++    }
++
+     #[cfg(feature = "nostr-discovery")]
+     async fn refresh_overlay_advert(
+         &self,
+         bootstrap: &std::sync::Arc<NostrDiscovery>,
+     ) -> Result<(), crate::discovery::nostr::BootstrapError> {
++        let mut helper_endpoints = self
++            .peer_assist_endpoints
++            .values()
++            .copied()
++            .collect::<Vec<_>>();
++        helper_endpoints.sort();
++        helper_endpoints.dedup();
++        bootstrap
++            .update_private_helper_endpoints(helper_endpoints)
++            .await;
+         let advert = self.build_overlay_advert();
+         bootstrap.update_local_advert(advert).await
+     }
+@@ -1598,6 +1682,21 @@ impl Node {
+             crate::transport::TransportHandle::Udp(transport),
+         );
+         self.bootstrap_transports.insert(transport_id);
++        if traversal
++            .transport_config
++            .as_ref()
++            .is_some_and(|cfg| cfg.peer_assist_enabled())
++            && let Some(public_endpoint) = traversal.public_endpoint
++        {
++            self.peer_assist_endpoints
++                .insert(transport_id, public_endpoint);
++        }
++        #[cfg(feature = "nostr-discovery")]
++        if let Some(runtime) = self.nostr_discovery.clone()
++            && let Err(err) = self.refresh_overlay_advert(&runtime).await
++        {
++            debug!(error = %err, "Failed to refresh local Nostr overlay advert after traversal adoption");
++        }
+ 
+         let remote_addr = TransportAddr::from_string(&traversal.remote_addr.to_string());
+         if let Err(err) = self
+@@ -1605,9 +1704,16 @@ impl Node {
+             .await
+         {
+             self.bootstrap_transports.remove(&transport_id);
++            self.peer_assist_endpoints.remove(&transport_id);
+             if let Some(mut handle) = self.transports.remove(&transport_id) {
+                 let _ = handle.stop().await;
+             }
++            #[cfg(feature = "nostr-discovery")]
++            if let Some(runtime) = self.nostr_discovery.clone()
++                && let Err(refresh_err) = self.refresh_overlay_advert(&runtime).await
++            {
++                debug!(error = %refresh_err, "Failed to refresh local Nostr overlay advert after traversal cleanup");
++            }
+             return Err(err);
+         }
+ 
+diff --git a/src/node/mod.rs b/src/node/mod.rs
+index 6467d3a..69c03d1 100644
+--- a/src/node/mod.rs
++++ b/src/node/mod.rs
+@@ -435,6 +435,9 @@ pub struct Node {
+     nostr_discovery: Option<Arc<crate::discovery::nostr::NostrDiscovery>>,
+     /// Per-peer UDP transports adopted from NAT traversal handoff.
+     bootstrap_transports: HashSet<TransportId>,
++    /// Publicly reachable helper endpoints for live UDP transports that may be
++    /// used for peer-assisted rendezvous.
++    peer_assist_endpoints: HashMap<TransportId, std::net::SocketAddr>,
+ 
+     // === Periodic Parent Re-evaluation ===
+     /// Timestamp of last periodic parent re-evaluation (for pacing).
+@@ -599,6 +602,7 @@ impl Node {
+             #[cfg(feature = "nostr-discovery")]
+             nostr_discovery: None,
+             bootstrap_transports: HashSet::new(),
++            peer_assist_endpoints: HashMap::new(),
+             last_parent_reeval: None,
+             last_congestion_log: None,
+             estimated_mesh_size: None,
+@@ -727,6 +731,7 @@ impl Node {
+             #[cfg(feature = "nostr-discovery")]
+             nostr_discovery: None,
+             bootstrap_transports: HashSet::new(),
++            peer_assist_endpoints: HashMap::new(),
+             last_parent_reeval: None,
+             last_congestion_log: None,
+             estimated_mesh_size: None,
+@@ -1437,6 +1442,7 @@ impl Node {
+         );
+ 
+         self.bootstrap_transports.remove(&transport_id);
++        self.peer_assist_endpoints.remove(&transport_id);
+         self.transport_drops.remove(&transport_id);
+         self.transports.remove(&transport_id);
+     }
+diff --git a/src/node/tests/bootstrap.rs b/src/node/tests/bootstrap.rs
+index bfb3bd5..3d5af43 100644
+--- a/src/node/tests/bootstrap.rs
++++ b/src/node/tests/bootstrap.rs
+@@ -1,8 +1,14 @@
++#![cfg(feature = "nostr-discovery")]
++
+ //! Integration tests for bootstrap handoff into the FIPS node.
+ 
+ use super::*;
+ use crate::EstablishedTraversal;
+-use crate::config::UdpConfig;
++use crate::config::{PeerAssistMode, PeerConfig, TransportInstances, UdpConfig};
++use crate::discovery::nostr::{
++    ADVERT_IDENTIFIER, ADVERT_VERSION, AssistGrant, AssistObserved, AssistRequest, NostrDiscovery,
++    OverlayAdvert, OverlayEndpointAdvert, OverlayTransportKind, PEER_ASSIST_MAGIC,
++};
+ use crate::node::wire::{PHASE_MSG1, PHASE_MSG2};
+ use crate::transport::udp::UdpTransport;
+ use crate::utils::index::IndexAllocator;
+@@ -187,6 +193,7 @@ async fn test_third_peer_can_handshake_via_adopted_transport_socket() {
+     let mut transport_c = UdpTransport::new(transport_id_c, None, udp_config, packet_tx_c);
+     transport_c.start_async().await.unwrap();
+     let addr_c = transport_c.local_addr().unwrap();
++    let addr_c_label = addr_c.to_string();
+     node_c
+         .transports
+         .insert(transport_id_c, TransportHandle::Udp(transport_c));
+@@ -207,7 +214,7 @@ async fn test_third_peer_can_handshake_via_adopted_transport_socket() {
+             .await
+             .expect("timeout waiting for Colin->Bob msg1")
+             .expect("node_b channel closed");
+-        if pkt.remote_addr.as_str() == Some(&addr_c.to_string())
++        if pkt.remote_addr.as_str() == Some(addr_c_label.as_str())
+             && pkt.data.first().map(|b| b & 0x0f) == Some(PHASE_MSG1)
+         {
+             break pkt;
+@@ -243,3 +250,331 @@ async fn test_third_peer_can_handshake_via_adopted_transport_socket() {
+         transport.stop().await.ok();
+     }
+ }
++
++#[tokio::test]
++async fn test_adopted_traversal_public_endpoint_stays_private() {
++    let mut node_a = make_node();
++    let mut node_b = make_node();
++    node_b.config.node.discovery.nostr.enabled = true;
++    node_b.config.node.discovery.nostr.peer_assist.mode = PeerAssistMode::FallbackPrivate;
++    node_b.config.transports.udp = TransportInstances::Single(UdpConfig {
++        advertise_on_nostr: Some(true),
++        public: Some(false),
++        peer_assist: Some(true),
++        ..Default::default()
++    });
++
++    let transport_id_a = TransportId::new(1);
++    let udp_config = UdpConfig {
++        bind_addr: Some("127.0.0.1:0".to_string()),
++        mtu: Some(1280),
++        ..Default::default()
++    };
++
++    let (packet_tx_a, packet_rx_a) = packet_channel(64);
++    let (packet_tx_b, packet_rx_b) = packet_channel(64);
++
++    node_a.packet_tx = Some(packet_tx_a.clone());
++    node_a.packet_rx = Some(packet_rx_a);
++    node_a.state = NodeState::Running;
++
++    node_b.packet_tx = Some(packet_tx_b.clone());
++    node_b.packet_rx = Some(packet_rx_b);
++    node_b.state = NodeState::Running;
++
++    let mut transport_a = UdpTransport::new(transport_id_a, None, udp_config, packet_tx_a);
++    transport_a.start_async().await.unwrap();
++    let addr_a = transport_a.local_addr().unwrap();
++    node_a
++        .transports
++        .insert(transport_id_a, TransportHandle::Udp(transport_a));
++
++    let adopted_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
++    let handoff = EstablishedTraversal::new("sess-helper", node_a.npub(), addr_a, adopted_socket)
++        .with_public_endpoint("198.51.100.20:44750".parse().unwrap());
++    node_b.adopt_established_traversal(handoff).await.unwrap();
++
++    let advert = node_b
++        .build_overlay_advert()
++        .expect("private assist advert");
++    assert!(
++        advert
++            .endpoints
++            .iter()
++            .any(|endpoint| endpoint.addr == "nat"),
++        "node_b should still advertise udp:nat for Nostr onboarding"
++    );
++    assert!(
++        !serde_json::to_string(&advert)
++            .unwrap()
++            .contains("198.51.100.20:44750"),
++        "private helper endpoints must not be published in the overlay advert"
++    );
++
++    for (_, transport) in node_a.transports.iter_mut() {
++        transport.stop().await.ok();
++    }
++    for (_, transport) in node_b.transports.iter_mut() {
++        transport.stop().await.ok();
++    }
++}
++
++#[tokio::test]
++async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
++    let mut node_a = make_node(); // Existing traversal peer (Alice)
++    let mut node_b = make_node(); // Helper node with adopted socket (Bob)
++    let mut node_c = make_node(); // New peer using peer assist (Colin)
++
++    let transport_id_a = TransportId::new(1);
++    let udp_config = UdpConfig {
++        bind_addr: Some("127.0.0.1:0".to_string()),
++        mtu: Some(1280),
++        ..Default::default()
++    };
++
++    let (packet_tx_a, packet_rx_a) = packet_channel(64);
++    let (packet_tx_b, packet_rx_b) = packet_channel(128);
++    let (packet_tx_c, packet_rx_c) = packet_channel(64);
++
++    node_a.packet_tx = Some(packet_tx_a.clone());
++    node_a.packet_rx = Some(packet_rx_a);
++    node_a.state = NodeState::Running;
++
++    node_b.packet_tx = Some(packet_tx_b.clone());
++    node_b.packet_rx = Some(packet_rx_b);
++    node_b.state = NodeState::Running;
++
++    node_c.packet_tx = Some(packet_tx_c.clone());
++    node_c.packet_rx = Some(packet_rx_c);
++    node_c.state = NodeState::Running;
++
++    let mut transport_a = UdpTransport::new(transport_id_a, None, udp_config.clone(), packet_tx_a);
++    transport_a.start_async().await.unwrap();
++    let addr_a = transport_a.local_addr().unwrap();
++    node_a
++        .transports
++        .insert(transport_id_a, TransportHandle::Udp(transport_a));
++
++    node_b.config.node.discovery.nostr.enabled = true;
++    node_b.config.node.discovery.nostr.peer_assist.mode = PeerAssistMode::FallbackPrivate;
++    node_b.config.transports.udp = TransportInstances::Single(UdpConfig {
++        advertise_on_nostr: Some(true),
++        public: Some(false),
++        peer_assist: Some(true),
++        ..Default::default()
++    });
++
++    let adopted_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
++    let helper_addr = adopted_socket.local_addr().unwrap();
++    let handoff = EstablishedTraversal::new("sess-existing", node_a.npub(), addr_a, adopted_socket)
++        .with_public_endpoint(helper_addr);
++    let _handoff_result = node_b.adopt_established_traversal(handoff).await.unwrap();
++
++    // Drive Alice/Bob handshake manually to establish Bob's adopted transport first.
++    let mut rx_a = node_a.packet_rx.take().expect("node_a packet_rx");
++    let mut rx_b = node_b.packet_rx.take().expect("node_b packet_rx");
++
++    let pkt_at_a = timeout(Duration::from_secs(1), rx_a.recv())
++        .await
++        .expect("timeout waiting for Bob->Alice msg1")
++        .expect("node_a channel closed");
++    assert_eq!(pkt_at_a.data[0] & 0x0f, PHASE_MSG1);
++    node_a.handle_msg1(pkt_at_a).await;
++
++    let pkt_at_b = timeout(Duration::from_secs(1), rx_b.recv())
++        .await
++        .expect("timeout waiting for Alice->Bob msg2")
++        .expect("node_b channel closed");
++    assert_eq!(pkt_at_b.data[0] & 0x0f, PHASE_MSG2);
++    node_b.handle_msg2(pkt_at_b).await;
++
++    let node_a_addr = *PeerIdentity::from_pubkey_full(node_a.identity.pubkey_full()).node_addr();
++    assert!(
++        node_b.get_peer(&node_a_addr).is_some(),
++        "node_b should first be connected to node_a via adopted transport"
++    );
++
++    let mut bob_runtime_config = node_b.config.node.discovery.nostr.clone();
++    bob_runtime_config.enabled = true;
++    bob_runtime_config.peer_assist.mode = PeerAssistMode::FallbackPrivate;
++    bob_runtime_config.dm_relays = vec!["wss://relay.example".to_string()];
++    let bob_runtime = NostrDiscovery::new_for_test(&node_b.identity, bob_runtime_config);
++    bob_runtime
++        .update_private_helper_endpoints(vec![helper_addr])
++        .await;
++
++    let mut colin_runtime_config = node_c.config.node.discovery.nostr.clone();
++    colin_runtime_config.enabled = true;
++    colin_runtime_config.stun_servers.clear();
++    colin_runtime_config.peer_assist.mode = PeerAssistMode::FallbackPrivate;
++    colin_runtime_config.dm_relays = vec!["wss://relay.example".to_string()];
++    let colin_runtime = NostrDiscovery::new_for_test(&node_c.identity, colin_runtime_config);
++
++    let bob_advert = OverlayAdvert {
++        identifier: ADVERT_IDENTIFIER.to_string(),
++        version: ADVERT_VERSION,
++        endpoints: vec![OverlayEndpointAdvert {
++            transport: OverlayTransportKind::Udp,
++            addr: "nat".to_string(),
++        }],
++        signal_relays: Some(vec!["wss://relay.example".to_string()]),
++        stun_servers: None,
++    };
++    let bob_peer_config = PeerConfig {
++        npub: node_b.npub(),
++        via_nostr: true,
++        ..Default::default()
++    };
++
++    let colin_connect_task = tokio::spawn({
++        let runtime = colin_runtime.clone();
++        let peer_config = bob_peer_config.clone();
++        let advert = bob_advert.clone();
++        async move {
++            runtime
++                .connect_peer_via_private_assist_for_test(peer_config, advert)
++                .await
++        }
++    });
++
++    let request: AssistRequest = loop {
++        let signals = colin_runtime.drain_test_signals().await;
++        if let Some(request) = signals
++            .into_iter()
++            .find_map(|payload| serde_json::from_str::<AssistRequest>(&payload).ok())
++        {
++            break request;
++        }
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    };
++
++    let colin_nostr_pubkey =
++        nostr::Keys::parse(&hex::encode(node_c.identity.keypair().secret_bytes()))
++            .unwrap()
++            .public_key();
++
++    bob_runtime
++        .clone()
++        .handle_incoming_assist_request_for_test(request.clone(), colin_nostr_pubkey, node_c.npub())
++        .await
++        .expect("register Bob-side peer assist observation");
++
++    let grant: AssistGrant = loop {
++        let signals = bob_runtime.drain_test_signals().await;
++        if let Some(grant) = signals
++            .into_iter()
++            .find_map(|payload| serde_json::from_str::<AssistGrant>(&payload).ok())
++        {
++            break grant;
++        }
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    };
++    let helper_addr_label = helper_addr.to_string();
++    assert_eq!(
++        grant.helper_addr.as_deref(),
++        Some(helper_addr_label.as_str())
++    );
++
++    colin_runtime
++        .inject_assist_grant_for_test(grant.clone(), node_b.npub())
++        .await;
++
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
++    let probe_packet = loop {
++        let pkt = timeout_at(deadline, rx_b.recv())
++            .await
++            .expect("timeout waiting for Colin private-assist probe")
++            .expect("node_b channel closed");
++        if pkt.data.len() >= 4
++            && u32::from_be_bytes(pkt.data[0..4].try_into().unwrap()) == PEER_ASSIST_MAGIC
++        {
++            break pkt;
++        }
++    };
++    let observed_addr = probe_packet
++        .remote_addr
++        .as_str()
++        .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
++        .expect("probe remote addr");
++    assert!(
++        bob_runtime
++            .observe_peer_assist_probe(helper_addr, observed_addr, &probe_packet.data)
++            .await,
++        "Bob should accept the observed peer-assist probe"
++    );
++
++    let observed: AssistObserved = loop {
++        let signals = bob_runtime.drain_test_signals().await;
++        if let Some(observed) = signals
++            .into_iter()
++            .find_map(|payload| serde_json::from_str::<AssistObserved>(&payload).ok())
++        {
++            break observed;
++        }
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    };
++    let observed_addr_label = observed_addr.to_string();
++    assert_eq!(
++        observed
++            .observed_address
++            .as_ref()
++            .map(|addr| format!("{}:{}", addr.ip, addr.port))
++            .as_deref(),
++        Some(observed_addr_label.as_str())
++    );
++
++    colin_runtime
++        .inject_assist_observed_for_test(observed, node_b.npub())
++        .await;
++
++    let traversal = timeout(Duration::from_secs(2), colin_connect_task)
++        .await
++        .expect("timeout waiting for Colin traversal result")
++        .expect("join peer-assist connect task")
++        .expect("Colin traversal result");
++    assert_eq!(traversal.remote_addr, helper_addr);
++    assert_eq!(traversal.public_endpoint, Some(observed_addr));
++
++    let _handoff = node_c.adopt_established_traversal(traversal).await.unwrap();
++
++    let mut rx_c = node_c.packet_rx.take().expect("node_c packet_rx");
++
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
++    let pkt_at_b = loop {
++        let pkt = timeout_at(deadline, rx_b.recv())
++            .await
++            .expect("timeout waiting for Colin->Bob msg1")
++            .expect("node_b channel closed");
++        if pkt.data.first().map(|b| b & 0x0f) == Some(PHASE_MSG1) {
++            break pkt;
++        }
++    };
++    node_b.handle_msg1(pkt_at_b).await;
++
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
++    let pkt_at_c = loop {
++        let pkt = timeout_at(deadline, rx_c.recv())
++            .await
++            .expect("timeout waiting for Bob->Colin msg2")
++            .expect("node_c channel closed");
++        if pkt.data.first().map(|b| b & 0x0f) == Some(PHASE_MSG2) {
++            break pkt;
++        }
++    };
++    node_c.handle_msg2(pkt_at_c).await;
++
++    let node_c_addr = *PeerIdentity::from_pubkey_full(node_c.identity.pubkey_full()).node_addr();
++    assert!(
++        node_b.get_peer(&node_c_addr).is_some(),
++        "node_b should promote node_c after peer-assist handoff and handshake"
++    );
++    for (_, transport) in node_a.transports.iter_mut() {
++        transport.stop().await.ok();
++    }
++    for (_, transport) in node_b.transports.iter_mut() {
++        transport.stop().await.ok();
++    }
++    for (_, transport) in node_c.transports.iter_mut() {
++        transport.stop().await.ok();
++    }
++}
+diff --git a/src/node/tests/mod.rs b/src/node/tests/mod.rs
+index b087570..21c598a 100644
+--- a/src/node/tests/mod.rs
++++ b/src/node/tests/mod.rs
+@@ -9,6 +9,7 @@ mod acl;
+ mod ble;
+ mod bloom;
+ mod bloom_poison;
++#[cfg(feature = "nostr-discovery")]
+ mod bootstrap;
+ mod disconnect;
+ mod discovery;
+diff --git a/src/transport/mod.rs b/src/transport/mod.rs
+index 41d0f8d..a31d9b5 100644
+--- a/src/transport/mod.rs
++++ b/src/transport/mod.rs
+@@ -998,6 +998,16 @@ impl TransportHandle {
+         }
+     }
+ 
++    /// Clone the live UDP socket as a standard socket.
++    pub fn try_clone_udp_socket(&self) -> Result<std::net::UdpSocket, TransportError> {
++        match self {
++            TransportHandle::Udp(t) => t.try_clone_std_socket(),
++            _ => Err(TransportError::NotSupported(
++                "standard UDP socket clone only supported for UDP transports".into(),
++            )),
++        }
++    }
++
+     /// Get the interface name (Ethernet only, returns None for other transports).
+     pub fn interface_name(&self) -> Option<&str> {
+         match self {
+diff --git a/src/transport/udp/mod.rs b/src/transport/udp/mod.rs
+index 50bfa05..425462a 100644
+--- a/src/transport/udp/mod.rs
++++ b/src/transport/udp/mod.rs
+@@ -38,6 +38,8 @@ pub struct UdpTransport {
+     state: TransportState,
+     /// Bound socket (None until started).
+     socket: Option<AsyncUdpSocket>,
++    /// Duplicate standard socket handle for STUN/helper observation.
++    std_socket: Option<std::net::UdpSocket>,
+     /// Channel for delivering received packets to Node.
+     packet_tx: PacketTx,
+     /// Receive loop task handle.
+@@ -64,6 +66,7 @@ impl UdpTransport {
+             config,
+             state: TransportState::Configured,
+             socket: None,
++            std_socket: None,
+             packet_tx,
+             recv_task: None,
+             local_addr: None,
+@@ -82,6 +85,15 @@ impl UdpTransport {
+         self.local_addr
+     }
+ 
++    /// Clone the live UDP socket as a standard socket.
++    pub fn try_clone_std_socket(&self) -> Result<std::net::UdpSocket, TransportError> {
++        self.std_socket
++            .as_ref()
++            .ok_or(TransportError::NotStarted)?
++            .try_clone()
++            .map_err(|e| TransportError::StartFailed(format!("socket clone failed: {}", e)))
++    }
++
+     /// Get the transport statistics.
+     pub fn stats(&self) -> &Arc<UdpStats> {
+         &self.stats
+@@ -160,6 +172,7 @@ impl UdpTransport {
+         let actual_recv = raw_socket.recv_buffer_size()?;
+         let actual_send = raw_socket.send_buffer_size()?;
+         self.local_addr = Some(raw_socket.local_addr());
++        self.std_socket = Some(raw_socket.try_clone_std()?);
+ 
+         // Wrap in AsyncFd for tokio integration
+         let async_socket = raw_socket.into_async()?;
+@@ -221,6 +234,7 @@ impl UdpTransport {
+         let actual_recv = raw_socket.recv_buffer_size()?;
+         let actual_send = raw_socket.send_buffer_size()?;
+         self.local_addr = Some(raw_socket.local_addr());
++        self.std_socket = Some(raw_socket.try_clone_std()?);
+ 
+         let async_socket = raw_socket.into_async()?;
+         self.socket = Some(async_socket.clone());
+@@ -271,6 +285,7 @@ impl UdpTransport {
+ 
+         // Drop socket
+         self.socket.take();
++        self.std_socket.take();
+         self.local_addr = None;
+ 
+         self.state = TransportState::Down;
+@@ -385,6 +400,7 @@ impl Drop for UdpTransport {
+             task.abort();
+         }
+         self.socket.take();
++        self.std_socket.take();
+         self.local_addr = None;
+     }
+ }
+@@ -461,6 +477,7 @@ mod tests {
+             send_buf_size: None,
+             advertise_on_nostr: None,
+             public: None,
++            peer_assist: None,
+         }
+     }
+ 
+diff --git a/src/transport/udp/socket.rs b/src/transport/udp/socket.rs
+index c17c1ee..c976ffb 100644
+--- a/src/transport/udp/socket.rs
++++ b/src/transport/udp/socket.rs
+@@ -205,6 +205,15 @@ mod platform {
+             self.local_addr
+         }
+ 
++        /// Duplicate this socket as a standard UDP socket.
++        pub fn try_clone_std(&self) -> Result<std::net::UdpSocket, TransportError> {
++            let cloned = self
++                .inner
++                .try_clone()
++                .map_err(|e| TransportError::StartFailed(format!("socket clone failed: {}", e)))?;
++            Ok(cloned.into())
++        }
++
+         /// Get the actual receive buffer size granted by the kernel.
+         pub fn recv_buffer_size(&self) -> Result<usize, TransportError> {
+             self.inner
+@@ -482,6 +491,15 @@ mod platform {
+             self.local_addr
+         }
+ 
++        /// Duplicate this socket as a standard UDP socket.
++        pub fn try_clone_std(&self) -> Result<std::net::UdpSocket, TransportError> {
++            let cloned = self
++                .inner
++                .try_clone()
++                .map_err(|e| TransportError::StartFailed(format!("socket clone failed: {}", e)))?;
++            Ok(cloned.into())
++        }
++
+         /// Get the actual receive buffer size.
+         pub fn recv_buffer_size(&self) -> Result<usize, TransportError> {
+             self.inner

@@ -251,10 +251,11 @@ sides punch at the negotiated time. On success, the punch socket is
 adopted as an FMP UDP transport and Noise IK proceeds normally.
 
 > **Validation:** `advertise_on_nostr: true` with `public: false` on UDP
-> requires both `dm_relays` and `stun_servers` to be non-empty. The
-> node fails startup with a config validation error if either list is
-> empty. This is enforced because a `udp:nat` advert without signaling
-> relays or STUN servers is unreachable by construction.
+> always requires `dm_relays` to be non-empty. It also requires either
+> non-empty `stun_servers` or an enabled peer-assist helper on a private UDP
+> transport marked `peer_assist: true`. In the no-STUN helper case, `udp:nat`
+> publication is deferred until the node has learned a usable helper endpoint
+> from an adopted traversal.
 
 Works best with full-cone NAT on at least one side. Symmetric NAT on
 both sides is not reliably traversable with this protocol and will time
@@ -345,8 +346,9 @@ The following combinations are rejected with `ConfigError::Validation`:
   `node.discovery.nostr.enabled` is `false` or absent.
 - A UDP transport sets `advertise_on_nostr: true` with `public: false`
   (a `udp:nat` advert) but `dm_relays` is empty.
-- A UDP transport sets `advertise_on_nostr: true` with `public: false`
-  but `stun_servers` is empty.
+- A UDP transport sets `advertise_on_nostr: true` with `public: false`,
+  `stun_servers` is empty, and peer-assist helper mode is not enabled on
+  an advertised private UDP transport.
 
 ## Under the covers
 

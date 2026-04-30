@@ -34,17 +34,20 @@ node:
     #     - "stun:stun.l.google.com:19302"
     #     - "stun:stun.cloudflare.com:3478"
     #     - "stun:global.stun.twilio.com:3478"
-    #   # Private peer-assisted onboarding is disabled by default. Enable only
-    #   # for trusted helpers; allowlist expected requester npubs in production.
+    #   # Private peer-assisted onboarding is disabled by default. `dial_mode`
+    #   # controls outgoing use; `helper.enabled` controls serving requests.
+    #   # Keep helpers allowlisted in production unless intentionally open.
     #   peer_assist:
-    #     mode: disabled # disabled | fallback_private | prefer_private
-    #     request_policy: allowlist # open_rate_limited | allowlist
-    #     request_allowlist:
-    #       - "npub1..."
-    #     max_pending_requests: 16
+    #     dial_mode: disabled # disabled | fallback_private | prefer_private
     #     grant_ttl_secs: 15
-    #     max_requests_per_peer_per_window: 4
-    #     request_window_secs: 60
+    #     helper:
+    #       enabled: false
+    #       request_policy: allowlist # open_rate_limited | allowlist
+    #       request_allowlist:
+    #         - "npub1..."
+    #       max_pending_requests: 16
+    #       max_requests_per_peer_per_window: 4
+    #       request_window_secs: 60
 
 tun:
   enabled: true

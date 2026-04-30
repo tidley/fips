@@ -14,6 +14,9 @@ use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
+use super::assist::{
+    PeerAssistState, PendingPrivateAssistGrant, RateLimitWindow, allow_in_rate_window,
+};
 use super::signal::{
     SignalEnvelope, build_peer_assist_probe, build_signal_event, create_assist_grant,
     create_assist_observed, create_assist_request, create_traversal_answer, create_traversal_offer,
@@ -56,21 +59,6 @@ fn endpoint_summary(endpoints: &[OverlayEndpointAdvert]) -> String {
         .join(",")
 }
 
-#[derive(Debug, Clone)]
-struct PendingPrivateAssistGrant {
-    request_id: String,
-    grant_id: String,
-    grant_nonce: String,
-    probe_token: String,
-    sender_pubkey: PublicKey,
-    sender_npub: String,
-    helper_addr: String,
-    relays: Vec<String>,
-    expires_at: u64,
-}
-
-type RateLimitWindow = HashMap<String, Vec<u64>>;
-
 pub struct NostrDiscovery {
     client: Client,
     keys: nostr::Keys,
@@ -81,12 +69,7 @@ pub struct NostrDiscovery {
     local_advert: RwLock<Option<OverlayAdvert>>,
     current_advert_event_id: RwLock<Option<EventId>>,
     pending_answers: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<TraversalAnswer>>>>,
-    pending_assist_grants: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<AssistGrant>>>>,
-    pending_assist_observed:
-        Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<AssistObserved>>>>,
-    pending_private_assist_grants: Mutex<HashMap<String, PendingPrivateAssistGrant>>,
-    helper_endpoints: RwLock<Vec<std::net::SocketAddr>>,
-    assist_request_windows: Mutex<RateLimitWindow>,
+    peer_assist: PeerAssistState,
     traversal_offer_windows: Mutex<RateLimitWindow>,
     active_initiators: Mutex<HashSet<String>>,
     seen_sessions: Mutex<HashMap<String, u64>>,
@@ -99,6 +82,8 @@ pub struct NostrDiscovery {
     test_capture_outgoing: bool,
     #[cfg(test)]
     test_sent_signals: Mutex<Vec<String>>,
+    #[cfg(test)]
+    test_sent_deletes: Mutex<Vec<Vec<String>>>,
 }
 
 impl NostrDiscovery {
@@ -143,11 +128,7 @@ impl NostrDiscovery {
             local_advert: RwLock::new(None),
             current_advert_event_id: RwLock::new(None),
             pending_answers: Mutex::new(HashMap::new()),
-            pending_assist_grants: Mutex::new(HashMap::new()),
-            pending_assist_observed: Mutex::new(HashMap::new()),
-            pending_private_assist_grants: Mutex::new(HashMap::new()),
-            helper_endpoints: RwLock::new(Vec::new()),
-            assist_request_windows: Mutex::new(HashMap::new()),
+            peer_assist: PeerAssistState::new(),
             traversal_offer_windows: Mutex::new(HashMap::new()),
             active_initiators: Mutex::new(HashSet::new()),
             seen_sessions: Mutex::new(HashMap::new()),
@@ -160,6 +141,8 @@ impl NostrDiscovery {
             test_capture_outgoing: false,
             #[cfg(test)]
             test_sent_signals: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_sent_deletes: Mutex::new(Vec::new()),
         });
 
         runtime.subscribe().await?;
@@ -195,11 +178,7 @@ impl NostrDiscovery {
             local_advert: RwLock::new(None),
             current_advert_event_id: RwLock::new(None),
             pending_answers: Mutex::new(HashMap::new()),
-            pending_assist_grants: Mutex::new(HashMap::new()),
-            pending_assist_observed: Mutex::new(HashMap::new()),
-            pending_private_assist_grants: Mutex::new(HashMap::new()),
-            helper_endpoints: RwLock::new(Vec::new()),
-            assist_request_windows: Mutex::new(HashMap::new()),
+            peer_assist: PeerAssistState::new(),
             traversal_offer_windows: Mutex::new(HashMap::new()),
             active_initiators: Mutex::new(HashSet::new()),
             seen_sessions: Mutex::new(HashMap::new()),
@@ -210,6 +189,7 @@ impl NostrDiscovery {
             advertise_task: Mutex::new(None),
             test_capture_outgoing: true,
             test_sent_signals: Mutex::new(Vec::new()),
+            test_sent_deletes: Mutex::new(Vec::new()),
         })
     }
 
@@ -251,10 +231,41 @@ impl NostrDiscovery {
         std::mem::take(&mut *signals)
     }
 
-    pub async fn update_private_helper_endpoints(&self, mut endpoints: Vec<std::net::SocketAddr>) {
-        endpoints.sort();
-        endpoints.dedup();
-        *self.helper_endpoints.write().await = endpoints;
+    #[cfg(test)]
+    pub(crate) async fn drain_test_deletes(&self) -> Vec<Vec<String>> {
+        let mut deletes = self.test_sent_deletes.lock().await;
+        std::mem::take(&mut *deletes)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn current_advert_event_id_for_test(&self) -> Option<EventId> {
+        self.current_advert_event_id.read().await.to_owned()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_advert_for_test(&self, peer_npub: String, advert: OverlayAdvert) {
+        let now = now_ms();
+        self.advert_cache.write().await.insert(
+            peer_npub.clone(),
+            CachedOverlayAdvert {
+                author_npub: peer_npub,
+                advert,
+                created_at: now,
+                valid_until_ms: now.saturating_add(self.advert_max_age_ms()),
+            },
+        );
+    }
+
+    pub async fn update_private_helper_endpoints(&self, endpoints: Vec<std::net::SocketAddr>) {
+        self.peer_assist.update_helper_endpoints(endpoints).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn connect_peer_for_test(
+        &self,
+        peer_config: PeerConfig,
+    ) -> Result<EstablishedTraversal, BootstrapError> {
+        self.connect_peer(peer_config).await
     }
 
     #[cfg(test)]
@@ -294,18 +305,17 @@ impl NostrDiscovery {
         grant: AssistGrant,
         sender_npub: String,
     ) {
-        if let Some(tx) = self
-            .pending_assist_grants
-            .lock()
-            .await
-            .remove(&grant.in_reply_to)
-        {
-            let _ = tx.send(SignalEnvelope {
-                payload: grant,
-                event_id: EventId::all_zeros(),
-                sender_npub,
-            });
-        }
+        let in_reply_to = grant.in_reply_to.clone();
+        self.peer_assist
+            .complete_grant(
+                &in_reply_to,
+                SignalEnvelope {
+                    payload: grant,
+                    event_id: EventId::all_zeros(),
+                    sender_npub,
+                },
+            )
+            .await;
     }
 
     #[cfg(test)]
@@ -314,18 +324,17 @@ impl NostrDiscovery {
         observed: AssistObserved,
         sender_npub: String,
     ) {
-        if let Some(tx) = self
-            .pending_assist_observed
-            .lock()
-            .await
-            .remove(&observed.in_reply_to)
-        {
-            let _ = tx.send(SignalEnvelope {
-                payload: observed,
-                event_id: EventId::all_zeros(),
-                sender_npub,
-            });
-        }
+        let in_reply_to = observed.in_reply_to.clone();
+        self.peer_assist
+            .complete_observed(
+                &in_reply_to,
+                SignalEnvelope {
+                    payload: observed,
+                    event_id: EventId::all_zeros(),
+                    sender_npub,
+                },
+            )
+            .await;
     }
 
     pub async fn update_local_advert(
@@ -479,18 +488,17 @@ impl NostrDiscovery {
                         && grant.message_type == "assist-grant"
                         && grant.recipient_npub == self.npub
                     {
-                        if let Some(tx) = self
-                            .pending_assist_grants
-                            .lock()
-                            .await
-                            .remove(&grant.in_reply_to)
-                        {
-                            let _ = tx.send(SignalEnvelope {
-                                payload: grant,
-                                event_id: event.id,
-                                sender_npub: sender_npub.clone(),
-                            });
-                        }
+                        let in_reply_to = grant.in_reply_to.clone();
+                        self.peer_assist
+                            .complete_grant(
+                                &in_reply_to,
+                                SignalEnvelope {
+                                    payload: grant,
+                                    event_id: event.id,
+                                    sender_npub: sender_npub.clone(),
+                                },
+                            )
+                            .await;
                         continue;
                     }
 
@@ -499,18 +507,17 @@ impl NostrDiscovery {
                         && observed.message_type == "assist-observed"
                         && observed.recipient_npub == self.npub
                     {
-                        if let Some(tx) = self
-                            .pending_assist_observed
-                            .lock()
-                            .await
-                            .remove(&observed.in_reply_to)
-                        {
-                            let _ = tx.send(SignalEnvelope {
-                                payload: observed,
-                                event_id: event.id,
-                                sender_npub: sender_npub.clone(),
-                            });
-                        }
+                        let in_reply_to = observed.in_reply_to.clone();
+                        self.peer_assist
+                            .complete_observed(
+                                &in_reply_to,
+                                SignalEnvelope {
+                                    payload: observed,
+                                    event_id: event.id,
+                                    sender_npub: sender_npub.clone(),
+                                },
+                            )
+                            .await;
                         continue;
                     }
 
@@ -645,24 +652,15 @@ impl NostrDiscovery {
     }
 
     async fn publish_advert(&self) -> Result<(), BootstrapError> {
-        let previous_event_id = self.current_advert_event_id.read().await.to_owned();
         if !self.config.advertise {
-            if let Some(event_id) = previous_event_id {
-                self.publish_delete(&self.config.advert_relays, [event_id])
-                    .await?;
-                *self.current_advert_event_id.write().await = None;
-            }
-            return Ok(());
+            return self.retract_current_advert().await;
         }
 
         let mut advert = match self.local_advert.read().await.clone() {
             Some(advert) => advert,
-            // Transient absence (e.g., a single tick during startup where
-            // build_overlay_advert briefly returns None). Don't proactively
-            // emit a NIP-09 delete: the next publish supersedes the old
-            // event via parameterized-replaceable semantics, and the NIP-40
-            // expiration tag bounds the worst case if we never re-publish.
-            None => return Ok(()),
+            // No eligible local endpoints remain. Retract the previous advert
+            // so peers do not keep discovering stale udp:nat helper metadata.
+            None => return self.retract_current_advert().await,
         };
 
         advert.identifier = ADVERT_IDENTIFIER.to_string();
@@ -670,7 +668,7 @@ impl NostrDiscovery {
         // Defensive: build_overlay_advert returns None on empty endpoints,
         // so this is only reachable from non-lifecycle callers.
         if advert.endpoints.is_empty() {
-            return Ok(());
+            return self.retract_current_advert().await;
         }
 
         if advert.has_udp_nat_endpoint() {
@@ -683,14 +681,15 @@ impl NostrDiscovery {
                     "udp:nat endpoint requires non-empty signalRelays".to_string(),
                 ));
             }
-            if !self.config.peer_assist.private_enabled()
-                && advert
-                    .stun_servers
-                    .as_ref()
-                    .is_none_or(|servers| servers.is_empty())
+            if advert
+                .stun_servers
+                .as_ref()
+                .is_none_or(|servers| servers.is_empty())
+                && (!self.config.peer_assist.helper_enabled()
+                    || self.peer_assist.first_helper_endpoint().await.is_none())
             {
                 return Err(BootstrapError::InvalidAdvert(
-                    "udp:nat endpoint requires non-empty stunServers".to_string(),
+                    "udp:nat endpoint requires non-empty stunServers or an active peer-assist helper endpoint".to_string(),
                 ));
             }
         } else {
@@ -710,6 +709,11 @@ impl NostrDiscovery {
             .tags(tags)
             .sign_with_keys(&self.keys)
             .map_err(|e| BootstrapError::Nostr(e.to_string()))?;
+        #[cfg(test)]
+        if self.test_capture_outgoing {
+            *self.current_advert_event_id.write().await = Some(event.id);
+            return Ok(());
+        }
         self.client
             .send_event_to(self.config.advert_relays.clone(), &event)
             .await
@@ -728,6 +732,20 @@ impl NostrDiscovery {
         // publish, which strict relays (e.g. Damus) honor by removing the
         // new advert too.
         *self.current_advert_event_id.write().await = Some(event.id);
+        Ok(())
+    }
+
+    async fn retract_current_advert(&self) -> Result<(), BootstrapError> {
+        let previous_event_id = self.current_advert_event_id.write().await.take();
+        if let Some(event_id) = previous_event_id {
+            if let Err(err) = self
+                .publish_delete(&self.config.advert_relays, [event_id.to_owned()])
+                .await
+            {
+                *self.current_advert_event_id.write().await = Some(event_id);
+                return Err(err);
+            }
+        }
         Ok(())
     }
 
@@ -750,8 +768,13 @@ impl NostrDiscovery {
             return Err(BootstrapError::MissingRelays(peer_config.npub));
         }
 
-        let private_assist_enabled = self.config.peer_assist.private_enabled();
+        let private_assist_enabled = self.config.peer_assist.dial_enabled();
         if !advert.has_udp_nat_endpoint() {
+            if private_assist_enabled {
+                return self
+                    .connect_peer_via_private_assist(peer_config, target_pubkey, &relays)
+                    .await;
+            }
             return Err(BootstrapError::MissingNatEndpoint(peer_config.npub));
         }
 
@@ -761,146 +784,184 @@ impl NostrDiscovery {
                 .await;
         }
 
-        if private_assist_enabled
-            && matches!(
-                self.config.peer_assist.mode,
-                crate::config::PeerAssistMode::PreferPrivate
-            )
-            && let Ok(traversal) = self
+        let mut private_assist_tried = false;
+        let mut private_assist_error = None;
+        if private_assist_enabled && self.config.peer_assist.prefer_private() {
+            private_assist_tried = true;
+            match self
                 .connect_peer_via_private_assist(peer_config.clone(), target_pubkey, &relays)
                 .await
-        {
-            return Ok(traversal);
+            {
+                Ok(traversal) => return Ok(traversal),
+                Err(err) => {
+                    debug!(
+                        peer = %peer_short,
+                        error = %err,
+                        "traversal: private assist failed; trying normal NAT traversal"
+                    );
+                    private_assist_error = Some(err);
+                }
+            }
         }
 
-        let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
-        base_socket.set_nonblocking(true)?;
+        if private_assist_enabled && self.config.stun_servers.is_empty() {
+            if !private_assist_tried {
+                return self
+                    .connect_peer_via_private_assist(peer_config, target_pubkey, &relays)
+                    .await;
+            }
+            if let Some(err) = private_assist_error {
+                return Err(err);
+            }
+        }
 
-        let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
-            &base_socket,
-            &self.config.stun_servers,
-            self.config.share_local_candidates,
-        )
-        .await?;
-        debug!(
-            peer = %peer_short,
-            reflexive = %reflexive_address.as_ref().map(|a| format!("{}:{}", a.ip, a.port)).unwrap_or_else(|| "-".into()),
-            local = local_addresses.len(),
-            stun = %stun_server.as_deref().unwrap_or("-"),
-            "traversal: initiator STUN observed"
-        );
-        let session_id = nonce();
-        let offer = create_traversal_offer(
-            session_id.clone(),
-            now_ms(),
-            self.config.signal_ttl_secs * 1000,
-            session_id.clone(),
-            self.npub.clone(),
-            peer_config.npub.clone(),
-            reflexive_address.clone(),
-            local_addresses,
-            stun_server,
-        );
+        let normal_result: Result<EstablishedTraversal, BootstrapError> = async {
+            let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+            base_socket.set_nonblocking(true)?;
 
-        let (tx, rx) = oneshot::channel();
-        self.pending_answers
-            .lock()
-            .await
-            .insert(offer.nonce.clone(), tx);
-        let offer_event = self.send_signal(&relays, target_pubkey, &offer).await?;
-        debug!(
-            peer = %peer_short,
-            session = %short_id(&offer.session_id),
-            relays = relays.len(),
-            event = %short_id(&offer_event.id.to_string()),
-            "traversal: offer sent"
-        );
+            let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
+                &base_socket,
+                &self.config.stun_servers,
+                self.config.share_local_candidates,
+            )
+            .await?;
+            debug!(
+                peer = %peer_short,
+                reflexive = %reflexive_address.as_ref().map(|a| format!("{}:{}", a.ip, a.port)).unwrap_or_else(|| "-".into()),
+                local = local_addresses.len(),
+                stun = %stun_server.as_deref().unwrap_or("-"),
+                "traversal: initiator STUN observed"
+            );
+            let session_id = nonce();
+            let offer = create_traversal_offer(
+                session_id.clone(),
+                now_ms(),
+                self.config.signal_ttl_secs * 1000,
+                session_id.clone(),
+                self.npub.clone(),
+                peer_config.npub.clone(),
+                reflexive_address.clone(),
+                local_addresses,
+                stun_server,
+            );
 
-        let answer = match tokio::time::timeout(
-            Duration::from_secs(self.config.signal_ttl_secs),
-            rx,
-        )
-        .await
-        {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(_)) => {
-                let _ = self.pending_answers.lock().await.remove(&offer.nonce);
+            let (tx, rx) = oneshot::channel();
+            self.pending_answers
+                .lock()
+                .await
+                .insert(offer.nonce.clone(), tx);
+            let offer_event = self.send_signal(&relays, target_pubkey, &offer).await?;
+            debug!(
+                peer = %peer_short,
+                session = %short_id(&offer.session_id),
+                relays = relays.len(),
+                event = %short_id(&offer_event.id.to_string()),
+                "traversal: offer sent"
+            );
+
+            let answer =
+                match tokio::time::timeout(Duration::from_secs(self.config.signal_ttl_secs), rx)
+                    .await
+                {
+                    Ok(Ok(answer)) => answer,
+                    Ok(Err(_)) => {
+                        let _ = self.pending_answers.lock().await.remove(&offer.nonce);
+                        return Err(BootstrapError::Protocol(
+                            "answer channel closed".to_string(),
+                        ));
+                    }
+                    Err(_) => {
+                        let _ = self.pending_answers.lock().await.remove(&offer.nonce);
+                        return Err(BootstrapError::SignalTimeout(peer_config.npub.clone()));
+                    }
+                };
+
+            debug!(
+                peer = %peer_short,
+                session = %short_id(&offer.session_id),
+                accepted = answer.payload.accepted,
+                reflexive = %answer.payload.reflexive_address.as_ref().map(|a| format!("{}:{}", a.ip, a.port)).unwrap_or_else(|| "-".into()),
+                local = answer.payload.local_addresses.len(),
+                "traversal: answer received"
+            );
+            validate_traversal_answer_for_offer(
+                &offer,
+                &answer.payload,
+                now_ms(),
+                self.config.signal_ttl_secs * 1000,
+                &answer.sender_npub,
+                &self.npub,
+            )?;
+            if !answer.payload.accepted {
                 return Err(BootstrapError::Protocol(
-                    "answer channel closed".to_string(),
+                    answer
+                        .payload
+                        .reason
+                        .unwrap_or_else(|| "remote rejected traversal".to_string()),
                 ));
             }
-            Err(_) => {
-                let _ = self.pending_answers.lock().await.remove(&offer.nonce);
-                return Err(BootstrapError::SignalTimeout(peer_config.npub));
+
+            let remotes = planned_remote_endpoints(
+                &offer.local_addresses,
+                offer.reflexive_address.as_ref(),
+                &answer.payload.local_addresses,
+                answer.payload.reflexive_address.as_ref(),
+            )?;
+
+            let remote_addr = run_punch_attempt(
+                &base_socket,
+                &session_id,
+                &remotes,
+                self.punch_hint(),
+                Duration::from_secs(self.config.attempt_timeout_secs),
+            )
+            .await
+            .map_err(|_| BootstrapError::PunchTimeout(peer_config.npub.clone()))?;
+            debug!(
+                peer = %peer_short,
+                session = %short_id(&session_id),
+                remote = %remote_addr,
+                "traversal: initiator punch succeeded"
+            );
+
+            let _ = self
+                .publish_delete(&relays, [offer_event.id, answer.event_id])
+                .await;
+
+            let mut traversal = EstablishedTraversal::new(
+                session_id,
+                peer_config.npub.clone(),
+                remote_addr,
+                base_socket,
+            )
+            .with_transport_name("nostr-nat");
+            if let Some(observed_endpoint) = reflexive_address
+                .as_ref()
+                .and_then(Self::traversal_address_to_socket)
+            {
+                traversal = traversal.with_observed_endpoint(observed_endpoint);
             }
-        };
-
-        debug!(
-            peer = %peer_short,
-            session = %short_id(&offer.session_id),
-            accepted = answer.payload.accepted,
-            reflexive = %answer.payload.reflexive_address.as_ref().map(|a| format!("{}:{}", a.ip, a.port)).unwrap_or_else(|| "-".into()),
-            local = answer.payload.local_addresses.len(),
-            "traversal: answer received"
-        );
-        validate_traversal_answer_for_offer(
-            &offer,
-            &answer.payload,
-            now_ms(),
-            self.config.signal_ttl_secs * 1000,
-            &answer.sender_npub,
-            &self.npub,
-        )?;
-        if !answer.payload.accepted {
-            return Err(BootstrapError::Protocol(
-                answer
-                    .payload
-                    .reason
-                    .unwrap_or_else(|| "remote rejected traversal".to_string()),
-            ));
+            Ok(traversal)
         }
+        .await;
 
-        let remotes = planned_remote_endpoints(
-            &offer.local_addresses,
-            offer.reflexive_address.as_ref(),
-            &answer.payload.local_addresses,
-            answer.payload.reflexive_address.as_ref(),
-        )?;
-
-        let remote_addr = run_punch_attempt(
-            &base_socket,
-            &session_id,
-            &remotes,
-            self.punch_hint(),
-            Duration::from_secs(self.config.attempt_timeout_secs),
-        )
-        .await
-        .map_err(|_| BootstrapError::PunchTimeout(peer_config.npub.clone()))?;
-        debug!(
-            peer = %peer_short,
-            session = %short_id(&session_id),
-            remote = %remote_addr,
-            "traversal: initiator punch succeeded"
-        );
-
-        let _ = self
-            .publish_delete(&relays, [offer_event.id, answer.event_id])
-            .await;
-
-        Ok(
-            EstablishedTraversal::new(session_id, peer_config.npub, remote_addr, base_socket)
-                .with_public_endpoint(
-                    reflexive_address
-                        .as_ref()
-                        .and_then(Self::traversal_address_to_socket)
-                        .ok_or_else(|| {
-                            BootstrapError::Protocol(
-                                "missing reflexive address for established traversal".to_string(),
-                            )
-                        })?,
-                )
-                .with_transport_name("nostr-nat"),
-        )
+        match normal_result {
+            Ok(traversal) => Ok(traversal),
+            Err(err)
+                if private_assist_enabled
+                    && !private_assist_tried
+                    && Self::should_try_private_assist_after_nat_error(&err) =>
+            {
+                debug!(
+                    peer = %peer_short,
+                    error = %err,
+                    "traversal: normal NAT traversal failed; trying private assist"
+                );
+                self.connect_peer_via_private_assist(peer_config, target_pubkey, &relays)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn connect_peer_via_private_assist(
@@ -923,11 +984,16 @@ impl NostrDiscovery {
         );
 
         let (grant_tx, grant_rx) = oneshot::channel();
-        self.pending_assist_grants
-            .lock()
-            .await
-            .insert(request.nonce.clone(), grant_tx);
-        let request_event = self.send_signal(relays, target_pubkey, &request).await?;
+        self.peer_assist
+            .insert_grant_waiter(request.nonce.clone(), grant_tx)
+            .await;
+        let request_event = match self.send_signal(relays, target_pubkey, &request).await {
+            Ok(event) => event,
+            Err(err) => {
+                self.peer_assist.remove_grant_waiter(&request.nonce).await;
+                return Err(err);
+            }
+        };
 
         let grant = match tokio::time::timeout(
             Duration::from_secs(self.config.peer_assist.grant_ttl_secs),
@@ -937,21 +1003,13 @@ impl NostrDiscovery {
         {
             Ok(Ok(grant)) => grant,
             Ok(Err(_)) => {
-                let _ = self
-                    .pending_assist_grants
-                    .lock()
-                    .await
-                    .remove(&request.nonce);
+                self.peer_assist.remove_grant_waiter(&request.nonce).await;
                 return Err(BootstrapError::Protocol(
                     "assist grant channel closed".to_string(),
                 ));
             }
             Err(_) => {
-                let _ = self
-                    .pending_assist_grants
-                    .lock()
-                    .await
-                    .remove(&request.nonce);
+                self.peer_assist.remove_grant_waiter(&request.nonce).await;
                 return Err(BootstrapError::SignalTimeout(peer_config.npub));
             }
         };
@@ -989,10 +1047,9 @@ impl NostrDiscovery {
             })?;
 
         let (observed_tx, observed_rx) = oneshot::channel();
-        self.pending_assist_observed
-            .lock()
-            .await
-            .insert(grant.payload.nonce.clone(), observed_tx);
+        self.peer_assist
+            .insert_observed_waiter(grant.payload.nonce.clone(), observed_tx)
+            .await;
 
         let probe_socket = base_socket.try_clone()?;
         let probe_task = tokio::spawn(async move {
@@ -1011,22 +1068,18 @@ impl NostrDiscovery {
         {
             Ok(Ok(observed)) => observed,
             Ok(Err(_)) => {
-                let _ = self
-                    .pending_assist_observed
-                    .lock()
-                    .await
-                    .remove(&grant.payload.nonce);
+                self.peer_assist
+                    .remove_observed_waiter(&grant.payload.nonce)
+                    .await;
                 probe_task.abort();
                 return Err(BootstrapError::Protocol(
                     "assist observed channel closed".to_string(),
                 ));
             }
             Err(_) => {
-                let _ = self
-                    .pending_assist_observed
-                    .lock()
-                    .await
-                    .remove(&grant.payload.nonce);
+                self.peer_assist
+                    .remove_observed_waiter(&grant.payload.nonce)
+                    .await;
                 probe_task.abort();
                 return Err(BootstrapError::SignalTimeout(peer_config.npub));
             }
@@ -1070,7 +1123,7 @@ impl NostrDiscovery {
 
         Ok(
             EstablishedTraversal::new(request_id, peer_config.npub, helper_addr, base_socket)
-                .with_public_endpoint(observed_endpoint)
+                .with_observed_endpoint(observed_endpoint)
                 .with_transport_name("nostr-assist")
                 .with_transport_config(UdpConfig {
                     peer_assist: Some(true),
@@ -1174,21 +1227,22 @@ impl NostrDiscovery {
                 remote = %remote_addr,
                 "traversal: responder punch succeeded"
             );
-            let _ = self.event_tx.send(BootstrapEvent::Established {
-                traversal: EstablishedTraversal::new(
-                    offer.session_id,
-                    offer.sender_npub,
-                    remote_addr,
-                    base_socket,
-                )
-                .with_public_endpoint(
-                    reflexive_address
-                        .as_ref()
-                        .and_then(Self::traversal_address_to_socket)
-                        .unwrap_or(remote_addr),
-                )
-                .with_transport_name("nostr-nat"),
-            });
+            let mut traversal = EstablishedTraversal::new(
+                offer.session_id,
+                offer.sender_npub,
+                remote_addr,
+                base_socket,
+            )
+            .with_transport_name("nostr-nat");
+            if let Some(observed_endpoint) = reflexive_address
+                .as_ref()
+                .and_then(Self::traversal_address_to_socket)
+            {
+                traversal = traversal.with_observed_endpoint(observed_endpoint);
+            }
+            let _ = self
+                .event_tx
+                .send(BootstrapEvent::Established { traversal });
         }
 
         let _ = self.publish_delete(&relays, [answer_event.id]).await;
@@ -1211,109 +1265,108 @@ impl NostrDiscovery {
         self.mark_session_seen(&request.request_id).await?;
 
         let relays = self.preferred_signal_relays(sender, None).await?;
-        if !self.config.peer_assist.private_enabled() {
-            let grant = create_assist_grant(
-                request.request_id,
-                nonce(),
-                now_ms(),
-                self.config.peer_assist.grant_ttl_secs * 1000,
-                nonce(),
-                self.npub.clone(),
-                request.sender_npub,
-                request.nonce,
-                false,
-                None,
-                None,
-                None,
-                Some("peer-assist disabled".to_string()),
-            );
-            let _ = self.send_signal(&relays, sender, &grant).await?;
+        if !self.config.peer_assist.helper_enabled() {
+            self.send_assist_rejection(&relays, sender, &request, "peer-assist disabled")
+                .await?;
             return Ok(());
         }
 
         if !self.requester_allowed(&sender_npub).await {
-            let grant = create_assist_grant(
-                request.request_id,
-                nonce(),
-                now_ms(),
-                self.config.peer_assist.grant_ttl_secs * 1000,
-                nonce(),
-                self.npub.clone(),
-                request.sender_npub,
-                request.nonce,
-                false,
-                None,
-                None,
-                None,
-                Some("peer-assist requester not allowed".to_string()),
-            );
-            let _ = self.send_signal(&relays, sender, &grant).await?;
+            self.send_assist_rejection(
+                &relays,
+                sender,
+                &request,
+                "peer-assist requester not allowed",
+            )
+            .await?;
             return Ok(());
         }
 
-        let helper_addr = self
-            .helper_endpoints
-            .read()
-            .await
-            .first()
-            .copied()
-            .ok_or_else(|| BootstrapError::Protocol("no eligible helper transport".to_string()))?;
-
-        let pending_count = self.pending_private_assist_grants.lock().await.len();
-        if pending_count >= self.config.peer_assist.max_pending_requests {
-            let grant = create_assist_grant(
-                request.request_id,
-                nonce(),
-                now_ms(),
-                self.config.peer_assist.grant_ttl_secs * 1000,
-                nonce(),
-                self.npub.clone(),
-                request.sender_npub,
-                request.nonce,
-                false,
-                None,
-                None,
-                None,
-                Some("peer-assist helper is at capacity".to_string()),
-            );
-            let _ = self.send_signal(&relays, sender, &grant).await?;
+        let Some(helper_addr) = self.peer_assist.first_helper_endpoint().await else {
+            self.send_assist_rejection(&relays, sender, &request, "no eligible helper transport")
+                .await?;
             return Ok(());
-        }
+        };
 
+        let now = now_ms();
         let grant_id = nonce();
         let grant_nonce = nonce();
         let probe_token = nonce();
-        self.pending_private_assist_grants.lock().await.insert(
-            grant_id.clone(),
-            PendingPrivateAssistGrant {
-                request_id: request.request_id.clone(),
-                grant_id: grant_id.clone(),
-                grant_nonce: grant_nonce.clone(),
-                probe_token: probe_token.clone(),
-                sender_pubkey: sender,
-                sender_npub: sender_npub.clone(),
-                helper_addr: helper_addr.to_string(),
-                relays: relays.clone(),
-                expires_at: now_ms() + self.config.peer_assist.grant_ttl_secs * 1000,
-            },
-        );
+        let pending_grant = PendingPrivateAssistGrant {
+            request_id: request.request_id.clone(),
+            grant_id: grant_id.clone(),
+            grant_nonce: grant_nonce.clone(),
+            probe_token: probe_token.clone(),
+            sender_pubkey: sender,
+            sender_npub: sender_npub.clone(),
+            helper_addr,
+            relays: relays.clone(),
+            expires_at: now + self.config.peer_assist.grant_ttl_secs * 1000,
+        };
+        if !self
+            .peer_assist
+            .try_insert_private_grant(
+                pending_grant,
+                now,
+                self.config.peer_assist.helper.max_pending_requests,
+            )
+            .await
+        {
+            self.send_assist_rejection(
+                &relays,
+                sender,
+                &request,
+                "peer-assist helper is at capacity",
+            )
+            .await?;
+            return Ok(());
+        }
 
         let grant = create_assist_grant(
-            request.request_id,
-            grant_id,
+            request.request_id.clone(),
+            grant_id.clone(),
             now_ms(),
             self.config.peer_assist.grant_ttl_secs * 1000,
             grant_nonce,
             self.npub.clone(),
-            request.sender_npub,
-            request.nonce,
+            request.sender_npub.clone(),
+            request.nonce.clone(),
             true,
             Some(helper_addr.to_string()),
             Some(probe_token),
             Some(1),
             None,
         );
-        let _ = self.send_signal(&relays, sender, &grant).await?;
+        if let Err(err) = self.send_signal(&relays, sender, &grant).await {
+            self.peer_assist.remove_private_grant(&grant_id).await;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    async fn send_assist_rejection(
+        &self,
+        relays: &[String],
+        sender: PublicKey,
+        request: &AssistRequest,
+        reason: &str,
+    ) -> Result<(), BootstrapError> {
+        let grant = create_assist_grant(
+            request.request_id.clone(),
+            nonce(),
+            now_ms(),
+            self.config.peer_assist.grant_ttl_secs * 1000,
+            nonce(),
+            self.npub.clone(),
+            request.sender_npub.clone(),
+            request.nonce.clone(),
+            false,
+            None,
+            None,
+            None,
+            Some(reason.to_string()),
+        );
+        let _ = self.send_signal(relays, sender, &grant).await?;
         Ok(())
     }
 
@@ -1327,19 +1380,15 @@ impl NostrDiscovery {
             return false;
         };
         let now = now_ms();
-        let pending = {
-            let mut pending = self.pending_private_assist_grants.lock().await;
-            pending.retain(|_, entry| entry.expires_at > now);
-            let Some(entry) = pending.remove(&probe.grant_id) else {
-                return false;
-            };
-            if entry.helper_addr != helper_addr.to_string() || entry.probe_token != probe.token {
-                pending.insert(entry.grant_id.clone(), entry);
-                return false;
-            }
-            entry
+        let Some(pending) = self
+            .peer_assist
+            .matching_private_grant(&probe.grant_id, &probe.token, helper_addr, now)
+            .await
+        else {
+            return false;
         };
 
+        let grant_id = pending.grant_id.clone();
         let observed = create_assist_observed(
             pending.request_id,
             pending.grant_id,
@@ -1362,7 +1411,10 @@ impl NostrDiscovery {
             .send_signal(&pending.relays, pending.sender_pubkey, &observed)
             .await
         {
-            Ok(_) => true,
+            Ok(_) => {
+                self.peer_assist.remove_private_grant(&grant_id).await;
+                true
+            }
             Err(err) => {
                 debug!(
                     sender_npub = %pending.sender_npub,
@@ -1375,46 +1427,60 @@ impl NostrDiscovery {
     }
 
     async fn requester_allowed(&self, sender_npub: &str) -> bool {
-        match self.config.peer_assist.request_policy {
+        let authorized = match self.config.peer_assist.helper.request_policy {
             PeerAssistRequestPolicy::Allowlist => self
                 .config
                 .peer_assist
+                .helper
                 .request_allowlist
                 .iter()
                 .any(|allowed| allowed == sender_npub),
-            PeerAssistRequestPolicy::OpenRateLimited => {
-                let now = now_ms();
-                let window_ms = self
-                    .config
-                    .peer_assist
-                    .request_window_secs
-                    .saturating_mul(1000);
-                let mut windows = self.assist_request_windows.lock().await;
-                allow_in_rate_window(
-                    &mut windows,
-                    sender_npub,
-                    now,
-                    window_ms,
-                    self.config.peer_assist.max_requests_per_peer_per_window,
-                )
-            }
+            PeerAssistRequestPolicy::OpenRateLimited => true,
+        };
+        if !authorized {
+            return false;
         }
-    }
 
-    async fn traversal_offer_allowed(&self, sender_npub: &str) -> bool {
         let now = now_ms();
         let window_ms = self
             .config
             .peer_assist
+            .helper
             .request_window_secs
             .saturating_mul(1000);
+        self.peer_assist
+            .request_allowed_in_window(
+                sender_npub,
+                now,
+                window_ms,
+                self.config
+                    .peer_assist
+                    .helper
+                    .max_requests_per_peer_per_window,
+            )
+            .await
+    }
+
+    async fn traversal_offer_allowed(&self, sender_npub: &str) -> bool {
+        let now = now_ms();
+        let window_ms = self.config.offer_window_secs.saturating_mul(1000);
         let mut windows = self.traversal_offer_windows.lock().await;
         allow_in_rate_window(
             &mut windows,
             sender_npub,
             now,
             window_ms,
-            self.config.peer_assist.max_requests_per_peer_per_window,
+            self.config.max_offers_per_peer_per_window,
+        )
+    }
+
+    fn should_try_private_assist_after_nat_error(err: &BootstrapError) -> bool {
+        matches!(
+            err,
+            BootstrapError::Protocol(_)
+                | BootstrapError::PunchTimeout(_)
+                | BootstrapError::SignalTimeout(_)
+                | BootstrapError::Stun(_)
         )
     }
 
@@ -1724,6 +1790,16 @@ impl NostrDiscovery {
     where
         I: IntoIterator<Item = EventId>,
     {
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        #[cfg(test)]
+        if self.test_capture_outgoing {
+            self.test_sent_deletes
+                .lock()
+                .await
+                .push(ids.iter().map(ToString::to_string).collect());
+            return Ok(());
+        }
+
         let event = EventBuilder::delete(nostr::nips::nip09::EventDeletionRequest::new().ids(ids))
             .sign_with_keys(&self.keys)
             .map_err(|e| BootstrapError::Nostr(e.to_string()))?;
@@ -1764,23 +1840,4 @@ impl NostrDiscovery {
         }
         Ok(())
     }
-}
-
-pub(super) fn allow_in_rate_window(
-    windows: &mut RateLimitWindow,
-    key: &str,
-    now: u64,
-    window_ms: u64,
-    max_requests: usize,
-) -> bool {
-    if max_requests == 0 {
-        return false;
-    }
-    let entry = windows.entry(key.to_string()).or_default();
-    entry.retain(|timestamp| now.saturating_sub(*timestamp) <= window_ms);
-    if entry.len() >= max_requests {
-        return false;
-    }
-    entry.push(now);
-    true
 }

@@ -4,7 +4,9 @@
 
 use super::*;
 use crate::EstablishedTraversal;
-use crate::config::{PeerAssistMode, PeerConfig, TransportInstances, UdpConfig};
+use crate::config::{
+    PeerAssistDialMode, PeerAssistRequestPolicy, PeerConfig, TransportInstances, UdpConfig,
+};
 use crate::discovery::nostr::{
     ADVERT_IDENTIFIER, ADVERT_VERSION, AssistGrant, AssistObserved, AssistRequest, NostrDiscovery,
     OverlayAdvert, OverlayEndpointAdvert, OverlayTransportKind, PEER_ASSIST_MAGIC,
@@ -293,11 +295,27 @@ async fn test_third_peer_can_handshake_via_adopted_transport_socket() {
 }
 
 #[tokio::test]
-async fn test_adopted_traversal_public_endpoint_stays_private() {
+async fn test_adopted_traversal_observed_endpoint_stays_private() {
     let mut node_a = make_node();
     let mut node_b = make_node();
     node_b.config.node.discovery.nostr.enabled = true;
-    node_b.config.node.discovery.nostr.peer_assist.mode = PeerAssistMode::FallbackPrivate;
+    node_b.config.node.discovery.nostr.peer_assist.dial_mode = PeerAssistDialMode::FallbackPrivate;
+    node_b
+        .config
+        .node
+        .discovery
+        .nostr
+        .peer_assist
+        .helper
+        .enabled = true;
+    node_b
+        .config
+        .node
+        .discovery
+        .nostr
+        .peer_assist
+        .helper
+        .request_policy = PeerAssistRequestPolicy::OpenRateLimited;
     node_b.config.transports.udp = TransportInstances::Single(UdpConfig {
         advertise_on_nostr: Some(true),
         public: Some(false),
@@ -332,7 +350,7 @@ async fn test_adopted_traversal_public_endpoint_stays_private() {
 
     let adopted_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let handoff = EstablishedTraversal::new("sess-helper", node_a.npub(), addr_a, adopted_socket)
-        .with_public_endpoint("198.51.100.20:44750".parse().unwrap());
+        .with_observed_endpoint("198.51.100.20:44750".parse().unwrap());
     node_b.adopt_established_traversal(handoff).await.unwrap();
 
     let advert = node_b
@@ -356,6 +374,74 @@ async fn test_adopted_traversal_public_endpoint_stays_private() {
         transport.stop().await.ok();
     }
     for (_, transport) in node_b.transports.iter_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+#[tokio::test]
+async fn test_no_stun_nat_advert_waits_for_helper_endpoint() {
+    let mut node = make_node();
+    node.config.node.discovery.nostr.enabled = true;
+    node.config.node.discovery.nostr.stun_servers.clear();
+    node.config.node.discovery.nostr.peer_assist.helper.enabled = true;
+    node.config
+        .node
+        .discovery
+        .nostr
+        .peer_assist
+        .helper
+        .request_policy = PeerAssistRequestPolicy::OpenRateLimited;
+    node.config.transports.udp = TransportInstances::Single(UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        advertise_on_nostr: Some(true),
+        public: Some(false),
+        peer_assist: Some(true),
+        ..Default::default()
+    });
+
+    let transport_id = TransportId::new(1);
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.packet_tx = Some(packet_tx.clone());
+    node.packet_rx = Some(packet_rx);
+    node.state = NodeState::Running;
+
+    let mut transport = UdpTransport::new(
+        transport_id,
+        None,
+        UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        },
+        packet_tx,
+    );
+    transport.start_async().await.unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(transport));
+
+    assert!(
+        node.build_overlay_advert().is_none(),
+        "no-STUN helper nodes must not publish udp:nat until a helper endpoint is known"
+    );
+
+    node.peer_assist_endpoints
+        .insert(transport_id, "198.51.100.20:44750".parse().unwrap());
+
+    let advert = node
+        .build_overlay_advert()
+        .expect("helper endpoint should enable deferred udp:nat advert");
+    assert!(
+        advert
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.addr == "nat"),
+        "node should publish udp:nat once it has an active helper endpoint"
+    );
+    assert!(
+        advert.stun_servers.is_none(),
+        "no-STUN peer-assist adverts should not synthesize STUN metadata"
+    );
+
+    for (_, transport) in node.transports.iter_mut() {
         transport.stop().await.ok();
     }
 }
@@ -397,7 +483,23 @@ async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
         .insert(transport_id_a, TransportHandle::Udp(transport_a));
 
     node_b.config.node.discovery.nostr.enabled = true;
-    node_b.config.node.discovery.nostr.peer_assist.mode = PeerAssistMode::FallbackPrivate;
+    node_b.config.node.discovery.nostr.peer_assist.dial_mode = PeerAssistDialMode::FallbackPrivate;
+    node_b
+        .config
+        .node
+        .discovery
+        .nostr
+        .peer_assist
+        .helper
+        .enabled = true;
+    node_b
+        .config
+        .node
+        .discovery
+        .nostr
+        .peer_assist
+        .helper
+        .request_policy = PeerAssistRequestPolicy::OpenRateLimited;
     node_b.config.transports.udp = TransportInstances::Single(UdpConfig {
         advertise_on_nostr: Some(true),
         public: Some(false),
@@ -408,7 +510,7 @@ async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
     let adopted_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let helper_addr = adopted_socket.local_addr().unwrap();
     let handoff = EstablishedTraversal::new("sess-existing", node_a.npub(), addr_a, adopted_socket)
-        .with_public_endpoint(helper_addr);
+        .with_observed_endpoint(helper_addr);
     let _handoff_result = node_b.adopt_established_traversal(handoff).await.unwrap();
 
     // Drive Alice/Bob handshake manually to establish Bob's adopted transport first.
@@ -437,7 +539,9 @@ async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
 
     let mut bob_runtime_config = node_b.config.node.discovery.nostr.clone();
     bob_runtime_config.enabled = true;
-    bob_runtime_config.peer_assist.mode = PeerAssistMode::FallbackPrivate;
+    bob_runtime_config.peer_assist.dial_mode = PeerAssistDialMode::FallbackPrivate;
+    bob_runtime_config.peer_assist.helper.enabled = true;
+    bob_runtime_config.peer_assist.helper.request_policy = PeerAssistRequestPolicy::OpenRateLimited;
     bob_runtime_config.dm_relays = vec!["wss://relay.example".to_string()];
     let bob_runtime = NostrDiscovery::new_for_test(&node_b.identity, bob_runtime_config);
     bob_runtime
@@ -447,7 +551,7 @@ async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
     let mut colin_runtime_config = node_c.config.node.discovery.nostr.clone();
     colin_runtime_config.enabled = true;
     colin_runtime_config.stun_servers.clear();
-    colin_runtime_config.peer_assist.mode = PeerAssistMode::FallbackPrivate;
+    colin_runtime_config.peer_assist.dial_mode = PeerAssistDialMode::FallbackPrivate;
     colin_runtime_config.dm_relays = vec!["wss://relay.example".to_string()];
     let colin_runtime = NostrDiscovery::new_for_test(&node_c.identity, colin_runtime_config);
 
@@ -574,7 +678,7 @@ async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
         .expect("join peer-assist connect task")
         .expect("Colin traversal result");
     assert_eq!(traversal.remote_addr, helper_addr);
-    assert_eq!(traversal.public_endpoint, Some(observed_addr));
+    assert_eq!(traversal.observed_endpoint, Some(observed_addr));
 
     let _handoff = node_c.adopt_established_traversal(traversal).await.unwrap();
 

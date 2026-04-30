@@ -1,5 +1,6 @@
 #![cfg(feature = "nostr-discovery")]
 
+mod assist;
 mod runtime;
 mod signal;
 pub(crate) mod stun;

@@ -42,11 +42,13 @@ pub struct EstablishedTraversal {
     pub remote_addr: SocketAddr,
     /// The live UDP socket carrying the established mapping.
     pub socket: UdpSocket,
-    /// Public endpoint for this socket as observed during rendezvous.
+    /// Endpoint for this socket as observed during rendezvous.
     ///
-    /// When present, this can be advertised so other peers may use the live
-    /// transport as a peer-assisted rendezvous helper.
-    pub public_endpoint: Option<SocketAddr>,
+    /// For normal STUN traversal this is the local reflexive endpoint. For
+    /// private peer assist this is the requester endpoint observed by the
+    /// helper. It is optional because a traversal can succeed through local
+    /// candidates even when no useful observed endpoint is available.
+    pub observed_endpoint: Option<SocketAddr>,
     /// Optional name for the adopted UDP transport.
     pub transport_name: Option<String>,
     /// Optional UDP transport tuning overrides.
@@ -66,16 +68,27 @@ impl EstablishedTraversal {
             peer_npub: peer_npub.into(),
             remote_addr,
             socket,
-            public_endpoint: None,
+            observed_endpoint: None,
             transport_name: None,
             transport_config: None,
         }
     }
 
-    /// Attach an observed public endpoint for this live socket.
-    pub fn with_public_endpoint(mut self, addr: SocketAddr) -> Self {
-        self.public_endpoint = Some(addr);
+    /// Attach an observed endpoint for this live socket.
+    pub fn with_observed_endpoint(mut self, addr: SocketAddr) -> Self {
+        self.observed_endpoint = Some(addr);
         self
+    }
+
+    /// Backwards-compatible alias for callers that used the older public
+    /// endpoint terminology.
+    pub fn with_public_endpoint(self, addr: SocketAddr) -> Self {
+        self.with_observed_endpoint(addr)
+    }
+
+    /// Backwards-compatible accessor for the observed endpoint.
+    pub fn public_endpoint(&self) -> Option<SocketAddr> {
+        self.observed_endpoint
     }
 
     /// Attach an explicit transport name to the adopted UDP transport.

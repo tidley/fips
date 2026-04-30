@@ -207,7 +207,7 @@ impl Node {
             .discovery
             .nostr
             .peer_assist
-            .private_enabled()
+            .helper_enabled()
         {
             return false;
         }

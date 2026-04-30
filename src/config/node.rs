@@ -4,7 +4,7 @@
 //! retry/backoff, cache sizing, discovery, spanning tree, bloom filters,
 //! session management, and internal buffers.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::IdentityConfig;
 use crate::mmp::{DEFAULT_LOG_INTERVAL_SECS, DEFAULT_OWD_WINDOW_SIZE, MmpConfig, MmpMode};
@@ -277,51 +277,162 @@ pub enum NostrDiscoveryPolicy {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PeerAssistMode {
+pub enum PeerAssistDialMode {
     #[default]
     Disabled,
     FallbackPrivate,
     PreferPrivate,
 }
 
+/// Compatibility alias for older Rust callers. New code should use
+/// [`PeerAssistDialMode`] to distinguish dialing from helper behavior.
+pub type PeerAssistMode = PeerAssistDialMode;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerAssistRequestPolicy {
-    #[default]
     OpenRateLimited,
+    #[default]
     Allowlist,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PeerAssistConfig {
+pub struct PeerAssistHelperConfig {
     #[serde(default)]
-    pub mode: PeerAssistMode,
+    pub enabled: bool,
     #[serde(default)]
     pub request_policy: PeerAssistRequestPolicy,
     #[serde(default)]
     pub request_allowlist: Vec<String>,
     #[serde(default = "PeerAssistConfig::default_max_pending_requests")]
     pub max_pending_requests: usize,
-    #[serde(default = "PeerAssistConfig::default_grant_ttl_secs")]
-    pub grant_ttl_secs: u64,
     #[serde(default = "PeerAssistConfig::default_max_requests_per_peer_per_window")]
     pub max_requests_per_peer_per_window: usize,
     #[serde(default = "PeerAssistConfig::default_request_window_secs")]
     pub request_window_secs: u64,
 }
 
+impl Default for PeerAssistHelperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            request_policy: PeerAssistRequestPolicy::Allowlist,
+            request_allowlist: Vec::new(),
+            max_pending_requests: PeerAssistConfig::default_max_pending_requests(),
+            max_requests_per_peer_per_window:
+                PeerAssistConfig::default_max_requests_per_peer_per_window(),
+            request_window_secs: PeerAssistConfig::default_request_window_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerAssistConfig {
+    #[serde(default)]
+    pub dial_mode: PeerAssistDialMode,
+    #[serde(default)]
+    pub helper: PeerAssistHelperConfig,
+    #[serde(default = "PeerAssistConfig::default_grant_ttl_secs")]
+    pub grant_ttl_secs: u64,
+}
+
 impl Default for PeerAssistConfig {
     fn default() -> Self {
         Self {
-            mode: PeerAssistMode::Disabled,
-            request_policy: PeerAssistRequestPolicy::OpenRateLimited,
-            request_allowlist: Vec::new(),
-            max_pending_requests: Self::default_max_pending_requests(),
+            dial_mode: PeerAssistDialMode::Disabled,
+            helper: PeerAssistHelperConfig::default(),
             grant_ttl_secs: Self::default_grant_ttl_secs(),
-            max_requests_per_peer_per_window: Self::default_max_requests_per_peer_per_window(),
-            request_window_secs: Self::default_request_window_secs(),
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerAssistConfigWire {
+    #[serde(default)]
+    dial_mode: Option<PeerAssistDialMode>,
+    #[serde(default)]
+    mode: Option<PeerAssistDialMode>,
+    #[serde(default)]
+    helper: Option<PeerAssistHelperConfig>,
+    #[serde(default)]
+    request_policy: Option<PeerAssistRequestPolicy>,
+    #[serde(default)]
+    request_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    max_pending_requests: Option<usize>,
+    #[serde(default)]
+    max_requests_per_peer_per_window: Option<usize>,
+    #[serde(default)]
+    request_window_secs: Option<u64>,
+    #[serde(default)]
+    grant_ttl_secs: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for PeerAssistConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PeerAssistConfigWire::deserialize(deserializer)?;
+        let uses_legacy_fields = wire.mode.is_some()
+            || wire.request_policy.is_some()
+            || wire.request_allowlist.is_some()
+            || wire.max_pending_requests.is_some()
+            || wire.max_requests_per_peer_per_window.is_some()
+            || wire.request_window_secs.is_some();
+        let uses_current_fields = wire.dial_mode.is_some() || wire.helper.is_some();
+
+        if uses_legacy_fields && uses_current_fields {
+            return Err(de::Error::custom(
+                "cannot mix legacy `peer_assist.mode`/flat request fields with `peer_assist.dial_mode`/`peer_assist.helper`; use the nested helper schema",
+            ));
+        }
+
+        let grant_ttl_secs = wire
+            .grant_ttl_secs
+            .unwrap_or_else(Self::default_grant_ttl_secs);
+
+        if uses_legacy_fields {
+            let dial_mode = wire.mode.unwrap_or_default();
+            let mut helper = PeerAssistHelperConfig {
+                enabled: matches!(
+                    dial_mode,
+                    PeerAssistDialMode::FallbackPrivate | PeerAssistDialMode::PreferPrivate
+                ),
+                request_policy: PeerAssistRequestPolicy::OpenRateLimited,
+                ..Default::default()
+            };
+            if let Some(request_policy) = wire.request_policy {
+                helper.request_policy = request_policy;
+            }
+            if let Some(request_allowlist) = wire.request_allowlist {
+                helper.request_allowlist = request_allowlist;
+            }
+            if let Some(max_pending_requests) = wire.max_pending_requests {
+                helper.max_pending_requests = max_pending_requests;
+            }
+            if let Some(max_requests_per_peer_per_window) = wire.max_requests_per_peer_per_window {
+                helper.max_requests_per_peer_per_window = max_requests_per_peer_per_window;
+            }
+            if let Some(request_window_secs) = wire.request_window_secs {
+                helper.request_window_secs = request_window_secs;
+            }
+
+            return Ok(Self {
+                dial_mode,
+                helper,
+                grant_ttl_secs,
+            });
+        }
+
+        Ok(Self {
+            dial_mode: wire.dial_mode.unwrap_or_default(),
+            helper: wire.helper.unwrap_or_default(),
+            grant_ttl_secs,
+        })
     }
 }
 
@@ -342,11 +453,25 @@ impl PeerAssistConfig {
         60
     }
 
-    pub fn private_enabled(&self) -> bool {
+    pub fn dial_enabled(&self) -> bool {
         matches!(
-            self.mode,
-            PeerAssistMode::FallbackPrivate | PeerAssistMode::PreferPrivate
+            self.dial_mode,
+            PeerAssistDialMode::FallbackPrivate | PeerAssistDialMode::PreferPrivate
         )
+    }
+
+    pub fn prefer_private(&self) -> bool {
+        matches!(self.dial_mode, PeerAssistDialMode::PreferPrivate)
+    }
+
+    pub fn helper_enabled(&self) -> bool {
+        self.helper.enabled
+    }
+
+    /// Compatibility alias for older callers. New code should use
+    /// [`Self::dial_enabled`] or [`Self::helper_enabled`] depending on intent.
+    pub fn private_enabled(&self) -> bool {
+        self.dial_enabled()
     }
 }
 
@@ -399,6 +524,12 @@ pub struct NostrDiscoveryConfig {
     /// Acts as a rate limit against offer spam from relays.
     #[serde(default = "NostrDiscoveryConfig::default_max_concurrent_incoming_offers")]
     pub max_concurrent_incoming_offers: usize,
+    /// Max traversal offers accepted from one sender per rate window.
+    #[serde(default = "NostrDiscoveryConfig::default_max_offers_per_peer_per_window")]
+    pub max_offers_per_peer_per_window: usize,
+    /// Per-sender traversal-offer rate-limit window in seconds.
+    #[serde(default = "NostrDiscoveryConfig::default_offer_window_secs")]
+    pub offer_window_secs: u64,
     /// Max cached overlay adverts retained from relay traffic.
     /// Bounds memory under ambient advert volume.
     #[serde(default = "NostrDiscoveryConfig::default_advert_cache_max_entries")]
@@ -447,6 +578,8 @@ impl Default for NostrDiscoveryConfig {
             policy: NostrDiscoveryPolicy::default(),
             open_discovery_max_pending: Self::default_open_discovery_max_pending(),
             max_concurrent_incoming_offers: Self::default_max_concurrent_incoming_offers(),
+            max_offers_per_peer_per_window: Self::default_max_offers_per_peer_per_window(),
+            offer_window_secs: Self::default_offer_window_secs(),
             advert_cache_max_entries: Self::default_advert_cache_max_entries(),
             seen_sessions_max_entries: Self::default_seen_sessions_max_entries(),
             attempt_timeout_secs: Self::default_attempt_timeout_secs(),
@@ -504,6 +637,12 @@ impl NostrDiscoveryConfig {
 
     fn default_max_concurrent_incoming_offers() -> usize {
         16
+    }
+    fn default_max_offers_per_peer_per_window() -> usize {
+        8
+    }
+    fn default_offer_window_secs() -> u64 {
+        60
     }
 
     fn default_advert_cache_max_entries() -> usize {

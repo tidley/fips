@@ -432,6 +432,15 @@ pub struct Node {
 
     /// Optional Nostr/STUN overlay discovery coordinator for `udp:nat` peers.
     nostr_discovery: Option<Arc<crate::discovery::nostr::NostrDiscovery>>,
+    /// Wall-clock ms when Nostr discovery successfully started, used to
+    /// schedule the one-shot startup advert sweep after a settle delay.
+    /// `None` until discovery comes up; remains `None` if discovery is
+    /// disabled or failed to start.
+    nostr_discovery_started_at_ms: Option<u64>,
+    /// Whether the one-shot startup advert sweep has run. Set to true
+    /// after the first sweep fires (under `policy: open`); thereafter
+    /// only the per-tick `queue_open_discovery_retries` continues.
+    startup_open_discovery_sweep_done: bool,
     /// Per-peer UDP transports adopted from NAT traversal handoff.
     bootstrap_transports: HashSet<TransportId>,
 
@@ -596,6 +605,8 @@ impl Node {
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
             nostr_discovery: None,
+            nostr_discovery_started_at_ms: None,
+            startup_open_discovery_sweep_done: false,
             bootstrap_transports: HashSet::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
@@ -723,6 +734,8 @@ impl Node {
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
             nostr_discovery: None,
+            nostr_discovery_started_at_ms: None,
+            startup_open_discovery_sweep_done: false,
             bootstrap_transports: HashSet::new(),
             last_parent_reeval: None,
             last_congestion_log: None,

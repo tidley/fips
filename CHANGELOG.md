@@ -194,6 +194,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-`0.3.0` so a tagged release supersedes any prior dev .deb.
   Tagged release builds (no `-dev` in Cargo.toml) keep the clean
   `<version>-1` form. Operator override via `--version` still wins
+- One-shot startup advert sweep for Nostr open-discovery. On daemon
+  startup under `node.discovery.nostr.policy: open`, after a short
+  settle delay (`startup_sweep_delay_secs`, default 5s) the cached
+  overlay-advert table is iterated once and recent adverts (newer
+  than `startup_sweep_max_age_secs`, default 3600s) are queued for
+  outbound retry, modulo the same skip-filters as the per-tick sweep
+  (configured peer, already connected, retry-pending, connecting).
+  Closes the gap where peers learned only through relay backlog at
+  startup were not dialed until they republished.
+- Diagnostic logging on the open-discovery sweep. Each `queued retry`
+  now logs at info-level with the peer short-npub and advert age,
+  and a one-line summary (cached count, queued count, per-reason
+  skip counts) is emitted on every startup sweep and on any per-tick
+  sweep that queues at least one retry. Operator-facing visibility
+  into what the auto-dial path is doing.
 
 ### Changed
 

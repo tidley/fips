@@ -205,6 +205,8 @@ without that feature ignore `udp:nat` bootstrap configuration.
 | `node.discovery.nostr.punch_duration_ms` | u64 | `10000` | How long to keep punching before failure |
 | `node.discovery.nostr.advert_ttl_secs` | u64 | `3600` | Advert TTL in seconds |
 | `node.discovery.nostr.advert_refresh_secs` | u64 | `1800` | How often adverts are refreshed in seconds |
+| `node.discovery.nostr.startup_sweep_delay_secs` | u64 | `5` | Settle delay after Nostr discovery starts before the one-shot startup advert sweep runs (only used under `policy: open`). Allows the relay subscription backlog to populate the in-memory advert cache before the sweep fires |
+| `node.discovery.nostr.startup_sweep_max_age_secs` | u64 | `3600` | Maximum advert age (`now - created_at`) considered by the one-shot startup sweep (only used under `policy: open`). Adverts older than this are skipped on startup; the per-tick sweep still considers them up to `valid_until_ms` |
 
 If `stun_servers` is omitted, the built-in default list above is used. If it is
 specified in YAML, the configured list fully overrides the defaults.

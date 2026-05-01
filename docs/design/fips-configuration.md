@@ -467,6 +467,7 @@ Requires an external Tor daemon providing a SOCKS5 proxy. Three modes:
 | `transports.tor.max_inbound_connections` | usize | `64` | Maximum inbound connections via onion service. |
 | `transports.tor.directory_service.hostname_file` | string | `"/var/lib/tor/fips_onion_service/hostname"` | Path to Tor-managed hostname file containing the `.onion` address. |
 | `transports.tor.directory_service.bind_addr` | string | `"127.0.0.1:8443"` | Local bind address for the listener that Tor forwards inbound connections to. Must match `HiddenServicePort` target in `torrc`. |
+| `transports.tor.advertised_port` | u16 | `443` | Public-facing onion port published in Nostr overlay adverts. Must match the virtual port in torrc's `HiddenServicePort <port> 127.0.0.1:<bind_port>` directive — that is the port other peers will use to reach this onion. |
 
 **Named instances.** Like other transports, multiple Tor instances can
 be configured with named sub-keys for different SOCKS5 proxy endpoints.

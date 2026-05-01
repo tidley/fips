@@ -1341,7 +1341,7 @@ impl Node {
                     if let Some(addr) = handle.onion_address() {
                         endpoints.push(OverlayEndpointAdvert {
                             transport: OverlayTransportKind::Tor,
-                            addr: addr.to_string(),
+                            addr: format!("{}:{}", addr, cfg.advertised_port()),
                         });
                     }
                 }

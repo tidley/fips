@@ -259,6 +259,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Tor onion adverts published over Nostr overlay discovery now
+  include the public-facing port (`<onion>.onion:<port>`) instead of
+  just the bare onion hostname. The publisher previously emitted a
+  bare onion that the parser refused (`expected host:port`),
+  producing a persistent retry-fail loop on any peer whose Tor
+  advert was the only entry in the discovery cache. New
+  `transports.tor.advertised_port` config field (default `443`,
+  matching the Tor `HiddenServicePort` convention) controls the
+  advertised port; operators with non-default virtual ports can
+  override.
 - Control socket path detection in fipsctl and fipstop now checks for
   the `/run/fips/` directory instead of the socket file inside it, so
   users not yet in the `fips` group get a clear "Permission denied"

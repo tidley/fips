@@ -1024,18 +1024,31 @@ impl Node {
         crate::upper::icmp::effective_ipv6_mtu(self.transport_mtu())
     }
 
-    /// Get the transport MTU for a specific transport.
+    /// Get the transport MTU governing the global TUN-boundary MSS clamp.
     ///
-    /// When called without a specific transport context, returns the MTU
-    /// of the first operational transport, or 1280 (IPv6 minimum) as
-    /// fallback. This is used for initial TUN configuration where a
-    /// specific transport isn't yet known.
+    /// Returns the **minimum** MTU across all operational transports, or
+    /// 1280 (IPv6 minimum) as fallback. Used for initial TUN configuration
+    /// where a specific egress transport isn't yet known: the resulting
+    /// `effective_ipv6_mtu` (transport_mtu - 77) and `max_mss`
+    /// (effective_mtu - 60) form a conservative ceiling that fits ANY
+    /// configured-transport's egress, eliminating PMTU-D black holes that
+    /// would otherwise occur when a flow's actual egress is smaller than
+    /// the clamp ceiling assumed at TUN init.
+    ///
+    /// Returning the smallest (rather than the first-iterated, which used
+    /// to vary across HashMap iteration order + async-startup race) makes
+    /// the clamp deterministic across daemon restarts.
+    ///
+    /// See `ISSUE-2026-0011` for the empirical investigation.
     pub fn transport_mtu(&self) -> u16 {
-        // Prefer the MTU from the first operational transport
-        for handle in self.transports.values() {
-            if handle.is_operational() {
-                return handle.mtu();
-            }
+        let min_operational = self
+            .transports
+            .values()
+            .filter(|h| h.is_operational())
+            .map(|h| h.mtu())
+            .min();
+        if let Some(mtu) = min_operational {
+            return mtu;
         }
         // Fallback to config: try UDP first, then Ethernet
         if let Some((_, cfg)) = self.config.transports.udp.iter().next() {

@@ -624,8 +624,11 @@ impl Node {
                         (fds[0], fds[1])
                     };
 
-                    // Create writer (dups the fd for independent write access)
-                    let (writer, tun_tx) = device.create_writer(max_mss)?;
+                    // Create writer (dups the fd for independent write access).
+                    // Pass path_mtu_lookup so inbound SYN-ACK clamp can read
+                    // per-destination path MTU learned via discovery.
+                    let (writer, tun_tx) =
+                        device.create_writer(max_mss, self.path_mtu_lookup.clone())?;
 
                     // Spawn writer thread
                     let writer_handle = thread::spawn(move || {
@@ -641,6 +644,7 @@ impl Node {
 
                     // Spawn reader thread
                     let transport_mtu = self.transport_mtu();
+                    let path_mtu_lookup = self.path_mtu_lookup.clone();
                     #[cfg(target_os = "macos")]
                     let reader_handle = thread::spawn(move || {
                         run_tun_reader(
@@ -650,6 +654,7 @@ impl Node {
                             reader_tun_tx,
                             outbound_tx,
                             transport_mtu,
+                            path_mtu_lookup,
                             shutdown_read_fd,
                         );
                     });
@@ -662,6 +667,7 @@ impl Node {
                             reader_tun_tx,
                             outbound_tx,
                             transport_mtu,
+                            path_mtu_lookup,
                         );
                     });
 

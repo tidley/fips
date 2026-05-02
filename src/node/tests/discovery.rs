@@ -710,14 +710,13 @@ async fn test_discovery_100_nodes() {
 #[tokio::test]
 async fn test_response_path_mtu_two_node() {
     // Two-node topology: node0 — node1
-    // Node0 initiates lookup for node1. The response should carry path_mtu
-    // reflecting the transport MTU (1280 in tests) clamped by transit.
-    // In a two-node setup: node1 (target) initializes path_mtu=u16::MAX,
-    // then the response is sent directly to node0. Since node1 is the
-    // target and sends directly, the transit logic does not apply for the
-    // first hop (the target sends directly). But node0 is the originator
-    // and doesn't apply transit MTU. So path_mtu should be u16::MAX in
-    // this simple case (no transit nodes to clamp it).
+    // Node0 initiates lookup for node1. node1 is the target and generates
+    // the response: send_lookup_response folds in node1's own outgoing-link
+    // MTU before sending, so path_mtu reflects the target-edge link
+    // constraint (the test transport MTU, 1280) even with no transit hops.
+    // Without that target-edge fold, a 2-node lookup would leave path_mtu
+    // at u16::MAX since no transit min-fold runs — that's the gap closed
+    // alongside the configured-peer seed in the B3 follow-up.
     let edges = vec![(0, 1)];
     let mut nodes = run_tree_test(2, &edges, false).await;
 
@@ -740,19 +739,38 @@ async fn test_response_path_mtu_two_node() {
         "Node 0 should have cached node 1's route"
     );
 
-    // Check that path_mtu was stored in the cache entry
     let entry = nodes[0].node.coord_cache().get_entry(&node1_addr).unwrap();
     let path_mtu = entry
         .path_mtu()
         .expect("path_mtu should be set from discovery");
-    // In a 2-node setup, no transit node applies the min() so path_mtu stays u16::MAX
     assert_eq!(
-        path_mtu,
-        u16::MAX,
-        "Two-node path_mtu should be u16::MAX (no transit nodes to clamp)"
+        path_mtu, 1280,
+        "Two-node path_mtu should be the target-edge link MTU (1280 in tests)"
     );
 
     cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_apply_outgoing_link_mtu_to_response_unknown_peer_noop() {
+    // When next_hop is not a directly-connected peer (no entry in
+    // self.peers), apply_outgoing_link_mtu_to_response is a no-op and the
+    // response's path_mtu is left unchanged. Pins the early-return path.
+    let node = make_node();
+    let unknown = make_node_addr(0x99);
+
+    let coords = TreeCoordinate::from_addrs(vec![unknown, make_node_addr(0)]).unwrap();
+    let identity = Identity::generate();
+    let proof_data = LookupResponse::proof_bytes(1, &unknown, &coords);
+    let proof = identity.sign(&proof_data);
+    let mut response = LookupResponse::new(1, unknown, coords, proof);
+    response.path_mtu = 1500;
+
+    node.apply_outgoing_link_mtu_to_response(&mut response, &unknown);
+    assert_eq!(
+        response.path_mtu, 1500,
+        "Unknown next_hop must leave path_mtu untouched"
+    );
 }
 
 #[tokio::test]

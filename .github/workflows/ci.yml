@@ -386,6 +386,14 @@ jobs:
           # without crashing). UDP transport baseline for v0.3.0.
           - suite: nostr-publish-consume
             type: nostr-publish-consume
+          # ── STUN fault-injection ───────────────────────────────────────
+          # One FIPS daemon + a netns-sharing shim that injects tc/iptables
+          # faults against UDP egress to the in-lab STUN server. Three
+          # phases: 100% drop, ~5s delay then clear, then full STUN
+          # container kill. Asserts the daemon notices each fault,
+          # recovers from delay, and never panics.
+          - suite: stun-faults
+            type: stun-faults
           # ── Real-deb install across target distros ─────────────────────
           # Boots a privileged systemd container per distro, runs
           # `apt install ./fips_*.deb` with the locally-built package,
@@ -659,6 +667,23 @@ jobs:
         run: |
           docker compose -f testing/nat/docker-compose.yml \
             --profile nostr-publish-consume down --volumes --remove-orphans
+
+      # ── STUN fault-injection ───────────────────────────────────────────
+      - name: Run STUN fault-injection test
+        if: matrix.type == 'stun-faults'
+        run: bash testing/nat/scripts/stun-faults-test.sh
+
+      - name: Collect logs on failure (stun-faults)
+        if: matrix.type == 'stun-faults' && failure()
+        run: |
+          docker compose -f testing/nat/docker-compose.yml \
+            --profile stun-faults logs --no-color | tail -300
+
+      - name: Stop containers (stun-faults)
+        if: matrix.type == 'stun-faults' && always()
+        run: |
+          docker compose -f testing/nat/docker-compose.yml \
+            --profile stun-faults down --volumes --remove-orphans
 
       # ── Outbound LAN gateway integration test ──────────────────────────
       - name: Generate configs (gateway)

@@ -18,7 +18,7 @@
 #   static-mesh, static-chain, rekey, rekey-accept-off,
 #   rekey-outbound-only, gateway,
 #   acl-allowlist, firewall, nat-cone, nat-symmetric, nat-lan,
-#   nostr-publish-consume,
+#   nostr-publish-consume, stun-faults,
 #   chaos-smoke-10, chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-tcp-mesh, chaos-bottleneck-parent,
 #   chaos-cost-avoidance, chaos-cost-reeval, chaos-cost-stability,
@@ -77,6 +77,7 @@ ACL_SUITES=(acl-allowlist)
 FIREWALL_SUITES=(firewall)
 NAT_SUITES=(cone symmetric lan)
 NOSTR_RELAY_SUITES=(nostr-publish-consume)
+STUN_FAULTS_SUITES=(stun-faults)
 DNS_RESOLVER_SUITES=(dns-resolver)
 DEB_INSTALL_SUITES=(deb-install)
 TOR_SUITES=(tor-socks5 tor-directory)
@@ -122,6 +123,9 @@ list_suites() {
     echo ""
     echo "  Nostr publish/consume:"
     for s in "${NOSTR_RELAY_SUITES[@]}"; do echo "    $s"; done
+    echo ""
+    echo "  STUN fault-injection:"
+    for s in "${STUN_FAULTS_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  Chaos scenarios:"
     for entry in "${CHAOS_SUITES[@]}"; do
@@ -478,6 +482,20 @@ run_nostr_publish_consume() {
     fi
 }
 
+# Run the STUN fault-injection integration test.
+# One FIPS daemon + a netns-sharing shim that injects tc/iptables faults
+# against UDP egress to the STUN service. Three phases: drop, delay,
+# kill. Asserts the daemon detects each fault, recovers from delay, and
+# never panics.
+run_stun_faults() {
+    info "[stun-faults] Running STUN fault-injection test"
+    if bash testing/nat/scripts/stun-faults-test.sh 2>&1; then
+        record "stun-faults" 0
+    else
+        record "stun-faults" 1
+    fi
+}
+
 # Run dns-resolver harness (multi-distro + e2e scenarios)
 run_dns_resolver() {
     info "[dns-resolver] Running multi-distro test (slow — builds per-distro images)"
@@ -565,6 +583,11 @@ run_integration() {
     # Nostr publish/consume (sequential — shares the NAT compose project)
     for _suite in "${NOSTR_RELAY_SUITES[@]}"; do
         run_nostr_publish_consume
+    done
+
+    # STUN fault-injection (sequential — shares the NAT compose project)
+    for _suite in "${STUN_FAULTS_SUITES[@]}"; do
+        run_stun_faults
     done
 
     # Chaos scenarios (parallel, throttled)
@@ -655,6 +678,8 @@ run_suite() {
             run_nat "${suite#nat-}" ;;
         nostr-publish-consume)
             run_nostr_publish_consume ;;
+        stun-faults)
+            run_stun_faults ;;
         chaos-*)
             local chaos_name="${suite#chaos-}"
             local found=false

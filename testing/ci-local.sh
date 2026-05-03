@@ -18,6 +18,7 @@
 #   static-mesh, static-chain, rekey, rekey-accept-off,
 #   rekey-outbound-only, gateway,
 #   acl-allowlist, nat-cone, nat-symmetric, nat-lan,
+#   nostr-publish-consume,
 #   chaos-smoke-10, chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-tcp-mesh, chaos-bottleneck-parent,
 #   chaos-cost-avoidance, chaos-cost-reeval, chaos-cost-stability,
@@ -74,6 +75,7 @@ GATEWAY_SUITES=(gateway)
 SIDECAR_SUITES=(sidecar)
 ACL_SUITES=(acl-allowlist)
 NAT_SUITES=(cone symmetric lan)
+NOSTR_RELAY_SUITES=(nostr-publish-consume)
 DNS_RESOLVER_SUITES=(dns-resolver)
 DEB_INSTALL_SUITES=(deb-install)
 TOR_SUITES=(tor-socks5 tor-directory)
@@ -113,6 +115,9 @@ list_suites() {
     echo ""
     echo "  NAT scenarios:"
     for s in "${NAT_SUITES[@]}"; do echo "    nat-$s"; done
+    echo ""
+    echo "  Nostr publish/consume:"
+    for s in "${NOSTR_RELAY_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  Chaos scenarios:"
     for entry in "${CHAOS_SUITES[@]}"; do
@@ -446,6 +451,19 @@ run_nat() {
     fi
 }
 
+# Run the Nostr overlay advert publish/consume integration test.
+# Two FIPS daemons + the existing strfry relay; exercises Phase 1
+# (A→B publish/consume), Phase 2 (B→A reverse), and Phase 3 (malformed
+# advert injected directly to the relay; consumer-liveness assertion).
+run_nostr_publish_consume() {
+    info "[nostr-publish-consume] Running Nostr publish/consume test"
+    if bash testing/nat/scripts/nostr-relay-test.sh 2>&1; then
+        record "nostr-publish-consume" 0
+    else
+        record "nostr-publish-consume" 1
+    fi
+}
+
 # Run dns-resolver harness (multi-distro + e2e scenarios)
 run_dns_resolver() {
     info "[dns-resolver] Running multi-distro test (slow — builds per-distro images)"
@@ -525,6 +543,11 @@ run_integration() {
     # NAT scenarios (sequential — each owns its compose project)
     for scenario in "${NAT_SUITES[@]}"; do
         run_nat "$scenario"
+    done
+
+    # Nostr publish/consume (sequential — shares the NAT compose project)
+    for _suite in "${NOSTR_RELAY_SUITES[@]}"; do
+        run_nostr_publish_consume
     done
 
     # Chaos scenarios (parallel, throttled)
@@ -611,6 +634,8 @@ run_suite() {
             run_acl_allowlist ;;
         nat-cone|nat-symmetric|nat-lan)
             run_nat "${suite#nat-}" ;;
+        nostr-publish-consume)
+            run_nostr_publish_consume ;;
         chaos-*)
             local chaos_name="${suite#chaos-}"
             local found=false

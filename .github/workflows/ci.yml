@@ -376,6 +376,13 @@ jobs:
           - suite: nat-lan
             type: nat
             scenario: lan
+          # ── Nostr overlay advert publish/consume round-trip ─────────────
+          # Two FIPS daemons + the existing strfry relay; covers Phase 1
+          # (A→B publish/consume), Phase 2 (B→A reverse), and Phase 3
+          # (malformed advert injected to relay; consumers must reject
+          # without crashing). UDP transport baseline for v0.3.0.
+          - suite: nostr-publish-consume
+            type: nostr-publish-consume
           # ── Real-deb install across target distros ─────────────────────
           # Boots a privileged systemd container per distro, runs
           # `apt install ./fips_*.deb` with the locally-built package,
@@ -616,6 +623,23 @@ jobs:
           docker compose -f testing/nat/docker-compose.yml \
             --profile cone --profile symmetric --profile lan \
             down --volumes --remove-orphans
+
+      # ── Nostr overlay advert publish/consume ───────────────────────────
+      - name: Run Nostr publish/consume test
+        if: matrix.type == 'nostr-publish-consume'
+        run: bash testing/nat/scripts/nostr-relay-test.sh
+
+      - name: Collect logs on failure (nostr-publish-consume)
+        if: matrix.type == 'nostr-publish-consume' && failure()
+        run: |
+          docker compose -f testing/nat/docker-compose.yml \
+            --profile nostr-publish-consume logs --no-color | tail -300
+
+      - name: Stop containers (nostr-publish-consume)
+        if: matrix.type == 'nostr-publish-consume' && always()
+        run: |
+          docker compose -f testing/nat/docker-compose.yml \
+            --profile nostr-publish-consume down --volumes --remove-orphans
 
       # ── Outbound LAN gateway integration test ──────────────────────────
       - name: Generate configs (gateway)

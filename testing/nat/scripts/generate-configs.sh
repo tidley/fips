@@ -11,7 +11,7 @@ SCENARIO="${1:?usage: generate-configs.sh <cone|symmetric|lan> [mesh-name]}"
 MESH_NAME="${2:-nat-lab-$(date +%s)-$$}"
 
 case "$SCENARIO" in
-    cone|symmetric|lan) ;;
+    cone|symmetric|lan|nostr-publish-consume) ;;
     *)
         echo "Unknown scenario: $SCENARIO" >&2
         exit 1
@@ -30,7 +30,7 @@ npub_b="$(echo "$keys_b" | awk -F= '/^npub=/{print $2}')"
 
 relay_addr="ws://172.31.254.30:7777"
 stun_addr="stun:172.31.254.40:3478"
-if [ "$SCENARIO" = "lan" ]; then
+if [ "$SCENARIO" = "lan" ] || [ "$SCENARIO" = "nostr-publish-consume" ]; then
     relay_addr="ws://172.31.10.30:7777"
     stun_addr="stun:172.31.10.40:3478"
 fi

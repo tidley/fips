@@ -274,6 +274,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- UDP transport with `advertise_on_nostr: true` + `public: true` +
+  a wildcard `bind_addr` (e.g. `0.0.0.0:2121`) is now advertised
+  with its STUN-discovered public IPv4 instead of being silently
+  dropped from the published Kind 37195 advert. Previously the
+  advert builder filtered the wildcard out (since `0.0.0.0` is
+  not a valid endpoint), but emitted no log explaining what
+  happened — operators saw the daemon up, both flags set, and
+  no UDP endpoint in the advert. The fix runs a one-shot STUN
+  observation against an ephemeral socket on the daemon's
+  configured `stun_servers` and combines the reflexive IPv4 with
+  the configured listener port for the advert (`udp:<eip>:<port>`).
+  Successful STUN observations are cached per-transport for one
+  `advert_refresh_secs` cycle (default 30 min) so we don't re-STUN
+  every refresh. Failed observations are cached for only 60s, so
+  a transient STUN flake at startup retries within ~a minute and
+  grows the advert with UDP as soon as STUN starts working —
+  rather than waiting the full 30-min cycle. Per-server STUN
+  response timeout is 5s for the advert-publish path (vs. 2s for
+  the latency-sensitive per-traversal path), giving slow
+  first-call STUN time to complete without giving up. On STUN
+  failure, the wildcard-bind path still skips, but now logs a
+  loud `warn!` pointing at the operator-side fixes (set
+  `external_addr`, bind to a specific IP, or ensure `stun_servers`
+  reachable). Restores zero-config public-IP autodiscovery on
+  AWS EIP / GCP / Azure setups where binding to the public IP
+  directly is impossible (1:1 NAT)
+- New `external_addr` field on `transports.udp.*` and
+  `transports.tcp.*` for explicit advertise-as override. Accepts
+  either a bare IP (`"54.183.70.180"` — the configured `bind_addr`
+  port is appended) or a full `host:port`
+  (`"54.183.70.180:8443"`). Takes precedence over both the bound
+  address and any STUN-derived autodiscovery. Required for TCP
+  on cloud-NAT setups (AWS EIP, GCP/Azure external IPs) where
+  binding to the public IP directly fails with `EADDRNOTAVAIL`
+  (the EIP isn't on a host interface). Optional but useful for
+  UDP as a deterministic alternative to STUN — operators who
+  want to skip STUN egress (or whose STUN is blocked) can
+  specify it explicitly. Without `external_addr`, TCP with a
+  wildcard `bind_addr` + `advertise_on_nostr: true` now logs a
+  loud `warn!` pointing at the two fixes instead of silently
+  skipping
 - Nostr-discovery now tolerates ±60s of clock skew on offer/answer
   freshness checks so a responder whose wall clock leads the
   initiator's by less than that no longer silently rejects every

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nostr::nips::nip17;
 use nostr::nips::nip19::ToBech32;
@@ -56,6 +57,25 @@ fn endpoint_summary(endpoints: &[OverlayEndpointAdvert]) -> String {
         .join(",")
 }
 
+/// Cached STUN-derived public address for an advert-eligible UDP transport
+/// bound to a wildcard. Lives on `NostrDiscovery` so the freshness window
+/// survives advert refresh cycles.
+struct CachedPublicUdpAddr {
+    /// Most recent STUN observation. `None` means the last attempt failed
+    /// (recorded so we don't re-spam STUN every refresh tick on broken
+    /// network conditions).
+    addr: Option<SocketAddr>,
+    fetched_at: Instant,
+}
+
+/// Cache lifetime for a *failed* STUN observation. Held briefly so that
+/// transient flakes (slow startup network, momentary STUN-server
+/// blip) get retried within ~a minute and the advert grows its UDP
+/// endpoint as soon as STUN starts working — rather than waiting a
+/// full `advert_refresh_secs` (30 min) for the success-path TTL to
+/// expire. Successful results use the longer per-config TTL.
+const PUBLIC_UDP_ADDR_FAILURE_TTL: Duration = Duration::from_secs(60);
+
 pub struct NostrDiscovery {
     client: Client,
     keys: nostr::Keys,
@@ -74,6 +94,10 @@ pub struct NostrDiscovery {
     notify_task: Mutex<Option<JoinHandle<()>>>,
     advertise_task: Mutex<Option<JoinHandle<()>>>,
     failure_state: FailureState,
+    /// STUN-derived public address per advert-eligible UDP transport
+    /// (keyed by `TransportId.as_u32()`). Populated on demand by
+    /// `learn_public_udp_addr()` and refreshed by TTL.
+    public_udp_addr_cache: RwLock<HashMap<u32, CachedPublicUdpAddr>>,
 }
 
 impl NostrDiscovery {
@@ -133,6 +157,7 @@ impl NostrDiscovery {
             notify_task: Mutex::new(None),
             advertise_task: Mutex::new(None),
             failure_state,
+            public_udp_addr_cache: RwLock::new(HashMap::new()),
         });
 
         runtime.subscribe().await?;
@@ -202,6 +227,108 @@ impl NostrDiscovery {
                 last_observed_skew_ms: rec.last_observed_skew_ms,
             })
             .collect()
+    }
+
+    /// Discover (or return cached) the public-Internet address for an
+    /// advert-eligible UDP transport bound to a wildcard. Used by
+    /// `build_overlay_advert` to avoid emitting `udp:0.0.0.0:port`,
+    /// which is invalid as an advertised endpoint. Result is the
+    /// reflexive IP (from STUN against the daemon's first
+    /// `stun_servers` reachable) combined with the configured
+    /// `advertise_port`.
+    ///
+    /// Asymmetric cache TTL: a successful observation is cached for
+    /// `advert_refresh_secs` (default 1800 = same as advert refresh)
+    /// so we don't re-STUN every refresh tick. A failed observation
+    /// is cached for `PUBLIC_UDP_ADDR_FAILURE_TTL` (60s) so we retry
+    /// soon after a transient STUN flake at startup, instead of
+    /// blocking advertise-as-public for half an hour. Once a success
+    /// is cached, subsequent ticks are zero-overhead.
+    pub async fn learn_public_udp_addr(
+        &self,
+        transport_id_key: u32,
+        advertise_port: u16,
+    ) -> Option<SocketAddr> {
+        if let Some(entry) = self
+            .public_udp_addr_cache
+            .read()
+            .await
+            .get(&transport_id_key)
+        {
+            let ttl = if entry.addr.is_some() {
+                Duration::from_secs(self.config.advert_refresh_secs.max(60))
+            } else {
+                PUBLIC_UDP_ADDR_FAILURE_TTL
+            };
+            if entry.fetched_at.elapsed() < ttl {
+                return entry.addr;
+            }
+        }
+        let resolved = self.stun_observe_public_ip(advertise_port).await;
+        let mut cache = self.public_udp_addr_cache.write().await;
+        cache.insert(
+            transport_id_key,
+            CachedPublicUdpAddr {
+                addr: resolved,
+                fetched_at: Instant::now(),
+            },
+        );
+        resolved
+    }
+
+    /// Run a one-shot STUN observation against an ephemeral UDP socket
+    /// to learn this host's public IPv4 (or IPv6, if the local STUN
+    /// server returns one). Returns `<reflexive_ip>:<advertise_port>`,
+    /// or `None` if STUN failed or no `stun_servers` are configured.
+    ///
+    /// The STUN-reported port is the ephemeral source port and is
+    /// discarded — what we want to advertise is the bound listener
+    /// port, which the kernel preserves through 1:1 NAT (AWS EIP,
+    /// GCP/Azure external IPs) and which the operator has explicitly
+    /// chosen via `bind_addr`.
+    async fn stun_observe_public_ip(&self, advertise_port: u16) -> Option<SocketAddr> {
+        if self.config.stun_servers.is_empty() {
+            return None;
+        }
+        let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(err) => {
+                debug!(error = %err, "public-udp-addr: ephemeral bind failed");
+                return None;
+            }
+        };
+        if let Err(err) = socket.set_nonblocking(true) {
+            debug!(error = %err, "public-udp-addr: set_nonblocking failed");
+            return None;
+        }
+        let observed = match super::stun::observe_traversal_addresses(
+            &socket,
+            &self.config.stun_servers,
+            false,
+            super::stun::ADVERT_STUN_TIMEOUT,
+        )
+        .await
+        {
+            Ok((reflexive, _local, stun_server)) => {
+                debug!(
+                    stun = %stun_server.as_deref().unwrap_or("-"),
+                    reflexive = %reflexive
+                        .as_ref()
+                        .map(|a| format!("{}:{}", a.ip, a.port))
+                        .unwrap_or_else(|| "-".into()),
+                    "public-udp-addr: STUN observation"
+                );
+                reflexive
+            }
+            Err(err) => {
+                debug!(error = %err, "public-udp-addr: STUN failed");
+                return None;
+            }
+        };
+        observed.and_then(|addr| {
+            let parsed_ip: std::net::IpAddr = addr.ip.parse().ok()?;
+            Some(SocketAddr::new(parsed_ip, advertise_port))
+        })
     }
 
     /// Stale-advert re-check (B6). Called by lifecycle on the
@@ -663,6 +790,7 @@ impl NostrDiscovery {
             &base_socket,
             &self.config.stun_servers,
             self.config.share_local_candidates,
+            super::stun::TRAVERSAL_STUN_TIMEOUT,
         )
         .await?;
         debug!(
@@ -852,6 +980,7 @@ impl NostrDiscovery {
             &base_socket,
             &self.config.stun_servers,
             self.config.share_local_candidates,
+            super::stun::TRAVERSAL_STUN_TIMEOUT,
         )
         .await?;
         let accepted = reflexive_address.is_some() || !local_addresses.is_empty();
@@ -1317,6 +1446,7 @@ impl NostrDiscovery {
             notify_task: Mutex::new(None),
             advertise_task: Mutex::new(None),
             failure_state,
+            public_udp_addr_cache: RwLock::new(HashMap::new()),
         }
     }
 

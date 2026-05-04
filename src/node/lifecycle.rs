@@ -1487,7 +1487,10 @@ impl Node {
         )
     }
 
-    fn build_overlay_advert(&self) -> Option<OverlayAdvert> {
+    async fn build_overlay_advert(
+        &self,
+        bootstrap: &std::sync::Arc<NostrDiscovery>,
+    ) -> Option<OverlayAdvert> {
         if !self.config.node.discovery.nostr.enabled {
             return None;
         }
@@ -1509,13 +1512,49 @@ impl Node {
                         continue;
                     }
                     if cfg.is_public() {
-                        if let Some(addr) = handle.local_addr()
-                            && !addr.ip().is_unspecified()
-                        {
+                        // Precedence:
+                        // 1. operator-supplied `external_addr` (skips STUN)
+                        // 2. non-wildcard `local_addr` (operator bound to
+                        //    a specific public IP directly)
+                        // 3. STUN auto-discovery against ephemeral socket
+                        // 4. loud warn + omit endpoint
+                        if let Some(explicit) = cfg.external_advert_addr() {
                             endpoints.push(OverlayEndpointAdvert {
                                 transport: OverlayTransportKind::Udp,
-                                addr: addr.to_string(),
+                                addr: explicit.to_string(),
                             });
+                        } else {
+                            match handle.local_addr() {
+                                Some(addr) if !addr.ip().is_unspecified() => {
+                                    endpoints.push(OverlayEndpointAdvert {
+                                        transport: OverlayTransportKind::Udp,
+                                        addr: addr.to_string(),
+                                    });
+                                }
+                                Some(addr) => {
+                                    let key = handle.transport_id().as_u32();
+                                    let port = addr.port();
+                                    if let Some(public) =
+                                        bootstrap.learn_public_udp_addr(key, port).await
+                                    {
+                                        endpoints.push(OverlayEndpointAdvert {
+                                            transport: OverlayTransportKind::Udp,
+                                            addr: public.to_string(),
+                                        });
+                                    } else {
+                                        warn!(
+                                            transport_id = key,
+                                            bind_addr = %addr,
+                                            "advert: udp public=true bound to wildcard but \
+                                            STUN observation failed; advertising no UDP \
+                                            endpoint. Either set transports.udp.external_addr, \
+                                            bind to a specific public IP, or ensure \
+                                            node.discovery.nostr.stun_servers is reachable"
+                                        );
+                                    }
+                                }
+                                None => {}
+                            }
                         }
                     } else {
                         endpoints.push(OverlayEndpointAdvert {
@@ -1532,13 +1571,38 @@ impl Node {
                     if !cfg.advertise_on_nostr() {
                         continue;
                     }
-                    if let Some(addr) = handle.local_addr()
-                        && !addr.ip().is_unspecified()
-                    {
+                    // Precedence:
+                    // 1. operator-supplied `external_addr` (only path that
+                    //    works on cloud-NAT setups where the public IP is
+                    //    not on a host interface).
+                    // 2. non-wildcard `local_addr` (operator bound to a
+                    //    specific public IP directly).
+                    // 3. loud warn + omit endpoint (no TCP STUN equivalent).
+                    if let Some(explicit) = cfg.external_advert_addr() {
                         endpoints.push(OverlayEndpointAdvert {
                             transport: OverlayTransportKind::Tcp,
-                            addr: addr.to_string(),
+                            addr: explicit.to_string(),
                         });
+                    } else {
+                        match handle.local_addr() {
+                            Some(addr) if !addr.ip().is_unspecified() => {
+                                endpoints.push(OverlayEndpointAdvert {
+                                    transport: OverlayTransportKind::Tcp,
+                                    addr: addr.to_string(),
+                                });
+                            }
+                            Some(addr) => {
+                                warn!(
+                                    bind_addr = %addr,
+                                    "advert: tcp advertise_on_nostr=true bound to wildcard \
+                                    and no transports.tcp.external_addr set; advertising no \
+                                    TCP endpoint. Either set external_addr to the public \
+                                    IP (recommended for cloud 1:1-NAT setups) or bind \
+                                    explicitly to the public IP"
+                                );
+                            }
+                            None => {}
+                        }
                     }
                 }
                 "tor" => {
@@ -1577,7 +1641,7 @@ impl Node {
         &self,
         bootstrap: &std::sync::Arc<NostrDiscovery>,
     ) -> Result<(), crate::discovery::nostr::BootstrapError> {
-        let advert = self.build_overlay_advert();
+        let advert = self.build_overlay_advert(bootstrap).await;
         bootstrap.update_local_advert(advert).await
     }
 

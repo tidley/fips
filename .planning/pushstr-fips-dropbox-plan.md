@@ -326,44 +326,91 @@ Otherwise ship transport/private-network first, then add E2EE in phase 2.
 
 ## FIPS Connectivity Options
 
-### Option A: Fastest POC
+### Chosen Path: Embedded In-Process FIPS Client
 
-Run FIPS Android/VPN separately. Pushstr-FIPS uses normal HTTP to a `.fips` or FIPS IPv6 address.
+Pushstr embeds the FIPS mobile core directly and calls it from Pushstr's Rust runtime. The app does not create an Android VPN, does not route the whole phone, and does not ask Android for `VpnService` permission in the MVP.
 
-Pros:
+Shape:
 
-- Keeps Pushstr changes smaller.
-- Proves the product workflow quickly.
-- Separates file UX from FIPS mobile embedding.
+```text
+Pushstr Flutter UI
+  -> flutter_rust_bridge
+  -> Pushstr Rust runtime
+      -> Pushstr Nostr/events
+      -> Pushstr Blossom metadata/upload logic
+      -> FipsClient
+          -> FIPS identity
+          -> Nostr discovery/signalling
+          -> NAT traversal
+          -> encrypted FIPS links
+          -> in-process service client API
+```
 
-Cons:
+Initial Pushstr-facing API:
 
-- Two Android apps/services.
-- Less polished.
-- Harder to distribute as one product.
+```text
+fips_init(identity, relays, config)
+fips_connect_peer(npub)
+fips_resolve_service("pi4ssd-storage")
+fips_open_service("pi4ssd-storage", "blossom")
+fips_upload_blob(target, file_stream, metadata)
+fips_status()
+fips_shutdown()
+```
 
-### Option B: Integrated Product
+Important boundary:
 
-Embed FIPS mobile core directly into Pushstr-FIPS.
+```text
+FIPS should expose service/stream/client primitives.
+Pushstr should own Blossom semantics.
+```
+
+`fips_upload_blob` is useful as a Pushstr convenience wrapper, but the reusable FIPS primitive should be closer to:
+
+```text
+fips_open_stream(service, protocol)
+```
+
+or:
+
+```text
+fips_http_request(service, request)
+```
+
+That keeps FIPS from becoming Blossom-specific and leaves room for Grafana/status/admin services later.
 
 Pros:
 
 - Single app.
-- Better user experience.
-- Future path for per-app routing and mobile mesh participation.
+- No Android VPN permission for the first file-drop use case.
+- Pushstr can present FIPS connection state inline.
+- Better fit for Pushstr's existing Rust core and `flutter_rust_bridge` shape.
+- Avoids pretending that file drop requires whole-device routing.
 
 Cons:
 
-- More native build complexity.
-- Must reconcile Pushstr's `flutter_rust_bridge` core with FIPS mobile/UniFFI or port one bridge style.
-- Android first; iOS will require a separate Network Extension design.
+- Requires a clean FIPS library API instead of only daemon/TUN behavior.
+- Requires Android-compatible FIPS runtime lifecycle.
+- Native build integration is harder than calling an external daemon.
+- iOS remains separate later work because background networking rules differ.
 
-Recommended sequence:
+### Fallback/Debug Path: External FIPS Environment
 
-```text
-Phase 1: Option A for proof.
-Phase 2: Option B for productization.
-```
+For development only, keep the ability to test Pi4ssd upload from a device that already has FIPS connectivity through another route, such as a devbox, test Android provider, or manually running FIPS daemon.
+
+Pros:
+
+- Useful for isolating Pushstr file UX from FIPS mobile bugs.
+- Lets Pi4ssd Blossom and metadata work start before Android embedding is complete.
+
+Cons:
+
+- Not the product path.
+- Must not become the long-term required setup.
+
+### Later Path: Android VPN/Tor-Style Provider
+
+After Pushstr file drop works, a separate FIPS provider app or VpnService mode can exist for routing other selected apps through FIPS. That belongs after the in-process service client is proven.
 
 ## Phases
 
@@ -470,14 +517,15 @@ Acceptance:
 Deliverables:
 
 - Fork/branch Pushstr.
+- Embed a minimal FIPS client facade into Pushstr's Rust runtime.
 - Add a "FIPS Drop" target in the mobile UI.
 - Add Android share intent handling for files.
 - Add settings for:
   - Pi4ssd target npub/alias
-  - Blossom URL or `.fips` hostname
+  - Pi4ssd service name, initially `pi4ssd-storage`
   - relay list
   - optional encryption toggle
-- Reuse Pushstr's Blossom upload code path, pointed at Pi4ssd.
+- Reuse Pushstr's Blossom upload code path over the embedded FIPS service client.
 - Store upload history locally.
 
 Acceptance:
@@ -502,18 +550,18 @@ Acceptance:
 - Laptop downloads the uploaded file over FIPS.
 - New Android install can restore history from Nostr relays.
 
-### Phase 6: Integrated FIPS Mobile
+### Phase 6: Harden Embedded FIPS Mobile
 
 Deliverables:
 
-- Decide bridge strategy:
-  - expose FIPS through `flutter_rust_bridge`, or
-  - wrap FIPS mobile UniFFI behind Flutter platform channels.
 - Add in-app FIPS node lifecycle:
   - start/stop
   - status
   - peer list
   - relay/Nostr config
+- Add Android background/foreground service behavior for long uploads.
+- Add pairing UX for Pi4ssd service npub and service adverts.
+- Add better status and retry telemetry.
 - Android first.
 - Keep iOS design notes but do not block Android MVP on iOS.
 
@@ -522,6 +570,19 @@ Acceptance:
 - Single Android app starts FIPS and uploads to Pi4ssd without separate VPN app.
 - App reports FIPS connected/disconnected state.
 - Uploads fail clearly when FIPS is unavailable.
+
+### Phase 6.5: Optional Android FIPS Provider
+
+Deliverables:
+
+- Decide whether a separate Android `VpnService` provider is still useful.
+- If yes, scope it to selected apps/routes only.
+- Reuse the same FIPS mobile core and identity handling as Pushstr where possible.
+
+Acceptance:
+
+- A non-Pushstr app can reach one allowlisted FIPS service without routing the whole phone.
+- Pushstr continues to work without requiring the provider.
 
 ### Phase 7: Resilience Tests
 
@@ -571,17 +632,21 @@ Multiple FIPS daemons remain available for hard isolation, but are no longer req
 - Which Blossom server implementation should be standardized on Pi4ssd?
 - Should Pi4ssd enforce upload authorization by allowlisted npubs only?
 - Should files be client-side encrypted in MVP, or phase 2?
-- Should the Android app require FIPS VPN already running, or should the first APK bundle FIPS immediately?
+- Should Pushstr use the same Nostr identity as its FIPS device identity for MVP, or bind a separate FIPS device npub to the user's Pushstr/Nostr identity?
+- Should the FIPS in-process client expose HTTP request primitives first, or lower-level stream primitives first?
 - What hostname convention should be used: `pi4ssd.fips`, `dropbox.fips`, or raw FIPS IPv6?
 - Should relay storage live on Pi4ssd only, or should Pi4/Pi3 keep relay persistence too?
 
 ## Immediate Next Steps
 
-1. Configure Pi4ssd FIPS node and record npub/FIPS IPv6.
-2. Pick and install a Blossom server on Pi4ssd.
-3. Confirm a `curl` upload/download to Pi4ssd over FIPS from devbox.
-4. In Pushstr, make a small Android-only branch with:
-   - file share intent
-   - Pi4ssd target settings
-   - upload to custom Blossom URL
-5. Use existing FIPS Android/VPN or a FIPS-connected Android environment for the first transfer proof.
+- [x] Add a FIPS-side design note for an embedded `FipsClient` API.
+- [x] Identify the smallest existing FIPS library hooks for:
+   - creating a node without TUN
+   - connecting to a peer by npub/Nostr
+   - sending app-owned bytes without exposing a kernel TUN
+   - receiving app-owned bytes in-process
+- [x] Add an initial Rust facade/skeleton if the hooks are already clean enough.
+- [ ] Configure Pi4ssd FIPS node and record npub/FIPS IPv6.
+- [ ] Pick and install a Blossom server on Pi4ssd.
+- [ ] Confirm a basic upload/download path to Pi4ssd over FIPS from devbox.
+- [ ] In Pushstr, make a small Android-only branch that calls the embedded facade rather than relying on a separate VPN.

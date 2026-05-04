@@ -12,6 +12,7 @@ mod lifecycle;
 mod rate_limit;
 mod retry;
 mod routing_error_rate_limit;
+mod service;
 pub(crate) mod session;
 pub(crate) mod session_wire;
 pub(crate) mod stats;
@@ -52,6 +53,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use thiserror::Error;
+
+pub use self::service::{ServicePacket, ServiceRx};
 
 /// Errors related to node operations.
 #[derive(Debug, Error)]
@@ -112,6 +115,12 @@ pub enum NodeError {
 
     #[error("send failed to {node_addr}: {reason}")]
     SendFailed { node_addr: NodeAddr, reason: String },
+
+    #[error("service port {port} is reserved")]
+    ServicePortReserved { port: u16 },
+
+    #[error("service port {port} is already registered")]
+    ServicePortAlreadyRegistered { port: u16 },
 
     #[error("mtu exceeded forwarding to {node_addr}: packet {packet_size} > mtu {mtu}")]
     MtuExceeded {
@@ -408,6 +417,10 @@ pub struct Node {
     /// Tracks which LinkId corresponds to which session index.
     pending_outbound: HashMap<(TransportId, u32), LinkId>,
 
+    // === In-Process Services ===
+    /// Registered local FSP service ports for embedded clients.
+    service_ports: HashMap<u16, tokio::sync::mpsc::Sender<service::ServicePacket>>,
+
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
     msg1_rate_limiter: HandshakeRateLimiter,
@@ -598,6 +611,7 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            service_ports: HashMap::new(),
             msg1_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
@@ -730,6 +744,7 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            service_ports: HashMap::new(),
             msg1_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),

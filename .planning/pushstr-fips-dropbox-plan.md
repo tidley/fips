@@ -1,0 +1,587 @@
+# Pushstr + FIPS Dropbox Plan
+
+## Goal
+
+Build a Pushstr-styled, multi-platform file-drop experience that uses the FIPS network as the private transport. The first proof of concept is:
+
+```text
+Android phone -> FIPS network -> Pi4ssd Blossom storage
+```
+
+The Android app should feel like Pushstr, keep Pushstr's Nostr identity/relay model, and initially send a selected file to Pi4ssd. Pi4ssd acts as the private storage anchor. The second Pi4 and Pi3 provide relay redundancy and mesh resilience.
+
+A parallel first-class goal is to remove the current VPS-as-WireGuard-proxy dependency. The home Pis should expose private services over FIPS so phone/laptop/homelab access no longer depends on a permanent VPS. LNVPS can remain useful as an optional rendezvous/public seed, but the system should keep working without it once devices are peered.
+
+## Device Roles
+
+### Pi4ssd
+
+Primary storage node.
+
+- FIPS node with persistent identity.
+- Blossom-compatible HTTP server backed by the 1 TB SSD.
+- Regular Nostr relay with NIP-17/NIP-59-friendly behavior.
+- Private upload endpoint reachable over FIPS, not exposed directly to the public internet.
+- Long-term location for received files, metadata, thumbnails, and optional backups.
+
+### Pi4
+
+Application and observability node.
+
+- FIPS node with persistent identity.
+- Regular Nostr relay with NIP-17 support.
+- Grafana-style dashboard host.
+- Uses Pi4ssd for durable metrics/storage where useful.
+- Monitors FIPS node health, relay health, Blossom storage, disk usage, and transfer status.
+
+### Pi3B
+
+Low-power support node.
+
+- FIPS node with persistent identity.
+- Lightweight Nostr relay with NIP-17 support if performance is acceptable.
+- Support mesh node for resilience and low-barrier demos.
+- Should remain simple: no large storage or heavy dashboards.
+
+### LNVPS
+
+Optional public bootstrap.
+
+- Useful while available for public rendezvous and normal network access.
+- Not required for local service availability once the Pis are peered.
+- Plans and tests should include "LNVPS absent" mode.
+- Should not remain the required WireGuard-style proxy for reaching home services.
+
+## WireGuard Proxy Replacement Goal
+
+Current pain:
+
+```text
+phone/laptop -> VPS WireGuard proxy -> home services
+```
+
+Desired shape:
+
+```text
+phone/laptop -> FIPS -> Pi/home services
+```
+
+The first replacement should be deliberately narrow:
+
+- Reach Pi4ssd private storage from phone/laptop without WireGuard.
+- Reach a small admin/status page on Pi4 or Pi4ssd without WireGuard.
+- Keep LNVPS optional for discovery/rendezvous only.
+- Do not expose Pi services directly to the public internet.
+
+This is not initially a full "route all traffic through home" VPN replacement. It is a private-service access replacement. Full egress routing can be a later project.
+
+### Replacement Modes
+
+#### Mode A: FIPS-Native Services
+
+Services bind to FIPS addresses or `.fips` hostnames.
+
+Examples:
+
+- Blossom on Pi4ssd.
+- Grafana/status on Pi4.
+- Nostr relays on Pi4ssd/Pi4/Pi3.
+- Git/file services later.
+
+Pros:
+
+- Cleanest security boundary.
+- No LAN-wide routing required.
+- Good fit for mobile app and Pushstr.
+
+Cons:
+
+- Each service needs explicit FIPS address/DNS support.
+- Existing clients may need `.fips` names or app config changes.
+
+#### Mode B: FIPS Gateway To LAN
+
+One Pi acts as a gateway from FIPS into selected LAN services.
+
+Pros:
+
+- Closer replacement for "VPN into home network".
+- Existing homelab/proxmox services can stay where they are.
+
+Cons:
+
+- Larger security surface.
+- Requires routing/firewall policy.
+- Easier to accidentally expose too much.
+
+Recommended sequence:
+
+```text
+Phase 1: FIPS-native services only.
+Phase 2: narrowly-scoped FIPS gateway for selected homelab services.
+```
+
+## Product Shape
+
+### Android MVP
+
+Start from Pushstr's mobile product direction:
+
+- Flutter UI and styling.
+- Rust core via `flutter_rust_bridge`.
+- Existing Nostr identity model.
+- Existing Blossom attachment concepts.
+- Android share-sheet integration.
+
+Add a new "FIPS Drop" workflow:
+
+```text
+Share file from Android
+  -> choose "Send to Pi4ssd"
+  -> app confirms target/storage path
+  -> file uploads to Pi4ssd Blossom endpoint over FIPS
+  -> app records a Nostr event/DM with the file manifest
+  -> upload appears in history
+```
+
+The first version does not need full chat, sync, or general internet routing. It only needs reliable file transfer from Android to Pi4ssd.
+
+### Desktop/Laptop Later
+
+Keep the design compatible with Pushstr's Linux desktop and browser-extension model:
+
+- Same Nostr identity/profile.
+- Same target Pi4ssd storage server.
+- Same manifest format.
+- Same relay list.
+- Same Blossom upload/download logic.
+
+## Proposed Architecture
+
+```text
+Android Pushstr-FIPS app
+  Flutter UI
+  Pushstr Rust Nostr/Blossom core
+  Android platform share intent
+  FIPS connectivity provider
+
+FIPS connectivity provider
+  Phase 1: depend on separately running FIPS Android/VPN app, if fastest
+  Phase 2: embed FIPS mobile core directly into Pushstr-FIPS
+
+Pi4ssd
+  FIPS node
+  Blossom server bound to FIPS-reachable address
+  Nostr relay
+  SSD-backed object store
+
+Pi4/Pi3
+  FIPS nodes
+  Nostr relays
+  observability/resilience roles
+```
+
+## Multi-Identity Security Boundaries
+
+FIPS npubs are cheap enough that a single physical device can expose multiple logical identities. Use this as a security boundary where it removes real risk:
+
+```text
+Pi4ssd physical device
+  pi4ssd-storage identity
+  pi4ssd-admin identity
+  pi4ssd-relay identity
+```
+
+Each identity should have its own:
+
+- FIPS keypair/npub.
+- Config file.
+- Control socket.
+- UDP bind if required.
+- Systemd unit.
+- Service allowlist.
+- Logs.
+
+This is similar in spirit to separate logins or containers: compromise or over-permissioning of one identity should not automatically grant access to every service on the box.
+
+### Initial Identity Split
+
+Start with three identities on Pi4ssd:
+
+#### `pi4ssd-storage`
+
+- Purpose: Blossom upload/download.
+- Exposed to phone, laptop, and selected homelab devices.
+- Can write to SSD-backed blob storage.
+- No admin dashboard or relay-management permissions.
+
+#### `pi4ssd-admin`
+
+- Purpose: operator access to dashboards/status/admin endpoints.
+- Exposed only to trusted operator devices.
+- Should not be used for casual file drop.
+- Can reach Grafana/status and later selected host management endpoints.
+
+#### `pi4ssd-relay`
+
+- Purpose: Nostr relay service identity.
+- Publicly or semi-publicly advertised depending on policy.
+- No write access to Blossom storage except relay database paths.
+
+Pi4 and Pi3 can start with one identity each. Split them later only if a real boundary appears.
+
+### Implementation POC
+
+The pragmatic near-term implementation is multiple FIPS daemon instances on the same Pi:
+
+```text
+/etc/fips/storage.yaml      -> /run/fips-storage/control.sock
+/etc/fips/admin.yaml        -> /run/fips-admin/control.sock
+/etc/fips/relay.yaml        -> /run/fips-relay/control.sock
+```
+
+Systemd units:
+
+```text
+fips-storage.service
+fips-admin.service
+fips-relay.service
+```
+
+Service binding:
+
+- Blossom binds only on the `pi4ssd-storage` FIPS address.
+- Grafana/status binds only on the `pi4ssd-admin` FIPS address.
+- Nostr relay binds only on the `pi4ssd-relay` FIPS address.
+
+If binding to a specific FIPS address is awkward initially, use loopback ports plus local firewall or reverse proxies that enforce the intended FIPS-side access policy.
+
+### Operational Tradeoffs
+
+Pros:
+
+- Clear blast-radius reduction.
+- Easy key rotation and revocation by removing one npub.
+- Different trust groups can be given different npubs.
+- Logs and metrics naturally separate by purpose.
+
+Cons:
+
+- More configs and units.
+- More sockets and memory use.
+- More ways to misconfigure routing.
+- More identities to document and back up.
+
+Guardrail:
+
+```text
+Do not create an identity for every tiny service.
+Create one only when it represents a meaningful trust boundary.
+```
+
+## Transfer Design
+
+### First Pass
+
+Use Blossom as the blob storage protocol and Nostr as the metadata/control protocol.
+
+1. Android selects a file.
+2. Android computes:
+   - SHA-256
+   - size
+   - MIME type
+   - original filename
+3. Android signs Blossom/NIP-98-style upload authorization with the user's Nostr key.
+4. Android uploads to:
+
+```text
+https://pi4ssd.fips/<blossom upload path>
+```
+
+or the equivalent FIPS IPv6/HTTP endpoint.
+
+5. Pi4ssd stores the blob on SSD.
+6. Android emits a private NIP-17 message, self-note, or app-specific event containing:
+   - blob URL
+   - hash
+   - size
+   - MIME type
+   - original filename
+   - upload timestamp
+   - optional encrypted file key if client-side encryption is enabled
+
+### Encryption Choices
+
+MVP can use one of two modes:
+
+- **Transport/private-network first:** rely on FIPS transport encryption plus server-side access control.
+- **End-to-end file encryption:** encrypt file before Blossom upload and store only ciphertext on Pi4ssd.
+
+Recommended MVP:
+
+```text
+Use client-side encryption if Pushstr attachment encryption is easy to reuse.
+Otherwise ship transport/private-network first, then add E2EE in phase 2.
+```
+
+## FIPS Connectivity Options
+
+### Option A: Fastest POC
+
+Run FIPS Android/VPN separately. Pushstr-FIPS uses normal HTTP to a `.fips` or FIPS IPv6 address.
+
+Pros:
+
+- Keeps Pushstr changes smaller.
+- Proves the product workflow quickly.
+- Separates file UX from FIPS mobile embedding.
+
+Cons:
+
+- Two Android apps/services.
+- Less polished.
+- Harder to distribute as one product.
+
+### Option B: Integrated Product
+
+Embed FIPS mobile core directly into Pushstr-FIPS.
+
+Pros:
+
+- Single app.
+- Better user experience.
+- Future path for per-app routing and mobile mesh participation.
+
+Cons:
+
+- More native build complexity.
+- Must reconcile Pushstr's `flutter_rust_bridge` core with FIPS mobile/UniFFI or port one bridge style.
+- Android first; iOS will require a separate Network Extension design.
+
+Recommended sequence:
+
+```text
+Phase 1: Option A for proof.
+Phase 2: Option B for productization.
+```
+
+## Phases
+
+### Phase 0: Baseline Inventory
+
+Deliverables:
+
+- Record Pi4ssd, Pi4, Pi3 npubs and FIPS IPv6 addresses.
+- Confirm each node is on upstream master and has persistent identity.
+- Confirm Pi4ssd can be reached over FIPS from Android or another client.
+- Inventory current WireGuard/VPS use:
+  - which devices connect through it
+  - which services are reached through it
+  - which ones need replacing first
+- Choose Blossom server implementation.
+- Choose relay implementation for Pi nodes.
+
+Acceptance:
+
+- `fipsctl show peers` shows the three Pis peered directly or via known parent.
+- Pi4ssd has stable storage mount path.
+- Android can resolve/reach a simple HTTP test service on Pi4ssd over FIPS.
+- At least one current WireGuard-proxied service is selected as the first FIPS replacement target.
+
+### Phase 0.5: WireGuard Proxy Exit Ramp
+
+Deliverables:
+
+- Document the current WireGuard proxy topology.
+- List services currently accessed through the VPS.
+- Classify each service:
+  - FIPS-native now
+  - FIPS gateway later
+  - keep public/VPS for now
+- Pick one low-risk service for first replacement, preferably Pi4ssd file drop or Pi4 status page.
+- Define rollback: WireGuard remains available until FIPS replacement is verified.
+
+Acceptance:
+
+- From a phone or laptop off-LAN, reach the selected service over FIPS without using WireGuard.
+- Stop WireGuard on the client and confirm the FIPS path still works.
+- Stop LNVPS after peering and confirm already-peered local access still works where expected.
+
+### Phase 1: Pi4ssd Storage Anchor
+
+Deliverables:
+
+- Install and configure Blossom server on Pi4ssd.
+- Create the first dedicated FIPS identity: `pi4ssd-storage`.
+- Bind Blossom only to FIPS-reachable interface/address where possible.
+- Store blobs under SSD path, for example:
+
+```text
+/srv/fips/blossom/blobs
+/srv/fips/blossom/meta
+```
+
+- Add systemd unit.
+- Add basic NIP-98/Nostr auth policy.
+- Add test upload/download commands from devbox over FIPS.
+
+Acceptance:
+
+- Upload a test file over FIPS.
+- Download file over FIPS.
+- File survives reboot.
+- Direct LAN/public access is blocked unless explicitly intended.
+- Phone/laptop can use this path without the WireGuard VPS proxy.
+
+### Phase 2: Multi-Identity Pi4ssd Split
+
+Deliverables:
+
+- Add `pi4ssd-admin` FIPS identity and service unit.
+- Add `pi4ssd-relay` FIPS identity and service unit.
+- Bind/admin-proxy Grafana/status only through `pi4ssd-admin`.
+- Bind/proxy the Nostr relay only through `pi4ssd-relay`.
+- Document all three npubs and their allowed use.
+
+Acceptance:
+
+- A storage client cannot reach admin-only endpoints.
+- A relay client cannot write arbitrary files to Blossom storage.
+- Revoking/removing one npub does not break unrelated roles.
+
+### Phase 3: Pi Relay Layer
+
+Deliverables:
+
+- Run Nostr relay on Pi4ssd.
+- Run Nostr relay on Pi4.
+- Run lightweight relay on Pi3 if acceptable.
+- Ensure NIP-17/NIP-59 event kinds are accepted/stored.
+- Configure Pushstr/FIPS clients to use the Pi relays plus selected public relays.
+
+Acceptance:
+
+- Publish and fetch NIP-17 events across Pi relays.
+- Turn off one Pi relay and verify another still works.
+- Confirm relays do not require LNVPS.
+
+### Phase 4: Android File-Send MVP
+
+Deliverables:
+
+- Fork/branch Pushstr.
+- Add a "FIPS Drop" target in the mobile UI.
+- Add Android share intent handling for files.
+- Add settings for:
+  - Pi4ssd target npub/alias
+  - Blossom URL or `.fips` hostname
+  - relay list
+  - optional encryption toggle
+- Reuse Pushstr's Blossom upload code path, pointed at Pi4ssd.
+- Store upload history locally.
+
+Acceptance:
+
+- Share a photo/document from Android to the app.
+- Upload completes over FIPS.
+- File appears on Pi4ssd SSD.
+- App shows success/failure with retry option.
+
+### Phase 5: Metadata and Multi-Device Sync
+
+Deliverables:
+
+- Define a file manifest schema.
+- Send manifest via NIP-17 to self or a configured device group.
+- Display upload history from Nostr events, not only local state.
+- Let laptop/desktop Pushstr see/download files from Pi4ssd.
+
+Acceptance:
+
+- Android upload appears on laptop.
+- Laptop downloads the uploaded file over FIPS.
+- New Android install can restore history from Nostr relays.
+
+### Phase 6: Integrated FIPS Mobile
+
+Deliverables:
+
+- Decide bridge strategy:
+  - expose FIPS through `flutter_rust_bridge`, or
+  - wrap FIPS mobile UniFFI behind Flutter platform channels.
+- Add in-app FIPS node lifecycle:
+  - start/stop
+  - status
+  - peer list
+  - relay/Nostr config
+- Android first.
+- Keep iOS design notes but do not block Android MVP on iOS.
+
+Acceptance:
+
+- Single Android app starts FIPS and uploads to Pi4ssd without separate VPN app.
+- App reports FIPS connected/disconnected state.
+- Uploads fail clearly when FIPS is unavailable.
+
+### Phase 7: Resilience Tests
+
+Tests:
+
+- Power off LNVPS: local Pi file upload still works.
+- Power off Pi4: Pi4ssd upload still works.
+- Power off Pi3: no impact on primary upload.
+- Power off Pi4ssd: app queues upload and retries later.
+- Disable one relay: NIP-17 manifest still publishes/fetches via another.
+- Reboot Android: pending upload state is preserved.
+
+Acceptance:
+
+- A one-page test log proves each degraded mode.
+
+## Future Work: Rich Per-Service Auth And ACLs
+
+The multiple-daemon model is useful for an early POC, but it should not be the only long-term answer. Future FIPS work should support richer service-level authorization without requiring one full node per role.
+
+Desired capabilities:
+
+- Per-service identities or capability keys attached to one FIPS node.
+- ACLs by peer npub, service name, route, port, or advertised endpoint.
+- Declarative service adverts:
+
+```text
+service=blossom role=storage access=allowlist
+service=grafana role=admin access=operator-only
+service=nostr-relay role=relay access=public-or-policy
+```
+
+- Separate audit logs per service.
+- Runtime `fipsctl` commands to grant/revoke service access.
+- Optional quota/rate limits per peer and service.
+- Integration with app-layer auth such as Blossom/NIP-98 and Nostr relay auth.
+
+Long-term target:
+
+```text
+One physical device can run one FIPS daemon while exposing multiple isolated service surfaces.
+Multiple FIPS daemons remain available for hard isolation, but are no longer required for every security boundary.
+```
+
+## Open Questions
+
+- Which Blossom server implementation should be standardized on Pi4ssd?
+- Should Pi4ssd enforce upload authorization by allowlisted npubs only?
+- Should files be client-side encrypted in MVP, or phase 2?
+- Should the Android app require FIPS VPN already running, or should the first APK bundle FIPS immediately?
+- What hostname convention should be used: `pi4ssd.fips`, `dropbox.fips`, or raw FIPS IPv6?
+- Should relay storage live on Pi4ssd only, or should Pi4/Pi3 keep relay persistence too?
+
+## Immediate Next Steps
+
+1. Configure Pi4ssd FIPS node and record npub/FIPS IPv6.
+2. Pick and install a Blossom server on Pi4ssd.
+3. Confirm a `curl` upload/download to Pi4ssd over FIPS from devbox.
+4. In Pushstr, make a small Android-only branch with:
+   - file share intent
+   - Pi4ssd target settings
+   - upload to custom Blossom URL
+5. Use existing FIPS Android/VPN or a FIPS-connected Android environment for the first transfer proof.

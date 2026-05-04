@@ -408,6 +408,31 @@ Cons:
 - Not the product path.
 - Must not become the long-term required setup.
 
+### Default Peer Endpoint Observation
+
+FIPS nodes should behave as lightweight STUN-like endpoints by default on their normal UDP transport. When Alice tries to connect directly to Bob and a UDP probe reaches Bob, Bob can immediately observe Alice's public source IP:port from that packet.
+
+Bob should then:
+
+- record Alice's observed source endpoint
+- send Alice a UDP punch/probe back to that observed endpoint
+- send Alice a signed/encrypted Nostr signal saying what endpoint Bob observed
+- continue normal FIPS encrypted handshake once packets are flowing both ways
+
+The intended flow is:
+
+```text
+Alice -> Bob UDP probe
+Bob observes Alice as public_ip:public_port
+Bob -> Alice UDP punch/probe to public_ip:public_port
+Bob -> Alice Nostr signal: "I saw you as public_ip:public_port"
+Alice and Bob continue the FIPS handshake over UDP
+```
+
+This makes any FIPS node that can receive a probe act as a useful endpoint observer for its peers, instead of requiring every joining node to use a public STUN service for every attempt.
+
+Public STUN remains useful for first bootstrap, unreachable peers, or restrictive NAT/firewall cases, but ordinary FIPS nodes should provide this peer-observation behavior automatically once they are online.
+
 ### Later Path: Android VPN/Tor-Style Provider
 
 After Pushstr file drop works, a separate FIPS provider app or VpnService mode can exist for routing other selected apps through FIPS. That belongs after the in-process service client is proven.
@@ -562,6 +587,7 @@ Deliverables:
 - Add Android background/foreground service behavior for long uploads.
 - Add pairing UX for Pi4ssd service npub and service adverts.
 - Add better status and retry telemetry.
+- Enable default peer endpoint observation/punch-back behavior so the mobile node can use already-known FIPS peers as lightweight STUN-like observers.
 - Android first.
 - Keep iOS design notes but do not block Android MVP on iOS.
 
@@ -634,6 +660,7 @@ Multiple FIPS daemons remain available for hard isolation, but are no longer req
 - Should files be client-side encrypted in MVP, or phase 2?
 - Should Pushstr use the same Nostr identity as its FIPS device identity for MVP, or bind a separate FIPS device npub to the user's Pushstr/Nostr identity?
 - Should the FIPS in-process client expose HTTP request primitives first, or lower-level stream primitives first?
+- Should peer endpoint observation be implemented as part of the existing Nostr NAT traversal messages, or as a smaller always-on UDP probe/response plus Nostr observation signal?
 - What hostname convention should be used: `pi4ssd.fips`, `dropbox.fips`, or raw FIPS IPv6?
 - Should relay storage live on Pi4ssd only, or should Pi4/Pi3 keep relay persistence too?
 
@@ -646,6 +673,7 @@ Multiple FIPS daemons remain available for hard isolation, but are no longer req
    - sending app-owned bytes without exposing a kernel TUN
    - receiving app-owned bytes in-process
 - [x] Add an initial Rust facade/skeleton if the hooks are already clean enough.
+- [ ] Specify the default peer endpoint observation/punch-back handshake.
 - [ ] Configure Pi4ssd FIPS node and record npub/FIPS IPv6.
 - [ ] Pick and install a Blossom server on Pi4ssd.
 - [ ] Confirm a basic upload/download path to Pi4ssd over FIPS from devbox.

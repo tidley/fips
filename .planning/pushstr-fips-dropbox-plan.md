@@ -12,6 +12,8 @@ The Android app should feel like Pushstr, keep Pushstr's Nostr identity/relay mo
 
 A parallel first-class goal is to remove the current VPS-as-WireGuard-proxy dependency. The home Pis should expose private services over FIPS so phone/laptop/homelab access no longer depends on a permanent VPS. LNVPS can remain useful as an optional rendezvous/public seed, but the system should keep working without it once devices are peered.
 
+A strong companion proof of concept is a Flutter mobile media app with a Rust FFI FIPS core. The app connects directly over UDP to a trusted homebase/routing node, then asks that node to fetch music, video, or other media from known, already-established FIPS peers. This demonstrates FIPS as a private service fabric, not only a file upload path.
+
 ## Device Roles
 
 ### Pi4ssd
@@ -145,6 +147,41 @@ Share file from Android
 ```
 
 The first version does not need full chat, sync, or general internet routing. It only needs reliable file transfer from Android to Pi4ssd.
+
+### Homebase Media PoC
+
+A second mobile PoC can use the same embedded FIPS core, Rust FFI, and Flutter UI pattern without starting from Pushstr's product surface.
+
+Shape:
+
+```text
+Flutter media app
+  -> Rust FFI FIPS client
+  -> direct UDP/FIPS connection to homebase node
+  -> homebase routes/fetches media from established FIPS peers
+  -> app streams or downloads the selected media
+```
+
+The homebase node is not a generic public relay or unrestricted internet proxy. It is a trusted private router with a known FIPS identity, explicit ACLs, and stable connections to media-serving peers such as Pi4ssd, homelab servers, or later dedicated media nodes.
+
+Initial user workflow:
+
+```text
+Open mobile app
+  -> connect to homebase by npub/service advert
+  -> browse a small catalog
+  -> tap a track/video
+  -> stream or download over FIPS
+```
+
+This PoC is useful because it exercises:
+
+- mobile Rust FFI without needing whole-device VPN mode
+- direct UDP connection to a homebase node
+- service discovery and service requests over FIPS
+- FIPS routing through a trusted node to already-connected media peers
+- realistic large-object transfer and streaming pressure
+- a more compelling demo than only file upload
 
 ### Desktop/Laptop Later
 
@@ -408,6 +445,31 @@ Cons:
 - Not the product path.
 - Must not become the long-term required setup.
 
+### Default Peer Endpoint Observation
+
+FIPS nodes should behave as lightweight STUN-like endpoints by default on their normal UDP transport. When Alice tries to connect directly to Bob and a UDP probe reaches Bob, Bob can immediately observe Alice's public source IP:port from that packet.
+
+Bob should then:
+
+- record Alice's observed source endpoint
+- send Alice a UDP punch/probe back to that observed endpoint
+- send Alice a signed/encrypted Nostr signal saying what endpoint Bob observed
+- continue normal FIPS encrypted handshake once packets are flowing both ways
+
+The intended flow is:
+
+```text
+Alice -> Bob UDP probe
+Bob observes Alice as public_ip:public_port
+Bob -> Alice UDP punch/probe to public_ip:public_port
+Bob -> Alice Nostr signal: "I saw you as public_ip:public_port"
+Alice and Bob continue the FIPS handshake over UDP
+```
+
+This makes any FIPS node that can receive a probe act as a useful endpoint observer for its peers, instead of requiring every joining node to use a public STUN service for every attempt.
+
+Public STUN remains useful for first bootstrap, unreachable peers, or restrictive NAT/firewall cases, but ordinary FIPS nodes should provide this peer-observation behavior automatically once they are online.
+
 ### Later Path: Android VPN/Tor-Style Provider
 
 After Pushstr file drop works, a separate FIPS provider app or VpnService mode can exist for routing other selected apps through FIPS. That belongs after the in-process service client is proven.
@@ -550,6 +612,32 @@ Acceptance:
 - Laptop downloads the uploaded file over FIPS.
 - New Android install can restore history from Nostr relays.
 
+### Phase 5.5: Homebase Media Router PoC
+
+Deliverables:
+
+- Create a small Flutter mobile app, separate from Pushstr if that is faster.
+- Embed the same Rust FFI FIPS client facade used by the file-drop work.
+- Configure one homebase/routing node with a persistent FIPS identity.
+- Add a simple media service protocol over FIPS service ports:
+  - list catalog
+  - fetch metadata
+  - request byte range or chunk
+  - cancel stream
+- Let homebase fetch media from known established FIPS peers, initially Pi4ssd or a homelab media server.
+- Add minimal playback/download UI:
+  - music first if video streaming is too much for the first pass
+  - video once chunking/backpressure is stable
+- Add ACLs so only allowlisted mobile/user npubs can request media.
+
+Acceptance:
+
+- Mobile app connects directly to homebase over UDP/FIPS using Nostr discovery or a service advert.
+- App lists at least three media items served by a downstream FIPS peer.
+- App plays or downloads one music file through homebase.
+- Homebase can fetch from an already-connected media peer without exposing that peer publicly.
+- Turning off LNVPS does not break playback once homebase and media peers are already peered.
+
 ### Phase 6: Harden Embedded FIPS Mobile
 
 Deliverables:
@@ -562,6 +650,7 @@ Deliverables:
 - Add Android background/foreground service behavior for long uploads.
 - Add pairing UX for Pi4ssd service npub and service adverts.
 - Add better status and retry telemetry.
+- Enable default peer endpoint observation/punch-back behavior so the mobile node can use already-known FIPS peers as lightweight STUN-like observers.
 - Android first.
 - Keep iOS design notes but do not block Android MVP on iOS.
 
@@ -634,6 +723,9 @@ Multiple FIPS daemons remain available for hard isolation, but are no longer req
 - Should files be client-side encrypted in MVP, or phase 2?
 - Should Pushstr use the same Nostr identity as its FIPS device identity for MVP, or bind a separate FIPS device npub to the user's Pushstr/Nostr identity?
 - Should the FIPS in-process client expose HTTP request primitives first, or lower-level stream primitives first?
+- Should peer endpoint observation be implemented as part of the existing Nostr NAT traversal messages, or as a smaller always-on UDP probe/response plus Nostr observation signal?
+- Should the homebase media PoC use HTTP-compatible range requests over FIPS, or a custom chunked media protocol over service ports?
+- Should homebase cache media locally, or only route/fetch from downstream FIPS peers?
 - What hostname convention should be used: `pi4ssd.fips`, `dropbox.fips`, or raw FIPS IPv6?
 - Should relay storage live on Pi4ssd only, or should Pi4/Pi3 keep relay persistence too?
 
@@ -646,6 +738,7 @@ Multiple FIPS daemons remain available for hard isolation, but are no longer req
    - sending app-owned bytes without exposing a kernel TUN
    - receiving app-owned bytes in-process
 - [x] Add an initial Rust facade/skeleton if the hooks are already clean enough.
+- [ ] Specify the default peer endpoint observation/punch-back handshake.
 - [ ] Configure Pi4ssd FIPS node and record npub/FIPS IPv6.
 - [ ] Pick and install a Blossom server on Pi4ssd.
 - [ ] Confirm a basic upload/download path to Pi4ssd over FIPS from devbox.

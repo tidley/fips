@@ -258,6 +258,68 @@ async fn test_session_direct_peer_data_transfer() {
     cleanup_nodes(&mut nodes).await;
 }
 
+#[tokio::test]
+async fn test_session_direct_peer_in_process_service_data_transfer() {
+    // Two nodes: establish session, then send encrypted non-TUN service data.
+    let edges = vec![(0, 1)];
+    let mut nodes = run_tree_test(2, &edges, false).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_pubkey = nodes[1].node.identity().pubkey_full();
+
+    let mut service_rx = nodes[1].node.register_service_port(4096, 8).unwrap();
+
+    nodes[0]
+        .node
+        .initiate_session(node1_addr, node1_pubkey)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .state()
+            .is_established()
+    );
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .state()
+            .is_established()
+    );
+
+    nodes[0]
+        .node
+        .send_service_data(&node1_addr, 5000, 4096, b"hello service")
+        .await
+        .expect("send_service_data failed");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let count = process_available_packets(&mut nodes).await;
+    assert!(count > 0, "Expected encrypted service data to arrive");
+
+    let packet = service_rx.try_recv().expect("service packet should arrive");
+    assert_eq!(packet.src_addr, node0_addr);
+    assert_eq!(packet.src_port, 5000);
+    assert_eq!(packet.dst_port, 4096);
+    assert_eq!(packet.payload, b"hello service");
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 // ============================================================================
 // Integration tests: 3-node forwarded session
 // ============================================================================

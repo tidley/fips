@@ -288,6 +288,7 @@ impl Node {
                     debug!(len = rest.len(), "DataPacket too short for port header");
                     return;
                 }
+                let src_port = u16::from_le_bytes([rest[0], rest[1]]);
                 let dst_port = u16::from_le_bytes([rest[2], rest[3]]);
                 let service_payload = &rest[FSP_PORT_HEADER_SIZE..];
 
@@ -330,11 +331,19 @@ impl Node {
                         }
                     }
                     _ => {
-                        debug!(
-                            src = %self.peer_display_name(src_addr),
+                        if !self.deliver_service_packet(
+                            src_addr,
+                            src_port,
                             dst_port,
-                            "Unknown FSP service port, dropping DataPacket"
-                        );
+                            service_payload,
+                        ) {
+                            debug!(
+                                src = %self.peer_display_name(src_addr),
+                                src_port,
+                                dst_port,
+                                "Unknown FSP service port, dropping DataPacket"
+                            );
+                        }
                     }
                 }
             }

@@ -1,13 +1,18 @@
 # NOW
 
 - Focus on the Android FIPS Dropbox PoC, not repository demo harnesses.
-- Build the first Rust slice for embedded app-owned FIPS communication:
+- Current Rust slice is implemented and covered:
+  - embedded Nostr bootstrap wrapper,
   - TUN disabled,
   - no system-wide Android VPN dependency,
-  - Nostr advert/signaling bootstrap,
-  - STUN-assisted UDP hole punch,
-  - adopt established UDP traversal into the FIPS node,
-  - verify normal FIPS peer/session readiness over that punched UDP path.
-- Then build the app-service send/receive API over a reserved Dropbox service port, proposed `4242`.
+  - traversal event adoption into the FIPS node,
+  - normal FIPS peer/session readiness over adopted UDP,
+  - app-service send/receive API,
+  - Dropbox-style service protocol on port `4242`,
+  - Pi4ssd receiver-agent logic for filesystem storage and acknowledgements.
+- Next work is at the integration boundary:
+  - package the receiver as a runnable Pi4ssd agent or keep it as a library first,
+  - test real Nostr/STUN traversal on hardware,
+  - add the Flutter/Pushstr bridge.
 - Keep `.planning/ANDROID-FIPS-DROPBOX-POC.md` as the current execution plan.
 - Keep local key/config material out of all PoC docs and commits.

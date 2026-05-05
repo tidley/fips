@@ -38,3 +38,18 @@
 - Tom clarified the initial Android connection should use the existing Nostr bootstrap/signaling path to establish a UDP hole punch between phone and FIPS node.
 - Updated `.planning/ANDROID-FIPS-DROPBOX-POC.md` to put embedded Nostr discovery + STUN/UDP traversal before app-service payload work.
 - Updated `STATUS.md`, `NOW.md`, and `DECISIONS.md`: first milestone is library-friendly Nostr bootstrap -> established traversal -> `Node::adopt_established_traversal` -> FIPS session readiness with TUN disabled.
+
+## 2026-05-05 Embedded Dropbox Rust slice
+- Consolidated the Pushstr Dropbox work into the main feature branch and removed stale clean worktrees.
+- Added embedded Nostr bootstrap methods on `Node`:
+  - `request_nostr_bootstrap`
+  - `drain_nostr_bootstrap`
+  - `NostrBootstrapOutcome`
+- Added in-process FSP service ports for app-owned payloads without TUN.
+- Added Dropbox-style protocol and receiver logic on service port `4242`.
+- Proved the embedded bootstrap/adoption path with TUN disabled and a normal FIPS session over the adopted traversal.
+- Proved encrypted in-process service data transfer and Dropbox `put`/`ack` round trip between two FIPS nodes.
+- Coverage for the new files:
+  - `src/node/embedded.rs`: 100%
+  - `src/node/service.rs`: 100%
+  - `src/dropbox.rs`: 99.55%

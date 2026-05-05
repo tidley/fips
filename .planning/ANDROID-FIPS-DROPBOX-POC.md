@@ -237,13 +237,14 @@ Only after Phase 1-5 prove direct FIPS app messaging:
 
 ## Immediate Next Course of Action
 
-1. Build a library-friendly embedded bootstrap wrapper around Nostr discovery + STUN/UDP traversal + `adopt_established_traversal`.
-2. Prove the wrapper with TUN disabled and a normal FIPS session established over the punched UDP path.
-3. Build the app-service API on top of that connection path.
-4. Create the Pi4ssd receiver-agent shape against that API.
-5. Add the Flutter bridge in Pushstr once the Rust bootstrap/app-service API is proven.
-6. Build the Android send/share UI against the bridge.
-7. Add Blossom/Nostr file metadata once raw direct FIPS transfer works.
+1. Done: build a library-friendly embedded bootstrap wrapper around Nostr discovery + STUN/UDP traversal + `adopt_established_traversal`.
+2. Done: prove the wrapper with TUN disabled and a normal FIPS session established over the adopted traversal path.
+3. Done: build the app-service API on top of that connection path.
+4. Done: create the Pi4ssd receiver-agent logic against that API.
+5. Next: choose whether to package the receiver as a small runnable agent before Flutter, or bridge the library API into Pushstr first.
+6. Next: add the Flutter bridge in Pushstr once the packaging decision is made.
+7. Later: build the Android send/share UI against the bridge.
+8. Later: add Blossom/Nostr file metadata once raw direct FIPS transfer works.
 
 The critical first slice is not UI and not Blossom. It is:
 
@@ -251,7 +252,7 @@ The critical first slice is not UI and not Blossom. It is:
 embedded FIPS node + Nostr bootstrap + UDP hole punch + adopted FIPS session + no TUN
 ```
 
-Once that exists, the second slice is the service-port payload channel. Android then becomes a normal Flutter/FRB integration task rather than a networking architecture gamble.
+That slice now exists in Rust tests. Android now becomes a Flutter/FRB integration task plus real-device traversal testing rather than a networking architecture gamble.
 
 ## Open Decisions
 

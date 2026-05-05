@@ -8,8 +8,8 @@ use crate::config::{
     PeerAssistDialMode, PeerAssistRequestPolicy, PeerConfig, TransportInstances, UdpConfig,
 };
 use crate::discovery::nostr::{
-    ADVERT_IDENTIFIER, ADVERT_VERSION, AssistGrant, AssistObserved, AssistRequest, NostrDiscovery,
-    OverlayAdvert, OverlayEndpointAdvert, OverlayTransportKind, PEER_ASSIST_MAGIC,
+    ADVERT_IDENTIFIER, ADVERT_VERSION, AssistGrant, AssistObserved, AssistRequest, BootstrapEvent,
+    NostrDiscovery, OverlayAdvert, OverlayEndpointAdvert, OverlayTransportKind, PEER_ASSIST_MAGIC,
 };
 use crate::node::wire::{PHASE_MSG1, PHASE_MSG2, PHASE_MSG3};
 use crate::transport::udp::UdpTransport;
@@ -138,6 +138,166 @@ async fn test_failed_adopted_traversal_cleans_up_transport() {
         node.transports.is_empty(),
         "failed handoff should remove the adopted transport"
     );
+}
+
+#[tokio::test]
+async fn test_embedded_nostr_bootstrap_request_requires_runtime() {
+    let mut node = make_node();
+    let peer_config = PeerConfig {
+        npub: "npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98".to_string(),
+        via_nostr: true,
+        ..Default::default()
+    };
+
+    let err = node.request_nostr_bootstrap(peer_config).await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        NodeError::NostrDiscoveryUnavailable(reason) if reason == "runtime is not running"
+    ));
+}
+
+#[tokio::test]
+async fn test_embedded_nostr_bootstrap_drain_requires_runtime() {
+    let mut node = make_node();
+
+    let err = node.drain_nostr_bootstrap().await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        NodeError::NostrDiscoveryUnavailable(reason) if reason == "runtime is not running"
+    ));
+}
+
+#[tokio::test]
+async fn test_embedded_nostr_bootstrap_request_reports_runtime_failure() {
+    let mut node = make_node();
+    let mut runtime_config = node.config.node.discovery.nostr.clone();
+    runtime_config.enabled = true;
+    runtime_config.advert_relays.clear();
+    runtime_config.dm_relays.clear();
+    node.nostr_discovery = Some(NostrDiscovery::new_for_test(&node.identity, runtime_config));
+
+    let peer_config = PeerConfig {
+        npub: "not-an-npub".to_string(),
+        via_nostr: true,
+        ..Default::default()
+    };
+
+    node.request_nostr_bootstrap(peer_config).await.unwrap();
+
+    let outcomes = timeout(Duration::from_secs(1), async {
+        loop {
+            let outcomes = node.drain_nostr_bootstrap().await.unwrap();
+            if !outcomes.is_empty() {
+                break outcomes;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timeout waiting for failed embedded bootstrap event");
+
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0] {
+        NostrBootstrapOutcome::Failed { npub, reason } => {
+            assert_eq!(npub, "not-an-npub");
+            assert!(reason.contains("invalid npub"), "reason was {reason}");
+        }
+        other => panic!("unexpected embedded bootstrap outcome: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_embedded_nostr_bootstrap_event_adopts_traversal_with_tun_disabled() {
+    let mut node_a = make_node();
+    let mut node_b = make_node();
+
+    let transport_id_b = TransportId::new(1);
+    let udp_config = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        mtu: Some(1280),
+        ..Default::default()
+    };
+
+    let (packet_tx_a, packet_rx_a) = packet_channel(64);
+    let (packet_tx_b, packet_rx_b) = packet_channel(64);
+
+    node_a.packet_tx = Some(packet_tx_a.clone());
+    node_a.packet_rx = Some(packet_rx_a);
+    node_a.state = NodeState::Running;
+    assert_eq!(node_a.tun_state, TunState::Disabled);
+
+    let mut runtime_config = node_a.config.node.discovery.nostr.clone();
+    runtime_config.enabled = true;
+    runtime_config.advert_relays.clear();
+    runtime_config.dm_relays.clear();
+    let runtime = NostrDiscovery::new_for_test(&node_a.identity, runtime_config);
+    node_a.nostr_discovery = Some(runtime.clone());
+
+    let mut transport_b = UdpTransport::new(transport_id_b, None, udp_config, packet_tx_b.clone());
+    transport_b.start_async().await.unwrap();
+
+    let addr_b = transport_b.local_addr().unwrap();
+    node_b.packet_tx = Some(packet_tx_b.clone());
+    node_b.packet_rx = Some(packet_rx_b);
+    node_b.state = NodeState::Running;
+    node_b
+        .transports
+        .insert(transport_id_b, TransportHandle::Udp(transport_b));
+
+    let adopted_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let handoff =
+        EstablishedTraversal::new("embedded-sess-1", node_b.npub(), addr_b, adopted_socket)
+            .with_transport_name("embedded-nostr");
+    runtime.emit_event_for_test(BootstrapEvent::Established { traversal: handoff });
+
+    let outcomes = node_a.drain_nostr_bootstrap().await.unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let peer_b_node_addr = match &outcomes[0] {
+        NostrBootstrapOutcome::Adopted(handoff) => {
+            assert_eq!(handoff.remote_addr, addr_b);
+            handoff.peer_node_addr
+        }
+        other => panic!("unexpected embedded bootstrap outcome: {other:?}"),
+    };
+    assert_eq!(node_a.tun_state, TunState::Disabled);
+
+    let mut rx_a = node_a.packet_rx.take().expect("node_a packet_rx");
+    let mut rx_b = node_b.packet_rx.take().expect("node_b packet_rx");
+
+    let pkt_at_b = timeout(Duration::from_secs(1), rx_b.recv())
+        .await
+        .expect("timeout waiting for node_a -> node_b msg1")
+        .expect("node_b channel closed");
+    assert_eq!(pkt_at_b.data[0] & 0x0f, PHASE_MSG1);
+    node_b.handle_msg1(pkt_at_b).await;
+
+    let pkt_at_a = timeout(Duration::from_secs(1), rx_a.recv())
+        .await
+        .expect("timeout waiting for node_b -> node_a msg2")
+        .expect("node_a channel closed");
+    assert_eq!(pkt_at_a.data[0] & 0x0f, PHASE_MSG2);
+    node_a.handle_msg2(pkt_at_a).await;
+
+    let pkt_at_b = timeout(Duration::from_secs(1), rx_b.recv())
+        .await
+        .expect("timeout waiting for node_a -> node_b msg3")
+        .expect("node_b channel closed");
+    assert_eq!(pkt_at_b.data[0] & 0x0f, PHASE_MSG3);
+    node_b.handle_msg3(pkt_at_b).await;
+
+    let peer_a_node_addr =
+        *PeerIdentity::from_pubkey_full(node_a.identity.pubkey_full()).node_addr();
+    assert!(node_a.get_peer(&peer_b_node_addr).unwrap().has_session());
+    assert!(node_b.get_peer(&peer_a_node_addr).unwrap().has_session());
+
+    for (_, transport) in node_a.transports.iter_mut() {
+        transport.stop().await.ok();
+    }
+    for (_, transport) in node_b.transports.iter_mut() {
+        transport.stop().await.ok();
+    }
 }
 
 #[tokio::test]

@@ -243,6 +243,11 @@ impl NostrDiscovery {
     }
 
     #[cfg(test)]
+    pub(crate) fn emit_event_for_test(&self, event: BootstrapEvent) {
+        let _ = self.event_tx.send(event);
+    }
+
+    #[cfg(test)]
     pub(crate) async fn inject_advert_for_test(&self, peer_npub: String, advert: OverlayAdvert) {
         let now = now_ms();
         self.advert_cache.write().await.insert(

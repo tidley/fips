@@ -15,15 +15,30 @@ Current execution plan:
 - `.planning/ANDROID-FIPS-DROPBOX-POC.md` is the active PoC plan.
 - `.planning/pushstr-fips-dropbox-plan.md` remains the product background/design file.
 
+Completed Rust slice:
+
+- One active worktree remains for this directive; stale `/tmp` worktrees were removed after confirming they were clean.
+- Added an embedded Nostr bootstrap wrapper:
+  - `request_nostr_bootstrap(peer_config)`
+  - `drain_nostr_bootstrap()`
+  - `NostrBootstrapOutcome`
+- Proved `request_connect -> BootstrapEvent::Established -> adopt_established_traversal` in-process.
+- Proved the adopted traversal path can establish a normal FIPS session with TUN disabled.
+- Added in-process FSP service ports and a Dropbox-style protocol on reserved port `4242`.
+- Added a Pi4ssd receiver-agent shape as Rust receiver logic:
+  - `hello`
+  - `put`
+  - `put_chunk`
+  - `put_done`
+  - hash/status acknowledgements.
+
 Immediate priority:
 
-1. Add/prove a public embedded bootstrap wrapper around existing Nostr discovery/traversal.
-2. Use that wrapper to request/connect to a node by npub/peer config via Nostr adverts/signaling.
-3. Adopt the established UDP traversal into FIPS and verify peer/session readiness without TUN/VPN.
-4. Then add/prove Dropbox service-port payload send/receive, currently proposed as port `4242`.
-5. Then bridge that API into Pushstr's Flutter/Rust mobile stack.
+1. Decide whether the Pi4ssd receiver becomes a small `fips-dropbox-agent` binary, a crate API consumed by Pushstr, or both.
+2. Run real Nostr/STUN traversal against Pi4ssd/Pi/mobile hardware.
+3. Bridge the proven Rust API into Pushstr's Flutter/Rust mobile stack.
+4. Add Blossom/Nostr metadata after raw direct FIPS transfer succeeds.
 
 Worktree caution:
 
-- Pre-existing dirty state remains: deleted `.planning/peer-assisted-core-34e00b9-to-3eaf9ac.diff` and untracked `.planning/pushstr-fips-dropbox-plan.md`.
 - Ignored local key/config files exist; keep them out of PoC material and commits.

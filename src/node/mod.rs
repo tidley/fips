@@ -7,6 +7,7 @@
 mod acl;
 mod bloom;
 mod discovery_rate_limit;
+mod embedded;
 mod handlers;
 mod lifecycle;
 mod rate_limit;
@@ -55,6 +56,7 @@ use std::thread::JoinHandle;
 use thiserror::Error;
 
 pub use self::service::{ServicePacket, ServiceRx};
+pub use embedded::NostrBootstrapOutcome;
 
 /// Errors related to node operations.
 #[derive(Debug, Error)]
@@ -149,6 +151,9 @@ pub enum NodeError {
 
     #[error("bootstrap handoff failed: {0}")]
     BootstrapHandoff(String),
+
+    #[error("Nostr discovery runtime unavailable: {0}")]
+    NostrDiscoveryUnavailable(String),
 }
 
 /// Node operational state.

@@ -149,7 +149,30 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Config;
+    use crate::node::session::{EndToEndState, SessionEntry};
+    use crate::noise::{HandshakeState, NoiseSession};
+    use crate::{Config, Identity};
+
+    fn make_noise_session(our_identity: &Identity, remote_identity: &Identity) -> NoiseSession {
+        let mut initiator = HandshakeState::new_initiator(our_identity.keypair());
+        let mut responder = HandshakeState::new_responder(remote_identity.keypair());
+
+        let mut init_epoch = [0u8; 8];
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut init_epoch);
+        initiator.set_local_epoch(init_epoch);
+        let mut resp_epoch = [0u8; 8];
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut resp_epoch);
+        responder.set_local_epoch(resp_epoch);
+
+        let msg1 = initiator.write_message_1().unwrap();
+        responder.read_message_1(&msg1).unwrap();
+        let msg2 = responder.write_message_2().unwrap();
+        initiator.read_message_2(&msg2).unwrap();
+        let msg3 = initiator.write_message_3().unwrap();
+        responder.read_message_3(&msg3).unwrap();
+
+        initiator.into_session().unwrap()
+    }
 
     #[test]
     fn register_rejects_reserved_ipv6_shim_port() {
@@ -201,5 +224,142 @@ mod tests {
         let src_addr = NodeAddr::from_bytes([7u8; 16]);
 
         assert!(!node.deliver_service_packet(&src_addr, 5000, 4096, b"hello"));
+    }
+
+    #[test]
+    fn unregister_and_registration_status_are_reported() {
+        let mut node = Node::new(Config::default()).unwrap();
+
+        assert!(!node.is_service_port_registered(4096));
+        assert!(!node.unregister_service_port(4096));
+
+        let _rx = node.register_service_port(4096, 8).unwrap();
+        assert!(node.is_service_port_registered(4096));
+        assert!(node.unregister_service_port(4096));
+        assert!(!node.is_service_port_registered(4096));
+        assert!(!node.unregister_service_port(4096));
+    }
+
+    #[test]
+    fn deliver_full_service_queue_counts_as_handled() {
+        let mut node = Node::new(Config::default()).unwrap();
+        let _rx = node.register_service_port(4096, 1).unwrap();
+        let src_addr = NodeAddr::from_bytes([7u8; 16]);
+
+        assert!(node.deliver_service_packet(&src_addr, 5000, 4096, b"one"));
+        assert!(node.deliver_service_packet(&src_addr, 5000, 4096, b"two"));
+    }
+
+    #[test]
+    fn deliver_closed_service_queue_counts_as_handled() {
+        let mut node = Node::new(Config::default()).unwrap();
+        let rx = node.register_service_port(4096, 1).unwrap();
+        drop(rx);
+
+        let src_addr = NodeAddr::from_bytes([7u8; 16]);
+        assert!(node.deliver_service_packet(&src_addr, 5000, 4096, b"hello"));
+    }
+
+    #[tokio::test]
+    async fn send_service_data_rejects_reserved_ports_before_session_lookup() {
+        let mut node = Node::new(Config::default()).unwrap();
+        let dest_addr = NodeAddr::from_bytes([8u8; 16]);
+
+        let err = node
+            .send_service_data(&dest_addr, FSP_PORT_IPV6_SHIM, 4096, b"hello")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NodeError::ServicePortReserved {
+                port: FSP_PORT_IPV6_SHIM
+            }
+        ));
+
+        let err = node
+            .send_service_data(&dest_addr, 5000, FSP_PORT_IPV6_SHIM, b"hello")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NodeError::ServicePortReserved {
+                port: FSP_PORT_IPV6_SHIM
+            }
+        ));
+    }
+
+    #[test]
+    fn established_service_session_status_tracks_session_state() {
+        let mut node = Node::new(Config::default()).unwrap();
+        let remote = Identity::generate();
+        let remote_addr = *remote.node_addr();
+
+        assert!(!node.has_established_service_session(&remote_addr));
+
+        let handshake = HandshakeState::new_initiator(node.identity().keypair());
+        node.sessions.insert(
+            remote_addr,
+            SessionEntry::new(
+                remote_addr,
+                remote.pubkey_full(),
+                EndToEndState::Initiating(handshake),
+                1000,
+                true,
+            ),
+        );
+        assert!(!node.has_established_service_session(&remote_addr));
+
+        let session = make_noise_session(node.identity(), &remote);
+        node.sessions.insert(
+            remote_addr,
+            SessionEntry::new(
+                remote_addr,
+                remote.pubkey_full(),
+                EndToEndState::Established(session),
+                1000,
+                true,
+            ),
+        );
+        assert!(node.has_established_service_session(&remote_addr));
+    }
+
+    #[tokio::test]
+    async fn ensure_service_session_noops_for_existing_initiating_session() {
+        let mut node = Node::new(Config::default()).unwrap();
+        let remote = Identity::generate();
+        let peer_identity = PeerIdentity::from_pubkey_full(remote.pubkey_full());
+        let remote_addr = *peer_identity.node_addr();
+        let handshake = HandshakeState::new_initiator(node.identity().keypair());
+
+        node.sessions.insert(
+            remote_addr,
+            SessionEntry::new(
+                remote_addr,
+                remote.pubkey_full(),
+                EndToEndState::Initiating(handshake),
+                1000,
+                true,
+            ),
+        );
+
+        node.ensure_service_session(&peer_identity).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_service_session_registers_identity_and_reports_no_route() {
+        let mut node = Node::new(Config::default()).unwrap();
+        let remote = Identity::generate();
+        let peer_identity = PeerIdentity::from_pubkey_full(remote.pubkey_full());
+
+        let err = node
+            .ensure_service_session(&peer_identity)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, NodeError::SendFailed { .. }));
+        assert!(
+            node.identity_cache_len() == 1,
+            "embedded callers should be able to register peer identity before routing succeeds"
+        );
     }
 }

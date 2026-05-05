@@ -1,6 +1,9 @@
 //! End-to-end session establishment tests.
 
 use super::*;
+use crate::dropbox::{
+    DROPBOX_SERVICE_PORT, DropboxMessage, DropboxReceiver, encode_b64, sha256_hex,
+};
 use crate::node::session::EndToEndState;
 use crate::node::tests::spanning_tree::{
     TestNode, cleanup_nodes, generate_random_edges, lock_large_network_test,
@@ -316,6 +319,116 @@ async fn test_session_direct_peer_in_process_service_data_transfer() {
     assert_eq!(packet.src_port, 5000);
     assert_eq!(packet.dst_port, 4096);
     assert_eq!(packet.payload, b"hello service");
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_session_direct_peer_dropbox_service_put_round_trip() {
+    let edges = vec![(0, 1)];
+    let mut nodes = run_tree_test(2, &edges, false).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_pubkey = nodes[1].node.identity().pubkey_full();
+
+    let mut client_rx = nodes[0].node.register_service_port(5000, 8).unwrap();
+    let mut receiver_rx = nodes[1]
+        .node
+        .register_service_port(DROPBOX_SERVICE_PORT, 8)
+        .unwrap();
+
+    nodes[0]
+        .node
+        .initiate_session(node1_addr, node1_pubkey)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .state()
+            .is_established()
+    );
+
+    let storage_dir = tempfile::tempdir().unwrap();
+    let mut receiver = DropboxReceiver::new(storage_dir.path());
+    let data = b"hello pi4ssd";
+    let put = DropboxMessage::Put {
+        id: "put-1".to_string(),
+        name: "hello.txt".to_string(),
+        mime: Some("text/plain".to_string()),
+        sha256: Some(sha256_hex(data)),
+        size: Some(data.len() as u64),
+        data_b64: encode_b64(data),
+    };
+
+    nodes[0]
+        .node
+        .send_service_data(
+            &node1_addr,
+            5000,
+            DROPBOX_SERVICE_PORT,
+            &put.to_payload().unwrap(),
+        )
+        .await
+        .expect("send Dropbox put");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    let packet = receiver_rx
+        .try_recv()
+        .expect("Dropbox packet should arrive");
+    assert_eq!(packet.src_addr, node0_addr);
+    assert_eq!(packet.src_port, 5000);
+    assert_eq!(packet.dst_port, DROPBOX_SERVICE_PORT);
+
+    let replies = receiver.handle_service_packet(&packet).unwrap();
+    assert_eq!(
+        std::fs::read(storage_dir.path().join("hello.txt")).unwrap(),
+        data
+    );
+    assert_eq!(replies.len(), 1);
+
+    for reply in replies {
+        nodes[1]
+            .node
+            .send_service_data(
+                &reply.dest_addr,
+                reply.src_port,
+                reply.dst_port,
+                &reply.payload,
+            )
+            .await
+            .expect("send Dropbox ack");
+    }
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    let ack_packet = client_rx.try_recv().expect("Dropbox ack should arrive");
+    assert_eq!(ack_packet.src_addr, node1_addr);
+    assert_eq!(ack_packet.src_port, DROPBOX_SERVICE_PORT);
+    assert_eq!(ack_packet.dst_port, 5000);
+    assert_eq!(
+        DropboxMessage::from_payload(&ack_packet.payload).unwrap(),
+        DropboxMessage::Ack {
+            id: "put-1".to_string(),
+            status: "stored".to_string(),
+            sha256: Some(sha256_hex(data)),
+            size: Some(data.len() as u64),
+            path: Some("hello.txt".to_string()),
+        }
+    );
 
     cleanup_nodes(&mut nodes).await;
 }

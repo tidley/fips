@@ -8,6 +8,7 @@ pub mod cache;
 pub mod config;
 pub mod control;
 pub mod discovery;
+pub mod dropbox;
 #[cfg(target_os = "linux")]
 pub mod gateway;
 pub mod identity;
@@ -66,4 +67,4 @@ pub use peer::{
 };
 
 // Re-export node types
-pub use node::{Node, NodeError, NodeState, ServicePacket, ServiceRx};
+pub use node::{Node, NodeError, NodeState, NostrBootstrapOutcome, ServicePacket, ServiceRx};

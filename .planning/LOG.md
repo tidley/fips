@@ -20,3 +20,21 @@
   - `cargo clippy --features "gateway nostr-discovery" --all-targets -- -D warnings`
   - `cargo test --features "gateway nostr-discovery"`
   - `./testing/nat/scripts/nat-test.sh assist`
+
+## 2026-05-04 PoC suite refocus
+- Confirmed local `/home/tom/code/fips` is now focused on a suite of PoCs.
+- Reviewed existing harnesses and planning with Satoshi/Ducky support.
+- Added `.planning/POC-SUITE.md` as the suite taxonomy and authoring guide.
+- Refreshed `STATUS.md`, `NOW.md`, `NEXT.md`, `BACKLOG.md`, and `DECISIONS.md` for the PoC-suite direction.
+- Preserved existing dirty-state caution: deleted `.planning/peer-assisted-core-34e00b9-to-3eaf9ac.diff`, untracked `.planning/pushstr-fips-dropbox-plan.md`, and ignored local key/config files.
+
+## 2026-05-04 Android Dropbox PoC refocus
+- Tom clarified that the focus is specifically `.planning/pushstr-fips-dropbox-plan.md` and taking forward a Pushstr-style Android app.
+- Key correction: the PoC should embed FIPS communication inside the Android app/library, not depend on a system-wide VPN/gateway path.
+- Added `.planning/ANDROID-FIPS-DROPBOX-POC.md` with the next course of action.
+- Updated `STATUS.md`, `NOW.md`, `NEXT.md`, and `DECISIONS.md` to prioritize embedded FIPS app-service communication and de-emphasize existing repo demo harnesses for this track.
+
+## 2026-05-04 Nostr bootstrap correction
+- Tom clarified the initial Android connection should use the existing Nostr bootstrap/signaling path to establish a UDP hole punch between phone and FIPS node.
+- Updated `.planning/ANDROID-FIPS-DROPBOX-POC.md` to put embedded Nostr discovery + STUN/UDP traversal before app-service payload work.
+- Updated `STATUS.md`, `NOW.md`, and `DECISIONS.md`: first milestone is library-friendly Nostr bootstrap -> established traversal -> `Node::adopt_established_traversal` -> FIPS session readiness with TUN disabled.

@@ -274,7 +274,7 @@ fn recvmsg_with_pktinfo(
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = &mut src_store as *mut _ as *mut _;
-    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
@@ -301,7 +301,7 @@ fn extract_pktinfo_ifindex(msg: &libc::msghdr) -> Option<u32> {
         if cmsg.cmsg_level == libc::IPPROTO_IPV6 && cmsg.cmsg_type == libc::IPV6_PKTINFO {
             let data_ptr = unsafe { libc::CMSG_DATA(cmsg_ptr) } as *const libc::in6_pktinfo;
             let pktinfo: libc::in6_pktinfo = unsafe { std::ptr::read_unaligned(data_ptr) };
-            return Some(pktinfo.ipi6_ifindex);
+            return pktinfo.ipi6_ifindex.try_into().ok();
         }
         cmsg_ptr = unsafe { libc::CMSG_NXTHDR(msg, cmsg_ptr) };
     }

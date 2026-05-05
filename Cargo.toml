@@ -9,8 +9,9 @@ repository = "https://github.com/jmcorgan/fips"
 readme = "README.md"
 
 [features]
-default = ["nostr-discovery"]
+default = ["nostr-discovery", "bluetooth"]
 nostr-discovery = ["dep:nostr", "dep:nostr-sdk"]
+bluetooth = ["dep:bluer"]
 
 [dependencies]
 ratatui = "0.30"
@@ -48,9 +49,10 @@ libc = "0.2"
 rtnetlink = "0.20.0"
 rustables = "0.8.7"
 
-# bluer/BlueZ needs glibc — see build.rs `bluer_available` cfg gate.
+# bluer/BlueZ needs glibc and a host D-Bus development environment. Keep it
+# optional so lean UDP/Nostr builds can cross-compile without a BlueZ sysroot.
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
-bluer = { version = "0.17", features = ["bluetoothd", "l2cap"] }
+bluer = { version = "0.17", features = ["bluetoothd", "l2cap"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"

@@ -7,6 +7,10 @@
 use super::{Node, NodeError};
 use crate::config::PeerConfig;
 use crate::discovery::BootstrapHandoffResult;
+use crate::node::service::ServiceOutbound;
+use crate::{NodeAddr, PeerIdentity};
+use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 /// Result of draining embedded Nostr bootstrap events.
 #[derive(Clone, Debug)]
@@ -17,7 +21,58 @@ pub enum NostrBootstrapOutcome {
     Failed { npub: String, reason: String },
 }
 
+/// Lightweight status snapshot for embedded clients.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddedNodeStatus {
+    pub npub: String,
+    pub node_addr: String,
+    pub fips_address: String,
+    pub state: String,
+    pub tun_state: String,
+    pub peer_count: usize,
+    pub link_count: usize,
+    pub session_count: usize,
+}
+
+/// Commands accepted by the embedded node event loop.
+pub enum EmbeddedNodeCommand {
+    RequestNostrBootstrap {
+        peer_config: PeerConfig,
+        respond_to: Option<oneshot::Sender<Result<(), String>>>,
+    },
+    EnsureServiceSession {
+        peer_identity: PeerIdentity,
+        respond_to: Option<oneshot::Sender<Result<(), String>>>,
+    },
+    HasServiceSession {
+        dest_addr: NodeAddr,
+        respond_to: oneshot::Sender<bool>,
+    },
+    SendServiceData {
+        outbound: ServiceOutbound,
+        respond_to: Option<oneshot::Sender<Result<(), String>>>,
+    },
+    Status {
+        respond_to: oneshot::Sender<EmbeddedNodeStatus>,
+    },
+    Stop,
+}
+
 impl Node {
+    /// Return a compact status snapshot for app-owned runtimes.
+    pub fn embedded_status(&self) -> EmbeddedNodeStatus {
+        EmbeddedNodeStatus {
+            npub: self.npub(),
+            node_addr: self.node_addr().to_string(),
+            fips_address: self.identity().address().to_string(),
+            state: self.state().to_string(),
+            tun_state: self.tun_state().to_string(),
+            peer_count: self.peer_count(),
+            link_count: self.link_count(),
+            session_count: self.session_count(),
+        }
+    }
+
     /// Ask the embedded Nostr discovery runtime to connect to a peer.
     ///
     /// This starts the existing Nostr advert/signaling/STUN traversal flow.

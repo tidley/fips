@@ -25,6 +25,19 @@ pub struct ServicePacket {
 /// Receiver returned by [`Node::register_service_port`].
 pub type ServiceRx = mpsc::Receiver<ServicePacket>;
 
+/// App-owned service payload to send through an established FSP session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceOutbound {
+    /// Destination FIPS node address.
+    pub dest_addr: NodeAddr,
+    /// Local service port chosen by the sender.
+    pub src_port: u16,
+    /// Remote service port.
+    pub dst_port: u16,
+    /// Plain service payload. FIPS encrypts this inside the end-to-end session.
+    pub payload: Vec<u8>,
+}
+
 impl Node {
     /// Register a local in-process FSP service port.
     ///

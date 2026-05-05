@@ -6,7 +6,7 @@ use crate::node::wire::{
     COMMON_PREFIX_SIZE, CommonPrefix, FMP_VERSION, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2,
     PHASE_MSG3,
 };
-use crate::node::{Node, NodeError};
+use crate::node::{EmbeddedNodeCommand, Node, NodeError};
 use crate::transport::ReceivedPacket;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -113,35 +113,186 @@ impl Node {
                     let _ = response_tx.send(response);
                 }
                 _ = tick.tick() => {
-                    self.check_timeouts();
-                    let now_ms = Self::now_ms();
-                    self.reload_peer_acl();
-                    self.poll_pending_connects().await;
-                    #[cfg(feature = "nostr-discovery")]
-                    self.poll_nostr_discovery().await;
-                    self.resend_pending_handshakes(now_ms).await;
-                    self.resend_pending_rekeys(now_ms).await;
-                    self.resend_pending_session_handshakes(now_ms).await;
-                    self.purge_idle_sessions(now_ms);
-                    self.process_pending_retries(now_ms).await;
-                    self.check_tree_state().await;
-                    self.check_bloom_state().await;
-                    self.compute_mesh_size();
-                    self.record_stats_history();
-                    self.check_mmp_reports().await;
-                    self.check_session_mmp_reports().await;
-                    self.check_link_heartbeats().await;
-                    self.check_rekey().await;
-                    self.check_session_rekey().await;
-                    self.check_pending_lookups(now_ms).await;
-                    self.poll_transport_discovery().await;
-                    self.sample_transport_congestion();
+                    self.run_periodic_tick().await;
                 }
             }
         }
 
         info!("RX event loop stopped (channel closed)");
         Ok(())
+    }
+
+    /// Run the receive loop with an extra app-owned command channel.
+    ///
+    /// This is the embedded/mobile variant of [`Node::run_rx_loop`]. It keeps
+    /// normal packet processing, periodic maintenance, Nostr bootstrap polling,
+    /// and optional control socket handling intact while allowing an in-process
+    /// client to request peer connects, service sends, and status snapshots.
+    pub async fn run_embedded_loop(
+        &mut self,
+        mut command_rx: tokio::sync::mpsc::Receiver<EmbeddedNodeCommand>,
+    ) -> Result<(), NodeError> {
+        let mut packet_rx = self.packet_rx.take().ok_or(NodeError::NotStarted)?;
+
+        let (mut tun_outbound_rx, _tun_guard) = match self.tun_outbound_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
+
+        let (mut dns_identity_rx, _dns_guard) = match self.dns_identity_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
+
+        let mut tick =
+            tokio::time::interval(Duration::from_secs(self.config.node.tick_interval_secs));
+
+        let (control_tx, mut control_rx) =
+            tokio::sync::mpsc::channel::<crate::control::ControlMessage>(32);
+
+        if self.config.node.control.enabled {
+            let config = self.config.node.control.clone();
+            let tx = control_tx.clone();
+            tokio::spawn(async move {
+                match ControlSocket::bind(&config) {
+                    Ok(socket) => {
+                        socket.accept_loop(tx).await;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to bind control socket");
+                    }
+                }
+            });
+        }
+        drop(control_tx);
+
+        info!("Embedded RX event loop started");
+
+        loop {
+            tokio::select! {
+                packet = packet_rx.recv() => {
+                    match packet {
+                        Some(p) => self.process_packet(p).await,
+                        None => break,
+                    }
+                }
+                Some(ipv6_packet) = tun_outbound_rx.recv() => {
+                    self.handle_tun_outbound(ipv6_packet).await;
+                }
+                Some(identity) = dns_identity_rx.recv() => {
+                    debug!(
+                        node_addr = %identity.node_addr,
+                        "Registering identity from DNS resolution"
+                    );
+                    self.register_identity(identity.node_addr, identity.pubkey);
+                }
+                Some((request, response_tx)) = control_rx.recv() => {
+                    let response = if request.command.starts_with("show_") {
+                        queries::dispatch(self, &request.command, request.params.as_ref())
+                    } else {
+                        commands::dispatch(
+                            self,
+                            &request.command,
+                            request.params.as_ref(),
+                        ).await
+                    };
+                    let _ = response_tx.send(response);
+                }
+                Some(command) = command_rx.recv() => {
+                    if !self.handle_embedded_command(command).await {
+                        break;
+                    }
+                }
+                _ = tick.tick() => {
+                    self.run_periodic_tick().await;
+                }
+            }
+        }
+
+        info!("Embedded RX event loop stopped");
+        Ok(())
+    }
+
+    async fn handle_embedded_command(&mut self, command: EmbeddedNodeCommand) -> bool {
+        match command {
+            EmbeddedNodeCommand::RequestNostrBootstrap {
+                peer_config,
+                respond_to,
+            } => {
+                send_embedded_result(respond_to, self.request_nostr_bootstrap(peer_config).await);
+                true
+            }
+            EmbeddedNodeCommand::EnsureServiceSession {
+                peer_identity,
+                respond_to,
+            } => {
+                send_embedded_result(
+                    respond_to,
+                    self.ensure_service_session(&peer_identity).await,
+                );
+                true
+            }
+            EmbeddedNodeCommand::HasServiceSession {
+                dest_addr,
+                respond_to,
+            } => {
+                let _ = respond_to.send(self.has_established_service_session(&dest_addr));
+                true
+            }
+            EmbeddedNodeCommand::SendServiceData {
+                outbound,
+                respond_to,
+            } => {
+                send_embedded_result(
+                    respond_to,
+                    self.send_service_data(
+                        &outbound.dest_addr,
+                        outbound.src_port,
+                        outbound.dst_port,
+                        &outbound.payload,
+                    )
+                    .await,
+                );
+                true
+            }
+            EmbeddedNodeCommand::Status { respond_to } => {
+                let _ = respond_to.send(self.embedded_status());
+                true
+            }
+            EmbeddedNodeCommand::Stop => false,
+        }
+    }
+
+    async fn run_periodic_tick(&mut self) {
+        self.check_timeouts();
+        let now_ms = Self::now_ms();
+        self.reload_peer_acl();
+        self.poll_pending_connects().await;
+        #[cfg(feature = "nostr-discovery")]
+        self.poll_nostr_discovery().await;
+        self.resend_pending_handshakes(now_ms).await;
+        self.resend_pending_rekeys(now_ms).await;
+        self.resend_pending_session_handshakes(now_ms).await;
+        self.purge_idle_sessions(now_ms);
+        self.process_pending_retries(now_ms).await;
+        self.check_tree_state().await;
+        self.check_bloom_state().await;
+        self.compute_mesh_size();
+        self.record_stats_history();
+        self.check_mmp_reports().await;
+        self.check_session_mmp_reports().await;
+        self.check_link_heartbeats().await;
+        self.check_rekey().await;
+        self.check_session_rekey().await;
+        self.check_pending_lookups(now_ms).await;
+        self.poll_transport_discovery().await;
+        self.sample_transport_congestion();
     }
 
     /// Process a single received packet.
@@ -236,5 +387,14 @@ impl Node {
     #[cfg(not(feature = "nostr-discovery"))]
     async fn try_handle_peer_assist_probe(&self, _packet: &ReceivedPacket) -> bool {
         false
+    }
+}
+
+fn send_embedded_result(
+    respond_to: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    result: Result<(), NodeError>,
+) {
+    if let Some(tx) = respond_to {
+        let _ = tx.send(result.map_err(|error| error.to_string()));
     }
 }

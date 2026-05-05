@@ -30,7 +30,7 @@ use tracing::error;
 use tracing::{debug, trace};
 #[cfg(windows)]
 use tracing::{error, warn};
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tun::Layer;
 
 /// Channel sender for packets to be written to TUN.
@@ -135,6 +135,7 @@ impl TunDevice {
         }
 
         // Create the TUN device
+        #[cfg_attr(target_os = "android", allow(unused_mut))]
         let mut tun_config = tun::Configuration::default();
 
         // On macOS, utun devices get kernel-assigned names (utun0, utun1, ...),
@@ -1019,6 +1020,43 @@ mod windows_tun {
 // Re-export Windows TUN types at module level
 #[cfg(windows)]
 pub use windows_tun::{TunDevice, TunWriter, run_tun_reader, shutdown_tun_interface};
+
+#[cfg(target_os = "android")]
+mod platform {
+    use super::TunError;
+    use std::net::Ipv6Addr;
+
+    /// Android apps cannot configure kernel TUN devices through this host
+    /// daemon path. Mobile embedding keeps TUN disabled and uses service ports.
+    pub fn is_ipv6_disabled() -> bool {
+        false
+    }
+
+    /// Android TUN creation is not supported by the host TUN implementation.
+    pub async fn interface_exists(_name: &str) -> bool {
+        false
+    }
+
+    /// Android TUN deletion is not supported by the host TUN implementation.
+    pub async fn delete_interface(name: &str) -> Result<(), TunError> {
+        Err(TunError::Configure(format!(
+            "TUN interface '{}' is not supported on Android",
+            name
+        )))
+    }
+
+    /// Android TUN configuration is not supported by the host TUN implementation.
+    pub async fn configure_interface(
+        name: &str,
+        _addr: Ipv6Addr,
+        _mtu: u16,
+    ) -> Result<(), TunError> {
+        Err(TunError::Configure(format!(
+            "TUN interface '{}' is not supported on Android",
+            name
+        )))
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod platform {

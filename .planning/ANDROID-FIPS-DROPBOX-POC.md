@@ -241,10 +241,16 @@ Only after Phase 1-5 prove direct FIPS app messaging:
 2. Done: prove the wrapper with TUN disabled and a normal FIPS session established over the adopted traversal path.
 3. Done: build the app-service API on top of that connection path.
 4. Done: create the Pi4ssd receiver-agent logic against that API.
-5. Next: choose whether to package the receiver as a small runnable agent before Flutter, or bridge the library API into Pushstr first.
-6. Next: add the Flutter bridge in Pushstr once the packaging decision is made.
-7. Later: build the Android send/share UI against the bridge.
-8. Later: add Blossom/Nostr file metadata once raw direct FIPS transfer works.
+5. Done: package the receiver as a small runnable `fips-dropbox-agent` binary.
+6. Done: add a Rust `mobile` facade for Android/Flutter wrappers:
+   - start embedded FIPS with TUN/DNS/control disabled,
+   - request Nostr traversal to a known npub,
+   - initiate/wait for FSP service sessions,
+   - send a Dropbox blob to service port `4242`,
+   - receive ACK/status service packets.
+7. Next: bridge `fips::mobile::FipsMobileClient` into Pushstr's Flutter/Rust mobile stack.
+8. Next: install/run `fips-dropbox-agent` on Pi4ssd and send one blob from Android/devbox.
+9. Later: add Blossom/Nostr file metadata once raw direct FIPS transfer works.
 
 The critical first slice is not UI and not Blossom. It is:
 
@@ -252,11 +258,30 @@ The critical first slice is not UI and not Blossom. It is:
 embedded FIPS node + Nostr bootstrap + UDP hole punch + adopted FIPS session + no TUN
 ```
 
-That slice now exists in Rust tests. Android now becomes a Flutter/FRB integration task plus real-device traversal testing rather than a networking architecture gamble.
+That slice now exists in Rust tests and has a runnable Pi-side receiver binary. Android now becomes a Flutter/FRB integration task plus real-device traversal testing rather than a networking architecture gamble.
+
+## Current Local Test Entry Points
+
+Pi4ssd receiver:
+
+```bash
+cargo run --bin fips-dropbox-agent --features nostr-discovery -- \
+  --config /path/to/pi4ssd-dropbox-fips.yaml \
+  --storage-root /tmp/fips-dropbox-inbox \
+  --port 4242
+```
+
+Android/Flutter bridge target:
+
+- Rust facade: `fips::mobile::FipsMobileClient`
+- Start: `FipsMobileClient::start_from_yaml(...)`
+- Connect: `connect_npub(pi4ssd_npub)`
+- Session: `ensure_session_npub(...)` then `wait_for_session_npub(...)`
+- Upload: `send_dropbox_blob_to_npub(pi4ssd_npub, name, mime, bytes)`
+- ACK/status receive: `recv_service_packet()`
 
 ## Open Decisions
 
 - Should the app-service API live in the main `fips` crate or a sibling crate such as `fips-app` / `fips-mobile`?
 - Should the first Android bridge add `fips` directly to Pushstr's `pushstr_rust`, or should it consume a separate `fips_mobile` library?
-- Should Pi4ssd run the receiver as a separate `fips-dropbox-agent` process or as an integrated FIPS node mode?
 - Which identity should be used for the Android app: existing Pushstr Nostr key, a dedicated FIPS key, or derived/separate keys linked by profile metadata?

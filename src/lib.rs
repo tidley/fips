@@ -13,6 +13,7 @@ pub mod dropbox;
 pub mod gateway;
 pub mod identity;
 pub mod mmp;
+pub mod mobile;
 pub mod node;
 pub mod noise;
 pub mod peer;
@@ -67,4 +68,7 @@ pub use peer::{
 };
 
 // Re-export node types
-pub use node::{Node, NodeError, NodeState, NostrBootstrapOutcome, ServicePacket, ServiceRx};
+pub use node::{
+    EmbeddedNodeCommand, EmbeddedNodeStatus, Node, NodeError, NodeState, NostrBootstrapOutcome,
+    ServiceOutbound, ServicePacket, ServiceRx,
+};

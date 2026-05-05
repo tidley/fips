@@ -9,10 +9,15 @@
   - normal FIPS peer/session readiness over adopted UDP,
   - app-service send/receive API,
   - Dropbox-style service protocol on port `4242`,
-  - Pi4ssd receiver-agent logic for filesystem storage and acknowledgements.
-- Next work is at the integration boundary:
-  - package the receiver as a runnable Pi4ssd agent or keep it as a library first,
-  - test real Nostr/STUN traversal on hardware,
-  - add the Flutter/Pushstr bridge.
+  - Pi4ssd receiver-agent logic for filesystem storage and acknowledgements,
+  - runnable `fips-dropbox-agent` binary,
+  - Rust `fips::mobile` facade for Android/Flutter wrappers,
+  - Pushstr `flutter_rust_bridge` integration,
+  - Android `FIPS Drop` UI,
+  - rebuilt Android native libs and debug APK.
+- Next work is physical integration:
+  - run the receiver binary on Pi4ssd,
+  - install the APK on Android,
+  - test real Nostr/STUN traversal and one blob send on hardware.
 - Keep `.planning/ANDROID-FIPS-DROPBOX-POC.md` as the current execution plan.
 - Keep local key/config material out of all PoC docs and commits.

@@ -1522,6 +1522,7 @@ impl Node {
                 their_index = %their_index,
                 "Connection promoted to active peer"
             );
+            self.last_connect_error = None;
 
             Ok(PromotionResult::Promoted(peer_node_addr))
         }

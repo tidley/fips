@@ -63,7 +63,7 @@ Purpose: prove user-facing value built on FIPS.
 
 First track:
 
-- Pushstr-style FIPS Dropbox: Android phone -> FIPS network -> Pi4ssd Blossom storage
+- Pushstr-style FIPS Drop: Android phone -> FIPS network -> Pi4ssd Blossom storage
 - private Pi4/Pi4ssd admin/status page over FIPS
 - WireGuard/VPS replacement slice for selected private services
 

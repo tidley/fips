@@ -73,6 +73,27 @@ ServicePacket {
 
 This is datagram-shaped. A later stream or HTTP helper can be built on top once framing, backpressure, and request correlation are clear.
 
+## Mobile Library Crate
+
+The supported Rust package boundary for app wrappers is `crates/fips-mobile`.
+It re-exports the embedded client from `src/mobile.rs` and builds `rlib`,
+`staticlib`, and `cdylib` artifacts so Android and later iOS bindings can target
+a mobile-specific crate instead of the root daemon package.
+
+Initial Android builds should use:
+
+```bash
+cargo ndk -t arm64-v8a build \
+  -p fips-mobile \
+  --release \
+  --no-default-features \
+  --features nostr-discovery
+```
+
+This crate deliberately keeps the current PoC API compatible while adding
+FIPS Drop product-name aliases. A later binding pass can rename the remaining
+`dropbox` methods once the Flutter/Rust bridge is regenerated.
+
 ## Pushstr Shape
 
 Pushstr can wrap the FIPS-side API behind its own `FipsClient` facade:

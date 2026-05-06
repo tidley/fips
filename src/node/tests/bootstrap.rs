@@ -5,7 +5,8 @@
 use super::*;
 use crate::EstablishedTraversal;
 use crate::config::{
-    PeerAssistDialMode, PeerAssistRequestPolicy, PeerConfig, TransportInstances, UdpConfig,
+    PeerAssistDialMode, PeerAssistRequestPolicy, PeerConfig, StunServerMode, TransportInstances,
+    UdpConfig,
 };
 use crate::discovery::nostr::{
     ADVERT_IDENTIFIER, ADVERT_VERSION, AssistGrant, AssistObserved, AssistRequest, BootstrapEvent,
@@ -170,7 +171,7 @@ async fn test_embedded_nostr_bootstrap_drain_requires_runtime() {
 }
 
 #[tokio::test]
-async fn test_embedded_nostr_bootstrap_request_reports_runtime_failure() {
+async fn test_embedded_nostr_bootstrap_request_rejects_invalid_npub() {
     let mut node = make_node();
     let mut runtime_config = node.config.node.discovery.nostr.clone();
     runtime_config.enabled = true;
@@ -184,28 +185,12 @@ async fn test_embedded_nostr_bootstrap_request_reports_runtime_failure() {
         ..Default::default()
     };
 
-    node.request_nostr_bootstrap(peer_config).await.unwrap();
+    let err = node.request_nostr_bootstrap(peer_config).await.unwrap_err();
 
-    let outcomes = timeout(Duration::from_secs(1), async {
-        loop {
-            let outcomes = node.drain_nostr_bootstrap().await.unwrap();
-            if !outcomes.is_empty() {
-                break outcomes;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("timeout waiting for failed embedded bootstrap event");
-
-    assert_eq!(outcomes.len(), 1);
-    match &outcomes[0] {
-        NostrBootstrapOutcome::Failed { npub, reason } => {
-            assert_eq!(npub, "not-an-npub");
-            assert!(reason.contains("invalid npub"), "reason was {reason}");
-        }
-        other => panic!("unexpected embedded bootstrap outcome: {other:?}"),
-    }
+    assert!(matches!(
+        err,
+        NodeError::InvalidPeerNpub { npub, .. } if npub == "not-an-npub"
+    ));
 }
 
 #[tokio::test]
@@ -607,6 +592,151 @@ async fn test_no_stun_nat_advert_waits_for_helper_endpoint() {
 }
 
 #[tokio::test]
+async fn test_public_udp_advert_publishes_same_socket_stun_service() {
+    let mut node = make_node();
+    node.config.node.discovery.nostr.enabled = true;
+    node.config.transports.udp = TransportInstances::Single(UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        advertise_on_nostr: Some(true),
+        public: Some(true),
+        ..Default::default()
+    });
+
+    let transport_id = TransportId::new(1);
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.packet_tx = Some(packet_tx.clone());
+    node.packet_rx = Some(packet_rx);
+    node.state = NodeState::Running;
+
+    let mut transport = UdpTransport::new(
+        transport_id,
+        None,
+        UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        },
+        packet_tx,
+    );
+    transport.start_async().await.unwrap();
+    let addr = transport.local_addr().unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(transport));
+
+    let advert = node
+        .build_overlay_advert()
+        .expect("public UDP advert should be published");
+    assert!(
+        advert
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.addr == addr.to_string()),
+        "public UDP endpoint should be advertised"
+    );
+    assert_eq!(
+        advert.stun_services,
+        Some(vec![format!("stun:{addr}")]),
+        "public UDP endpoint should be advertised as a STUN service in auto mode"
+    );
+
+    for (_, transport) in node.transports.iter_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+#[tokio::test]
+async fn test_public_udp_advert_uses_observed_endpoint_for_wildcard_bind() {
+    let mut node = make_node();
+    node.config.node.discovery.nostr.enabled = true;
+    node.config.transports.udp = TransportInstances::Single(UdpConfig {
+        bind_addr: Some("0.0.0.0:0".to_string()),
+        advertise_on_nostr: Some(true),
+        public: Some(true),
+        ..Default::default()
+    });
+
+    let transport_id = TransportId::new(1);
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.packet_tx = Some(packet_tx.clone());
+    node.packet_rx = Some(packet_rx);
+    node.state = NodeState::Running;
+
+    let mut transport = UdpTransport::new(
+        transport_id,
+        None,
+        UdpConfig {
+            bind_addr: Some("0.0.0.0:0".to_string()),
+            ..Default::default()
+        },
+        packet_tx,
+    );
+    transport.start_async().await.unwrap();
+    assert!(transport.local_addr().unwrap().ip().is_unspecified());
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(transport));
+    node.public_udp_endpoints
+        .insert(transport_id, "198.51.100.20:2121".parse().unwrap());
+
+    let advert = node
+        .build_overlay_advert()
+        .expect("observed public endpoint should enable advert");
+    assert!(
+        advert
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.addr == "198.51.100.20:2121")
+    );
+    assert_eq!(
+        advert.stun_services,
+        Some(vec!["stun:198.51.100.20:2121".to_string()])
+    );
+
+    for (_, transport) in node.transports.iter_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+#[tokio::test]
+async fn test_public_udp_stun_service_advert_can_be_disabled() {
+    let mut node = make_node();
+    node.config.node.discovery.nostr.enabled = true;
+    node.config.node.discovery.nostr.stun_server.mode = StunServerMode::Off;
+    node.config.transports.udp = TransportInstances::Single(UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        advertise_on_nostr: Some(true),
+        public: Some(true),
+        ..Default::default()
+    });
+
+    let transport_id = TransportId::new(1);
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.packet_tx = Some(packet_tx.clone());
+    node.packet_rx = Some(packet_rx);
+    node.state = NodeState::Running;
+
+    let mut transport = UdpTransport::new(
+        transport_id,
+        None,
+        UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        },
+        packet_tx,
+    );
+    transport.start_async().await.unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(transport));
+
+    let advert = node
+        .build_overlay_advert()
+        .expect("public UDP advert should still be published");
+    assert!(advert.stun_services.is_none());
+
+    for (_, transport) in node.transports.iter_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+#[tokio::test]
 async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
     let mut node_a = make_node(); // Existing traversal peer (Alice)
     let mut node_b = make_node(); // Helper node with adopted socket (Bob)
@@ -724,6 +854,7 @@ async fn test_private_assist_request_grant_observed_and_adopted_handoff() {
         }],
         signal_relays: Some(vec!["wss://relay.example".to_string()]),
         stun_servers: None,
+        stun_services: None,
     };
     let bob_peer_config = PeerConfig {
         npub: node_b.npub(),

@@ -319,6 +319,8 @@ impl Node {
             debug!(
                 version = prefix.version,
                 transport_id = %packet.transport_id,
+                remote_addr = %packet.remote_addr,
+                len = packet.data.len(),
                 "Unknown FMP version, dropping"
             );
             return;
@@ -344,6 +346,8 @@ impl Node {
                 debug!(
                     phase = prefix.phase,
                     transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
+                    len = packet.data.len(),
                     "Unknown FMP phase, dropping"
                 );
             }

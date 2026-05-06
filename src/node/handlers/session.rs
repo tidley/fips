@@ -331,6 +331,14 @@ impl Node {
                         }
                     }
                     _ => {
+                        debug!(
+                            src = %self.peer_display_name(src_addr),
+                            src_port,
+                            dst_port,
+                            len = service_payload.len(),
+                            counter = header.counter,
+                            "FSP service DataPacket received"
+                        );
                         if !self.deliver_service_packet(
                             src_addr,
                             src_port,
@@ -615,6 +623,23 @@ impl Node {
             }
         };
 
+        if entry.is_established()
+            && entry.is_initiator()
+            && !entry.has_rekey_in_progress()
+            && let Some(payload) = entry.handshake_payload().map(ToOwned::to_owned)
+        {
+            let my_addr = *self.node_addr();
+            let mut datagram = SessionDatagram::new(my_addr, *src_addr, payload)
+                .with_ttl(self.config.node.session.default_ttl);
+            if let Err(e) = self.send_session_datagram(&mut datagram).await {
+                debug!(error = %e, dest = %self.peer_display_name(src_addr), "Failed to resend SessionMsg3 after duplicate SessionAck");
+            } else {
+                debug!(src = %self.peer_display_name(src_addr), "Duplicate SessionAck after establishment, resent SessionMsg3");
+            }
+            self.sessions.insert(*src_addr, entry);
+            return;
+        }
+
         // Rekey path: entry is Established with rekey_state
         if entry.is_established() && entry.has_rekey_in_progress() && entry.is_rekey_initiator() {
             let mut handshake = match entry.take_rekey_state() {
@@ -757,7 +782,7 @@ impl Node {
         let msg3_wire = SessionMsg3::new(msg3);
         let msg3_payload = msg3_wire.encode();
         let my_addr = *self.node_addr();
-        let mut datagram = SessionDatagram::new(my_addr, *src_addr, msg3_payload)
+        let mut datagram = SessionDatagram::new(my_addr, *src_addr, msg3_payload.clone())
             .with_ttl(self.config.node.session.default_ttl);
 
         if let Err(e) = self.send_session_datagram(&mut datagram).await {
@@ -779,7 +804,7 @@ impl Node {
         entry.set_coords_warmup_remaining(self.config.node.session.coords_warmup_packets);
         entry.mark_established(now_ms);
         entry.init_mmp(&self.config.node.session_mmp);
-        entry.clear_handshake_payload();
+        entry.set_handshake_payload(msg3_payload, 0);
         entry.touch(now_ms);
         self.sessions.insert(*src_addr, entry);
         self.coord_cache.insert(*src_addr, ack.src_coords, now_ms);

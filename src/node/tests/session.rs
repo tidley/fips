@@ -204,6 +204,87 @@ async fn test_session_direct_peer_handshake() {
 }
 
 #[tokio::test]
+async fn test_duplicate_session_ack_resends_msg3_after_loss() {
+    let edges = vec![(0, 1)];
+    let mut nodes = run_tree_test(2, &edges, false).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_pubkey = nodes[1].node.identity().pubkey_full();
+
+    nodes[0]
+        .node
+        .initiate_session(node1_addr, node1_pubkey)
+        .await
+        .expect("initiate_session failed");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await; // SessionSetup -> node 1
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .state()
+            .is_awaiting_msg3()
+    );
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await; // SessionAck -> node 0, node 0 sends SessionMsg3
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .state()
+            .is_established()
+    );
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut dropped = 0;
+    while nodes[1].packet_rx.try_recv().is_ok() {
+        dropped += 1;
+    }
+    assert!(dropped > 0, "expected to drop the first SessionMsg3");
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .state()
+            .is_awaiting_msg3()
+    );
+
+    let resend_at = nodes[1]
+        .node
+        .get_session(&node0_addr)
+        .unwrap()
+        .next_resend_at_ms();
+    nodes[1]
+        .node
+        .resend_pending_session_handshakes(resend_at)
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await; // duplicate SessionAck -> node 0, resend msg3
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await; // resent SessionMsg3 -> node 1
+
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .state()
+            .is_established()
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
 async fn test_session_direct_peer_data_transfer() {
     // Two nodes: establish session, then send data
     let edges = vec![(0, 1)];
@@ -364,8 +445,9 @@ async fn test_session_direct_peer_dropbox_service_put_round_trip() {
     let storage_dir = tempfile::tempdir().unwrap();
     let mut receiver = DropboxReceiver::new(storage_dir.path());
     let data = b"hello pi4ssd";
+    let transfer_id = "0102030405060708";
     let put = DropboxMessage::Put {
-        id: "put-1".to_string(),
+        id: transfer_id.to_string(),
         name: "hello.txt".to_string(),
         mime: Some("text/plain".to_string()),
         sha256: Some(sha256_hex(data)),
@@ -422,7 +504,7 @@ async fn test_session_direct_peer_dropbox_service_put_round_trip() {
     assert_eq!(
         DropboxMessage::from_payload(&ack_packet.payload).unwrap(),
         DropboxMessage::Ack {
-            id: "put-1".to_string(),
+            id: transfer_id.to_string(),
             status: "stored".to_string(),
             sha256: Some(sha256_hex(data)),
             size: Some(data.len() as u64),

@@ -765,6 +765,64 @@ async fn test_stale_connection_cleanup() {
     );
 }
 
+/// Test that a pending outbound handshake to an already-promoted peer is
+/// cleaned immediately instead of retrying until the full handshake timeout.
+#[tokio::test]
+async fn test_redundant_pending_handshake_cleanup_after_promotion() {
+    use crate::peer::ActivePeer;
+
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+
+    let peer_identity = make_peer_identity();
+    let peer_addr = *peer_identity.node_addr();
+    let remote_addr = TransportAddr::from_string("10.0.0.2:2121");
+    let now_ms = Node::now_ms();
+
+    node.peers.insert(
+        peer_addr,
+        ActivePeer::new(peer_identity, LinkId::new(99), now_ms),
+    );
+
+    let link_id = node.allocate_link_id();
+    let mut conn = PeerConnection::outbound(link_id, peer_identity, now_ms);
+    let our_index = node.index_allocator.allocate().unwrap();
+    let noise_msg1 = conn
+        .start_handshake(node.identity.keypair(), node.startup_epoch, now_ms)
+        .unwrap();
+    let wire_msg1 = crate::node::wire::build_msg1(our_index, &noise_msg1);
+    conn.set_our_index(our_index);
+    conn.set_transport_id(transport_id);
+    conn.set_source_addr(remote_addr.clone());
+    conn.set_handshake_msg1(wire_msg1, now_ms);
+
+    let link = Link::connectionless(
+        link_id,
+        transport_id,
+        remote_addr.clone(),
+        LinkDirection::Outbound,
+        Duration::from_millis(100),
+    );
+    node.links.insert(link_id, link);
+    node.addr_to_link
+        .insert((transport_id, remote_addr.clone()), link_id);
+    node.connections.insert(link_id, conn);
+    node.pending_outbound
+        .insert((transport_id, our_index.as_u32()), link_id);
+
+    node.resend_pending_handshakes(now_ms).await;
+
+    assert_eq!(node.connection_count(), 0);
+    assert_eq!(node.link_count(), 0);
+    assert!(
+        !node
+            .pending_outbound
+            .contains_key(&(transport_id, our_index.as_u32()))
+    );
+    assert_eq!(node.index_allocator.count(), 0);
+    assert!(!node.addr_to_link.contains_key(&(transport_id, remote_addr)));
+}
+
 /// Test that failed connections are cleaned up by check_timeouts().
 #[tokio::test]
 async fn test_failed_connection_cleanup() {

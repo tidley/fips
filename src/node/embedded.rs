@@ -29,9 +29,11 @@ pub struct EmbeddedNodeStatus {
     pub fips_address: String,
     pub state: String,
     pub tun_state: String,
+    pub connection_count: usize,
     pub peer_count: usize,
     pub link_count: usize,
     pub session_count: usize,
+    pub last_connect_error: Option<String>,
 }
 
 /// Commands accepted by the embedded node event loop.
@@ -67,9 +69,11 @@ impl Node {
             fips_address: self.identity().address().to_string(),
             state: self.state().to_string(),
             tun_state: self.tun_state().to_string(),
+            connection_count: self.connection_count(),
             peer_count: self.peer_count(),
             link_count: self.link_count(),
             session_count: self.session_count(),
+            last_connect_error: self.last_connect_error.clone(),
         }
     }
 
@@ -83,11 +87,16 @@ impl Node {
         &mut self,
         peer_config: PeerConfig,
     ) -> Result<(), NodeError> {
-        let runtime = self.nostr_discovery.clone().ok_or_else(|| {
+        self.last_connect_error = None;
+        self.nostr_discovery.clone().ok_or_else(|| {
             NodeError::NostrDiscoveryUnavailable("runtime is not running".to_string())
         })?;
-        runtime.request_connect(peer_config).await;
-        Ok(())
+
+        let result = self.initiate_peer_connection(&peer_config).await;
+        if let Err(err) = &result {
+            self.last_connect_error = Some(format!("connect request failed: {err}"));
+        }
+        result
     }
 
     /// Ask the embedded Nostr discovery runtime to connect to a peer.
@@ -129,6 +138,10 @@ impl Node {
                     peer_config,
                     reason,
                 } => {
+                    self.last_connect_error = Some(format!(
+                        "NAT traversal failed for {}: {}",
+                        peer_config.npub, reason
+                    ));
                     outcomes.push(NostrBootstrapOutcome::Failed {
                         npub: peer_config.npub,
                         reason,

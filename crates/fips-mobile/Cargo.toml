@@ -1,0 +1,18 @@
+[package]
+name = "fips-mobile"
+version = "0.4.0-dev"
+edition = "2024"
+description = "Mobile-oriented embedded FIPS client library for Android and iOS wrappers"
+license = "MIT"
+publish = false
+
+[lib]
+name = "fips_mobile"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[features]
+default = ["nostr-discovery"]
+nostr-discovery = ["fips/nostr-discovery"]
+
+[dependencies]
+fips = { path = "../..", default-features = false }

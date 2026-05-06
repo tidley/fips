@@ -74,6 +74,7 @@ fn serializes_direct_overlay_advert_without_nat_metadata() {
         ],
         signal_relays: None,
         stun_servers: None,
+        stun_services: None,
     };
 
     let json = serde_json::to_string(&advert).unwrap();
@@ -93,6 +94,7 @@ fn serializes_nat_overlay_advert_with_metadata() {
         }],
         signal_relays: Some(vec!["wss://relay.example".to_string()]),
         stun_servers: Some(vec!["stun:stun.example.org:3478".to_string()]),
+        stun_services: None,
     };
 
     let json = serde_json::to_string(&advert).unwrap();
@@ -111,6 +113,7 @@ fn rejects_invalid_overlay_adverts() {
         }],
         signal_relays: None,
         stun_servers: None,
+        stun_services: None,
     };
     assert!(NostrDiscovery::validate_overlay_advert(missing_nat_metadata).is_err());
 
@@ -123,6 +126,7 @@ fn rejects_invalid_overlay_adverts() {
         }],
         signal_relays: None,
         stun_servers: None,
+        stun_services: None,
     };
     assert!(NostrDiscovery::validate_overlay_advert(wrong_identifier).is_err());
 
@@ -132,6 +136,7 @@ fn rejects_invalid_overlay_adverts() {
         endpoints: vec![],
         signal_relays: None,
         stun_servers: None,
+        stun_services: None,
     };
     assert!(NostrDiscovery::validate_overlay_advert(missing_all_endpoints).is_err());
 }
@@ -903,6 +908,7 @@ async fn local_advert_removal_retracts_previous_advert() {
         }],
         signal_relays: None,
         stun_servers: None,
+        stun_services: None,
     };
 
     runtime
@@ -1058,6 +1064,7 @@ async fn fallback_private_tries_peer_assist_after_normal_traversal_timeout() {
                 }],
                 signal_relays: Some(vec!["wss://relay.example".to_string()]),
                 stun_servers: Some(vec!["stun:example.invalid:3478".to_string()]),
+                stun_services: None,
             },
         )
         .await;

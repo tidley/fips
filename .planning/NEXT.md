@@ -1,34 +1,44 @@
 # NEXT
 
-Physical test junction is ready.
+The Android-to-Pi FIPS Drop PoC is physically validated and now moving into a
+receiver/product hardening track.
 
-Artifacts:
+Current implemented junction:
 
-- Pi receiver binary for Pi4/Pi3 arm64: `/home/tom/code/fips/target/aarch64-unknown-linux-gnu/release/fips-dropbox-agent`
-- Local x86_64 receiver binary: `/home/tom/code/fips/target/release/fips-dropbox-agent`
+- Android embedded FIPS node starts without VPN/TUN.
+- Android connects to the Pi receiver npub through Nostr/STUN traversal.
+- FIPS adopts the punched UDP socket and establishes peer/session state.
+- Android sends FIPS Drop v0 binary frames over FSP service port `4242`.
+- The Pi receiver stores files under `/var/lib/fips-drop`.
+- Sparse repair and adaptive sender tuning handle lossy 4G paths.
+- Public FIPS UDP nodes can act as same-socket STUN servers and advertise
+  `stunServices` through Nostr overlay adverts.
+- `crates/fips-mobile` is now the Rust package boundary for Android and future
+  iOS app wrappers.
+
+Primary artifacts:
+
+- Receiver binary: `/home/tom/code/fips/target/aarch64-unknown-linux-gnu/release/fips-drop-agent`
+- Legacy receiver alias: `/home/tom/code/fips/target/aarch64-unknown-linux-gnu/release/fips-dropbox-agent`
 - Android debug APK: `/home/tom/code/pushstr/mobile/build/app/outputs/flutter-apk/app-debug.apk`
-- Android native Rust libs rebuilt:
-  - `/home/tom/code/pushstr/mobile/android/app/src/main/jniLibs/arm64-v8a/libpushstr_rust.so`
-  - `/home/tom/code/pushstr/mobile/android/app/src/main/jniLibs/armeabi-v7a/libpushstr_rust.so`
+- Runbook: `docs/pocs/fips-drop-android-pi.md`
+- Wire spec: `docs/specs/fips-drop-v0.md`
+- Receiver ops: `docs/ops/fips-drop-receiver.md`
+- Roadmap: `.planning/FIPS-DROP-NEXT-PHASES.md`
+- Real-world harness: `testing/realworld/fips-drop-functional.sh`
+- Mobile Rust crate: `crates/fips-mobile`
 
-Next physical test:
+Next work:
 
-1. Put `fips-dropbox-agent` on Pi4ssd and run it against a FIPS config that advertises a Nostr `udp:nat` endpoint.
-2. Install the Pushstr debug APK on Android.
-3. Open drawer -> `FIPS Drop`.
-4. Paste Pi4ssd npub.
-5. Start embedded FIPS.
-6. Connect to Pi4ssd.
-7. Pick one small file and send it.
-8. Confirm Pi4ssd writes the blob under the configured storage root and returns ACK/ERROR over FIPS service data.
-
-Pi receiver build note:
-
-- The arm64 receiver was built with `--no-default-features --features nostr-discovery`.
-- Bluetooth remains part of default FIPS builds, but this PoC binary is UDP/Nostr-only so it cross-compiles without a BlueZ/dbus sysroot.
-
-After the raw direct FIPS transfer succeeds:
-
-- add progress/chunk UI,
-- add Blossom/Nostr metadata,
-- decide whether the receiver should become a permanent Pi4ssd service.
+1. Run the real-world harness regularly during protocol changes:
+   `FIPS_REALWORLD=1 testing/realworld/fips-drop-functional.sh`.
+2. Test a VPS/public-IP node with `public: true` and confirm its advert includes
+   both direct UDP and `stunServices`.
+3. Rebuild and physically retest the post-hardening `fips-drop-agent` and APK.
+4. Point the Android native bridge at `crates/fips-mobile`, then
+   regenerate/rename Flutter Rust Bridge APIs away from `dropbox` naming when
+   the UI bridge is ready for a breaking API cleanup.
+5. Add progress reporting from the mobile sender to the Flutter UI.
+6. Add receiver authorization/quota policy.
+7. Implement the FIPS Drop receipt layer and decide the Nostr/Blossom event
+   shape.

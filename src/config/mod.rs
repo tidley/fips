@@ -36,7 +36,7 @@ pub use node::{
     BloomConfig, BuffersConfig, CacheConfig, ControlConfig, DiscoveryConfig, LimitsConfig,
     NodeConfig, NostrDiscoveryConfig, NostrDiscoveryPolicy, PeerAssistConfig, PeerAssistDialMode,
     PeerAssistHelperConfig, PeerAssistMode, PeerAssistRequestPolicy, RateLimitConfig, RekeyConfig,
-    RetryConfig, SessionConfig, SessionMmpConfig, TreeConfig,
+    RetryConfig, SessionConfig, SessionMmpConfig, StunServerConfig, StunServerMode, TreeConfig,
 };
 pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
 pub use transport::{

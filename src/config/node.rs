@@ -277,6 +277,59 @@ pub enum NostrDiscoveryPolicy {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum StunServerMode {
+    Off,
+    #[default]
+    Auto,
+    On,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StunServerConfig {
+    /// Whether this node should answer STUN Binding Requests on eligible UDP
+    /// transports. `auto` enables it for public, Nostr-advertised UDP sockets.
+    #[serde(default)]
+    pub mode: StunServerMode,
+    /// Whether to publish this node's public UDP endpoint as a peer-usable STUN
+    /// service in Nostr overlay adverts.
+    #[serde(default = "StunServerConfig::default_advertise")]
+    pub advertise: bool,
+    /// Per-source-IP Binding Request limit for the same-socket responder.
+    #[serde(default = "StunServerConfig::default_rate_limit_per_ip_per_minute")]
+    pub rate_limit_per_ip_per_minute: u32,
+}
+
+impl Default for StunServerConfig {
+    fn default() -> Self {
+        Self {
+            mode: StunServerMode::Auto,
+            advertise: Self::default_advertise(),
+            rate_limit_per_ip_per_minute: Self::default_rate_limit_per_ip_per_minute(),
+        }
+    }
+}
+
+impl StunServerConfig {
+    pub fn enabled_for_public_udp_advert(&self, advertise_on_nostr: bool, public: bool) -> bool {
+        match self.mode {
+            StunServerMode::Off => false,
+            StunServerMode::Auto => advertise_on_nostr && public,
+            StunServerMode::On => true,
+        }
+    }
+
+    fn default_advertise() -> bool {
+        true
+    }
+
+    fn default_rate_limit_per_ip_per_minute() -> u32 {
+        120
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PeerAssistDialMode {
     #[default]
     Disabled,
@@ -492,10 +545,11 @@ pub struct NostrDiscoveryConfig {
     #[serde(default = "NostrDiscoveryConfig::default_dm_relays")]
     pub dm_relays: Vec<String>,
     /// STUN servers used for local reflexive address discovery.
-    /// Outbound observation uses only this local list; peer-advertised STUN
-    /// values are informational and are not treated as egress targets.
     #[serde(default = "NostrDiscoveryConfig::default_stun_servers")]
     pub stun_servers: Vec<String>,
+    /// Same-socket STUN Binding responder and advert publishing policy.
+    #[serde(default)]
+    pub stun_server: StunServerConfig,
     /// Whether to advertise local (RFC 1918 / ULA) interface addresses as
     /// host candidates in the traversal offer.
     ///
@@ -572,6 +626,7 @@ impl Default for NostrDiscoveryConfig {
             advert_relays: Self::default_advert_relays(),
             dm_relays: Self::default_dm_relays(),
             stun_servers: Self::default_stun_servers(),
+            stun_server: StunServerConfig::default(),
             share_local_candidates: false,
             app: Self::default_app(),
             signal_ttl_secs: Self::default_signal_ttl_secs(),

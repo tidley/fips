@@ -38,7 +38,7 @@ use crate::protocol::NodeProfile;
 use crate::transport::ethernet::EthernetTransport;
 use crate::transport::tcp::TcpTransport;
 use crate::transport::tor::TorTransport;
-use crate::transport::udp::UdpTransport;
+use crate::transport::udp::{UdpStunServerConfig, UdpTransport};
 use crate::transport::{
     Link, LinkId, PacketRx, PacketTx, TransportAddr, TransportError, TransportHandle, TransportId,
 };
@@ -341,6 +341,10 @@ pub struct Node {
     /// Pending connections (handshake in progress).
     /// Indexed by LinkId since we don't know the peer's identity yet.
     connections: HashMap<LinkId, PeerConnection>,
+    /// Last peer connect/bootstrap failure observed by the node event loop.
+    /// Embedded clients include this in status snapshots so UI errors can point
+    /// at the actual phase that failed instead of reporting only a send route miss.
+    last_connect_error: Option<String>,
 
     // === Peers (Active Phase) ===
     /// Authenticated peers.
@@ -465,6 +469,9 @@ pub struct Node {
     /// Publicly reachable helper endpoints for live UDP transports that may be
     /// used for peer-assisted rendezvous.
     peer_assist_endpoints: HashMap<TransportId, std::net::SocketAddr>,
+    /// Publicly reachable direct endpoints observed for public UDP transports
+    /// bound to wildcard addresses.
+    public_udp_endpoints: HashMap<TransportId, std::net::SocketAddr>,
 
     // === Periodic Parent Re-evaluation ===
     /// Timestamp of last periodic parent re-evaluation (for pacing).
@@ -591,6 +598,7 @@ impl Node {
             packet_tx: None,
             packet_rx: None,
             connections: HashMap::new(),
+            last_connect_error: None,
             peers: HashMap::new(),
             sessions: HashMap::new(),
             identity_cache: HashMap::new(),
@@ -634,6 +642,7 @@ impl Node {
             nostr_discovery: None,
             bootstrap_transports: HashSet::new(),
             peer_assist_endpoints: HashMap::new(),
+            public_udp_endpoints: HashMap::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
             estimated_mesh_size: None,
@@ -725,6 +734,7 @@ impl Node {
             packet_tx: None,
             packet_rx: None,
             connections: HashMap::new(),
+            last_connect_error: None,
             peers: HashMap::new(),
             sessions: HashMap::new(),
             identity_cache: HashMap::new(),
@@ -766,6 +776,7 @@ impl Node {
             nostr_discovery: None,
             bootstrap_transports: HashSet::new(),
             peer_assist_endpoints: HashMap::new(),
+            public_udp_endpoints: HashMap::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
             estimated_mesh_size: None,
@@ -804,7 +815,14 @@ impl Node {
         // Create UDP transport instances
         for (name, udp_config) in udp_instances {
             let transport_id = self.allocate_transport_id();
-            let udp = UdpTransport::new(transport_id, name, udp_config, packet_tx.clone());
+            let stun_server = self.udp_stun_server_config(&udp_config);
+            let udp = UdpTransport::new_with_stun_server(
+                transport_id,
+                name,
+                udp_config,
+                packet_tx.clone(),
+                stun_server,
+            );
             transports.push(TransportHandle::Udp(udp));
         }
 
@@ -897,6 +915,17 @@ impl Node {
         }
 
         transports
+    }
+
+    fn udp_stun_server_config(&self, udp_config: &crate::config::UdpConfig) -> UdpStunServerConfig {
+        let stun = &self.config.node.discovery.nostr.stun_server;
+        UdpStunServerConfig {
+            enabled: stun.enabled_for_public_udp_advert(
+                udp_config.advertise_on_nostr(),
+                udp_config.is_public(),
+            ),
+            rate_limit_per_ip_per_minute: stun.rate_limit_per_ip_per_minute,
+        }
     }
 
     /// Find an operational transport that matches the given transport type name.
@@ -1491,6 +1520,7 @@ impl Node {
 
         self.bootstrap_transports.remove(&transport_id);
         self.peer_assist_endpoints.remove(&transport_id);
+        self.public_udp_endpoints.remove(&transport_id);
         self.transport_drops.remove(&transport_id);
         self.transports.remove(&transport_id);
     }

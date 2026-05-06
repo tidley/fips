@@ -42,6 +42,17 @@ and a local STUN responder.
 | symmetric | UDP traversal fails under symmetric NAT, TCP fallback wins   |
 | lan       | Peers on the same LAN prefer local addresses over reflexive  |
 
+### [realworld/](realworld/) -- Public Relay/STUN Functional Tests
+
+Opt-in harnesses that use live public Nostr relays and STUN servers. The FIPS
+Drop harness starts a receiver and a mobile-style sender, establishes the real
+Nostr/STUN/FIPS path, sends a file, and verifies the stored hash. These tests
+are useful during PoC hardening but are not deterministic enough for normal CI.
+
+```bash
+FIPS_REALWORLD=1 testing/realworld/fips-drop-functional.sh
+```
+
 ### [chaos/](chaos/) -- Stochastic Simulation
 
 Automated network testing with configurable node counts, topology

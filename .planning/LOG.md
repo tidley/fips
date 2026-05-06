@@ -46,10 +46,63 @@
   - `drain_nostr_bootstrap`
   - `NostrBootstrapOutcome`
 - Added in-process FSP service ports for app-owned payloads without TUN.
-- Added Dropbox-style protocol and receiver logic on service port `4242`.
+- Added FIPS Drop protocol and receiver logic on service port `4242`.
 - Proved the embedded bootstrap/adoption path with TUN disabled and a normal FIPS session over the adopted traversal.
 - Proved encrypted in-process service data transfer and Dropbox `put`/`ack` round trip between two FIPS nodes.
 - Coverage for the new files:
   - `src/node/embedded.rs`: 100%
   - `src/node/service.rs`: 100%
   - `src/dropbox.rs`: 99.55%
+
+## 2026-05-05 FIPS Drop physical validation
+- Built and installed the Android debug APK and Pi arm64 receiver binary.
+- Validated Android -> Pi FIPS Drop upload over Wi-Fi.
+- Validated Android -> Pi FIPS Drop upload over 4G.
+- Confirmed Nostr/STUN traversal, NAT socket adoption, FIPS peer/session establishment, service-port delivery, binary blob sparse repair, and receiver filesystem storage.
+- Stored a 3 MiB video at `/var/lib/fips-dropbox/VID-20260505-WA0003.mp4`.
+- Added the reproducible PoC runbook at `docs/pocs/fips-drop-android-pi.md`.
+
+## 2026-05-05 FIPS Drop PoC hardening roadmap
+- Logged the seven next phases in `.planning/FIPS-DROP-NEXT-PHASES.md`.
+- Added product-facing receiver binary entry point `fips-drop-agent`, while
+  retaining `fips-dropbox-agent` as a compatibility alias.
+- Moved new receiver deployment material to `/var/lib/fips-drop` and
+  `packaging/systemd/fips-drop.service`.
+- Added FIPS Drop v0 wire/protocol spec at `docs/specs/fips-drop-v0.md`.
+- Added receiver ops runbook at `docs/ops/fips-drop-receiver.md`.
+- Added Blossom/Nostr alignment note at
+  `docs/design/fips-drop-blossom-alignment.md`.
+- Added adaptive Android sender tuning based on sparse missing reports.
+- Hardened Android file-transfer timeout UX to avoid raw missing chunk dumps.
+
+## 2026-05-05 Real-world functional harness
+- Added `fips-drop-functional`, an opt-in harness that starts an embedded FIPS
+  Drop receiver and mobile-style sender, uses public Nostr relays/STUN, sends a
+  deterministic file over FSP service port `4242`, and verifies the stored hash.
+- Added `testing/realworld/fips-drop-functional.sh` with explicit
+  `FIPS_REALWORLD=1` opt-in to avoid accidental public relay traffic.
+- Documented real-world harness scope, defaults, and non-CI expectations in
+  `testing/realworld/README.md` and linked it from `testing/README.md`.
+
+## 2026-05-05 Same-socket FIPS STUN service
+- Added a minimal STUN Binding responder to UDP transports, demuxed before FIPS
+  packet parsing so public FIPS UDP sockets can also answer STUN requests.
+- Added `node.discovery.nostr.stun_server.*` config with `auto` mode, advert
+  publication, and per-source-IP rate limiting.
+- Extended Nostr overlay adverts with `stunServices` for public UDP endpoints.
+- Nostr traversal now uses configured `stun_servers` plus `stunServices` from
+  the signed advert of the specific peer being dialed.
+- Public UDP transports bound to wildcard addresses can publish the observed
+  public endpoint after STUN observation, which covers VPS-style
+  `0.0.0.0:2121` listeners.
+
+## 2026-05-05 FIPS mobile crate scaffold
+- Added `crates/fips-mobile` as the mobile-oriented Rust package boundary for
+  Android and future iOS wrappers.
+- Turned the root package into a Cargo workspace containing the existing `fips`
+  package plus `fips-mobile`.
+- Re-exported the proven embedded mobile client API and added FIPS Drop
+  product-name aliases so new bindings do not have to depend on old Dropbox
+  terminology.
+- Documented Android build/check commands and the iOS target cleanup that still
+  needs to happen before claiming iOS support.

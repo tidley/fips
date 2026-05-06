@@ -143,14 +143,32 @@ impl Node {
         };
 
         match tx.try_send(packet) {
-            Ok(()) => true,
+            Ok(()) => {
+                tracing::debug!(
+                    src = %src_addr,
+                    src_port,
+                    dst_port,
+                    len = payload.len(),
+                    "FSP service payload delivered to local handler"
+                );
+                true
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::debug!(dst_port, "FSP service port queue full, dropping payload");
+                tracing::debug!(
+                    src = %src_addr,
+                    src_port,
+                    dst_port,
+                    len = payload.len(),
+                    "FSP service port queue full, dropping payload"
+                );
                 true
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::debug!(
+                    src = %src_addr,
+                    src_port,
                     dst_port,
+                    len = payload.len(),
                     "FSP service port receiver closed, dropping payload"
                 );
                 true

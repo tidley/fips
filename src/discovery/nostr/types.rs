@@ -96,6 +96,8 @@ pub struct OverlayAdvert {
     pub signal_relays: Option<Vec<String>>,
     #[serde(rename = "stunServers", skip_serializing_if = "Option::is_none")]
     pub stun_servers: Option<Vec<String>>,
+    #[serde(rename = "stunServices", skip_serializing_if = "Option::is_none")]
+    pub stun_services: Option<Vec<String>>,
 }
 
 impl OverlayAdvert {

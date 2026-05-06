@@ -444,6 +444,9 @@ impl Node {
                         }
                         Err(err) => {
                             warn!(peer_npub = %peer_npub, error = %err, "Failed to adopt NAT traversal");
+                            self.last_connect_error = Some(format!(
+                                "NAT traversal succeeded, but adoption failed for {peer_npub}: {err}"
+                            ));
                             if let Ok(peer_identity) = PeerIdentity::from_npub(&peer_npub) {
                                 self.schedule_retry(*peer_identity.node_addr(), Self::now_ms());
                             }
@@ -455,6 +458,10 @@ impl Node {
                     reason,
                 } => {
                     warn!(npub = %peer_config.npub, error = %reason, "NAT traversal failed");
+                    self.last_connect_error = Some(format!(
+                        "NAT traversal failed for {}: {}",
+                        peer_config.npub, reason
+                    ));
                     let peer_identity = match PeerIdentity::from_npub(&peer_config.npub) {
                         Ok(identity) => identity,
                         Err(_) => continue,
@@ -620,7 +627,7 @@ impl Node {
                 .await
             {
                 Ok(runtime) => {
-                    self.refresh_base_udp_helper_endpoints().await;
+                    self.refresh_base_udp_observed_endpoints().await;
                     if let Err(err) = self.refresh_overlay_advert(&runtime).await {
                         warn!(error = %err, "Failed to publish initial Nostr overlay advert");
                     }
@@ -940,6 +947,8 @@ impl Node {
                 }
             }
         }
+        self.peer_assist_endpoints.clear();
+        self.public_udp_endpoints.clear();
 
         // Drop packet channels
         self.packet_tx.take();
@@ -1357,10 +1366,11 @@ impl Node {
         }
 
         let mut endpoints = Vec::new();
+        let mut stun_services = Vec::new();
         let mut has_udp_nat = false;
         let has_private_helper_endpoint = !self.peer_assist_endpoints.is_empty();
 
-        for handle in self.transports.values() {
+        for (transport_id, handle) in &self.transports {
             if !handle.is_operational() {
                 continue;
             }
@@ -1374,13 +1384,24 @@ impl Node {
                         continue;
                     }
                     if cfg.is_public() {
-                        if let Some(addr) = handle.local_addr()
-                            && !addr.ip().is_unspecified()
-                        {
+                        let advertised_addr = handle
+                            .local_addr()
+                            .filter(|addr| !addr.ip().is_unspecified())
+                            .or_else(|| self.public_udp_endpoints.get(transport_id).copied());
+                        if let Some(addr) = advertised_addr {
                             endpoints.push(OverlayEndpointAdvert {
                                 transport: OverlayTransportKind::Udp,
                                 addr: addr.to_string(),
                             });
+                            let stun_config = &self.config.node.discovery.nostr.stun_server;
+                            if stun_config.advertise
+                                && stun_config.enabled_for_public_udp_advert(
+                                    cfg.advertise_on_nostr(),
+                                    cfg.is_public(),
+                                )
+                            {
+                                stun_services.push(format!("stun:{addr}"));
+                            }
                         }
                     } else if !self.config.node.discovery.nostr.stun_servers.is_empty()
                         || (self
@@ -1446,26 +1467,26 @@ impl Node {
             stun_servers: has_udp_nat
                 .then(|| self.config.node.discovery.nostr.stun_servers.clone())
                 .filter(|servers| !servers.is_empty()),
+            stun_services: (!stun_services.is_empty()).then_some(stun_services),
         })
     }
 
     #[cfg(feature = "nostr-discovery")]
-    async fn refresh_base_udp_helper_endpoints(&mut self) {
-        if !self.config.node.discovery.nostr.enabled
-            || !self
-                .config
-                .node
-                .discovery
-                .nostr
-                .peer_assist
-                .helper_enabled()
-            || self.config.node.discovery.nostr.stun_servers.is_empty()
-        {
+    async fn refresh_base_udp_observed_endpoints(&mut self) {
+        if !self.config.node.discovery.nostr.enabled {
             return;
         }
 
         let mut helper_updates = Vec::new();
+        let mut public_updates = Vec::new();
         let stun_servers = self.config.node.discovery.nostr.stun_servers.clone();
+        let private_helper_enabled = self
+            .config
+            .node
+            .discovery
+            .nostr
+            .peer_assist
+            .helper_enabled();
 
         for (transport_id, handle) in &self.transports {
             if handle.transport_type().name != "udp" || !handle.is_operational() {
@@ -1475,7 +1496,28 @@ impl Node {
             let Some(cfg) = self.lookup_udp_config(handle.name()) else {
                 continue;
             };
-            if !cfg.advertise_on_nostr() || cfg.is_public() || !cfg.peer_assist_enabled() {
+            if !cfg.advertise_on_nostr() {
+                continue;
+            }
+
+            let wants_public_endpoint = cfg.is_public();
+            let wants_private_helper = private_helper_enabled
+                && !cfg.is_public()
+                && cfg.peer_assist_enabled()
+                && !stun_servers.is_empty();
+            if !wants_public_endpoint && !wants_private_helper {
+                continue;
+            }
+
+            if wants_public_endpoint
+                && let Some(addr) = handle.local_addr()
+                && !addr.ip().is_unspecified()
+            {
+                public_updates.push((*transport_id, addr));
+                continue;
+            }
+
+            if stun_servers.is_empty() {
                 continue;
             }
 
@@ -1500,7 +1542,11 @@ impl Node {
             {
                 Ok((Some(reflexive), _, _)) => {
                     if let Ok(addr) = format!("{}:{}", reflexive.ip, reflexive.port).parse() {
-                        helper_updates.push((*transport_id, addr));
+                        if wants_public_endpoint {
+                            public_updates.push((*transport_id, addr));
+                        } else {
+                            helper_updates.push((*transport_id, addr));
+                        }
                     }
                 }
                 Ok((None, _, _)) => {}
@@ -1516,6 +1562,9 @@ impl Node {
 
         for (transport_id, addr) in helper_updates {
             self.peer_assist_endpoints.insert(transport_id, addr);
+        }
+        for (transport_id, addr) in public_updates {
+            self.public_udp_endpoints.insert(transport_id, addr);
         }
     }
 
@@ -1765,6 +1814,7 @@ impl Node {
         {
             self.bootstrap_transports.remove(&transport_id);
             self.peer_assist_endpoints.remove(&transport_id);
+            self.public_udp_endpoints.remove(&transport_id);
             if let Some(mut handle) = self.transports.remove(&transport_id) {
                 let _ = handle.stop().await;
             }

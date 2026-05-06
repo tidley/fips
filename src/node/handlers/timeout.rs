@@ -31,12 +31,31 @@ impl Node {
             if let Some(conn) = self.connections.get(&link_id) {
                 let direction = conn.direction();
                 let idle_ms = conn.idle_time(now_ms);
-                if conn.is_failed() {
+                let failed = conn.is_failed();
+                let retry_addr = conn
+                    .is_outbound()
+                    .then(|| {
+                        conn.expected_identity()
+                            .map(|identity| *identity.node_addr())
+                    })
+                    .flatten();
+                let peer = conn
+                    .expected_identity()
+                    .map(|identity| self.peer_display_name(identity.node_addr()));
+                if failed {
                     debug!(
                         link_id = %link_id,
                         direction = %direction,
                         "Failed handshake connection cleaned up"
                     );
+                    self.last_connect_error = Some(match peer {
+                        Some(peer) => format!(
+                            "handshake failed before peer promotion for {peer} ({direction}, {link_id})"
+                        ),
+                        None => format!(
+                            "handshake failed before peer promotion ({direction}, {link_id})"
+                        ),
+                    });
                 } else {
                     debug!(
                         link_id = %link_id,
@@ -44,13 +63,21 @@ impl Node {
                         idle_secs = idle_ms / 1000,
                         "Stale handshake connection timed out"
                     );
+                    self.last_connect_error = Some(match peer {
+                        Some(peer) => format!(
+                            "handshake timed out after {}s waiting for peer response from {peer} ({direction}, {link_id})",
+                            idle_ms / 1000
+                        ),
+                        None => format!(
+                            "handshake timed out after {}s waiting for peer response ({direction}, {link_id})",
+                            idle_ms / 1000
+                        ),
+                    });
                 }
 
                 // Schedule retry for failed outbound auto-connect peers
-                if conn.is_outbound()
-                    && let Some(identity) = conn.expected_identity()
-                {
-                    self.schedule_retry(*identity.node_addr(), now_ms);
+                if let Some(node_addr) = retry_addr {
+                    self.schedule_retry(node_addr, now_ms);
                 }
             }
             self.cleanup_stale_connection(link_id, now_ms);
@@ -98,6 +125,33 @@ impl Node {
         let interval_ms = self.config.node.rate_limit.handshake_resend_interval_ms;
         let backoff = self.config.node.rate_limit.handshake_resend_backoff;
 
+        // If a cross-connection has already promoted the target peer, any
+        // leftover outbound msg1 state is stale. Drop it now so it does not
+        // inflate link counts until the full handshake timeout expires.
+        let redundant: Vec<(LinkId, String)> = self
+            .connections
+            .iter()
+            .filter_map(|(link_id, conn)| {
+                if !(conn.is_outbound() && conn.handshake_state() == HandshakeState::SentMsg1) {
+                    return None;
+                }
+                let identity = conn.expected_identity()?;
+                if !self.peers.contains_key(identity.node_addr()) {
+                    return None;
+                }
+                Some((*link_id, self.peer_display_name(identity.node_addr())))
+            })
+            .collect();
+
+        for (link_id, peer) in redundant {
+            debug!(
+                peer = %peer,
+                link_id = %link_id,
+                "Cleaning up redundant pending handshake; peer already promoted"
+            );
+            self.cleanup_stale_connection(link_id, now_ms);
+        }
+
         // Collect resend candidates: outbound, in SentMsg1, with stored msg1,
         // under max resends, and past the scheduled time.
         // Skip resend if the target peer is already promoted — a cross-connection
@@ -124,9 +178,15 @@ impl Node {
 
         for (link_id, msg1_bytes) in candidates {
             // Get transport and address info from the connection
-            let (transport_id, remote_addr) = match self.connections.get(&link_id) {
+            let (transport_id, remote_addr, peer_name) = match self.connections.get(&link_id) {
                 Some(conn) => match (conn.transport_id(), conn.source_addr()) {
-                    (Some(tid), Some(addr)) => (tid, addr.clone()),
+                    (Some(tid), Some(addr)) => {
+                        let peer_name = conn
+                            .expected_identity()
+                            .map(|id| self.peer_display_name(id.node_addr()))
+                            .unwrap_or_else(|| "unknown peer".to_string());
+                        (tid, addr.clone(), peer_name)
+                    }
                     _ => continue,
                 },
                 None => continue,
@@ -138,7 +198,10 @@ impl Node {
                     Ok(_) => true,
                     Err(e) => {
                         debug!(
+                            peer = %peer_name,
                             link_id = %link_id,
+                            transport_id = %transport_id,
+                            remote_addr = %remote_addr,
                             error = %e,
                             "Handshake msg1 resend failed"
                         );
@@ -154,7 +217,10 @@ impl Node {
                 let next = now_ms + (interval_ms as f64 * backoff.powi(count as i32)) as u64;
                 conn.record_resend(next);
                 debug!(
+                    peer = %peer_name,
                     link_id = %link_id,
+                    transport_id = %transport_id,
+                    remote_addr = %remote_addr,
                     resend = count,
                     "Resent handshake msg1"
                 );

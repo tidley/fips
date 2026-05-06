@@ -1,0 +1,28 @@
+[Unit]
+Description=FIPS Drop Receiver Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/fips-drop
+Environment=FIPS_DROP_CONFIG=/etc/fips/fips.yaml
+Environment=FIPS_DROP_STORAGE_ROOT=/var/lib/fips-drop
+Environment=FIPS_DROP_PORT=4242
+ExecStart=/usr/local/bin/fips-drop-agent --config ${FIPS_DROP_CONFIG} --storage-root ${FIPS_DROP_STORAGE_ROOT} --port ${FIPS_DROP_PORT}
+Restart=on-failure
+RestartSec=5
+
+# The receiver uses an embedded FIPS node with TUN/DNS/control disabled, but it
+# still reads the normal FIPS identity/config and opens UDP sockets for peers.
+StateDirectory=fips-drop
+StateDirectoryMode=0755
+
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

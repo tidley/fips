@@ -59,6 +59,16 @@ fn endpoint_summary(endpoints: &[OverlayEndpointAdvert]) -> String {
         .join(",")
 }
 
+fn push_unique_stun_server(servers: &mut Vec<String>, server: &str) {
+    let trimmed = server.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !servers.iter().any(|existing| existing == trimmed) {
+        servers.push(trimmed.to_string());
+    }
+}
+
 pub struct NostrDiscovery {
     client: Client,
     keys: nostr::Keys,
@@ -771,6 +781,7 @@ impl NostrDiscovery {
                 reason: e.to_string(),
             })?;
         let advert = self.fetch_advert(&peer_config.npub, target_pubkey).await?;
+        let stun_servers = self.effective_stun_servers(Some(&advert)).await;
         let relays = self
             .preferred_signal_relays(target_pubkey, Some(&advert))
             .await?;
@@ -788,7 +799,7 @@ impl NostrDiscovery {
             return Err(BootstrapError::MissingNatEndpoint(peer_config.npub));
         }
 
-        if private_assist_enabled && self.config.stun_servers.is_empty() {
+        if private_assist_enabled && stun_servers.is_empty() {
             return self
                 .connect_peer_via_private_assist(peer_config, target_pubkey, &relays)
                 .await;
@@ -814,7 +825,7 @@ impl NostrDiscovery {
             }
         }
 
-        if private_assist_enabled && self.config.stun_servers.is_empty() {
+        if private_assist_enabled && stun_servers.is_empty() {
             if !private_assist_tried {
                 return self
                     .connect_peer_via_private_assist(peer_config, target_pubkey, &relays)
@@ -831,7 +842,7 @@ impl NostrDiscovery {
 
             let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
                 &base_socket,
-                &self.config.stun_servers,
+                &stun_servers,
                 self.config.share_local_candidates,
             )
             .await?;
@@ -1186,9 +1197,10 @@ impl NostrDiscovery {
 
         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
         base_socket.set_nonblocking(true)?;
+        let stun_servers = self.effective_stun_servers(None).await;
         let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
             &base_socket,
-            &self.config.stun_servers,
+            &stun_servers,
             self.config.share_local_candidates,
         )
         .await?;
@@ -1640,6 +1652,22 @@ impl NostrDiscovery {
         Ok(merged)
     }
 
+    async fn effective_stun_servers(&self, advert: Option<&OverlayAdvert>) -> Vec<String> {
+        let mut merged = Vec::new();
+        for server in &self.config.stun_servers {
+            push_unique_stun_server(&mut merged, server);
+        }
+        if let Some(advert) = advert
+            && let Some(services) = advert.stun_services.as_ref()
+        {
+            for server in services {
+                push_unique_stun_server(&mut merged, server);
+            }
+        }
+
+        merged
+    }
+
     async fn find_recipient_inbox_relays(
         &self,
         target_pubkey: PublicKey,
@@ -1729,6 +1757,17 @@ impl NostrDiscovery {
                 return Err(BootstrapError::InvalidAdvert(
                     "endpoint addr cannot be empty".to_string(),
                 ));
+            }
+        }
+        if let Some(services) = advert.stun_services.as_mut() {
+            services.retain(|server| !server.trim().is_empty());
+            if services.iter().any(|server| !server.starts_with("stun:")) {
+                return Err(BootstrapError::InvalidAdvert(
+                    "stunServices entries must use stun: URLs".to_string(),
+                ));
+            }
+            if services.is_empty() {
+                advert.stun_services = None;
             }
         }
 

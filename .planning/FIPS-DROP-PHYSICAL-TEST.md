@@ -1,30 +1,32 @@
 # FIPS Drop Physical Test
 
-Goal: Android Pushstr sends one small blob over embedded FIPS to Pi4ssd, and Pi4ssd writes it under a test storage root.
+Goal: Android Pushstr sends one blob over embedded FIPS to Pi4ssd/Pi, and the receiver writes it under a test storage root.
+
+Result: validated on 2026-05-05 with phone -> Pi over both Wi-Fi and 4G.
 
 ## Artifacts
 
-- Pi receiver binary for Pi4/Pi3 arm64: `/home/tom/code/fips/target/aarch64-unknown-linux-gnu/release/fips-dropbox-agent`
+- Pi receiver binary for Pi4/Pi3 arm64: `/home/tom/code/fips/target/aarch64-unknown-linux-gnu/release/fips-drop-agent`
 - Android APK: `/home/tom/code/pushstr/mobile/build/app/outputs/flutter-apk/app-debug.apk`
 
 Pi receiver build details:
 
 - Target: `aarch64-unknown-linux-gnu`
 - Features: `--no-default-features --features nostr-discovery`
-- Size after strip: about `13M`
-- SHA256: `8709f03ad5afe1a9f85f1aaca8d356c68d7ecc671e37cb92297a8bdf434278c3`
+- Size before strip: about `17M`
+- SHA256: `81a0c97e3187905b18e3408cdd3f3b6bd2a4a3327244df9bb3fd268053224dfb`
 
 ## Pi4ssd Receiver
 
 Copy/install the receiver binary onto Pi4ssd:
 
 ```bash
-scp /home/tom/code/fips/target/aarch64-unknown-linux-gnu/release/fips-dropbox-agent \
-  fips@pi4ssd:/tmp/fips-dropbox-agent
+scp /home/tom/code/fips/target/aarch64-unknown-linux-gnu/release/fips-drop-agent \
+  fips@pi4ssd:/tmp/fips-drop-agent
 
 ssh fips@pi4ssd
-sudo install -m 0755 /tmp/fips-dropbox-agent /usr/local/bin/fips-dropbox-agent
-sudo install -d -m 0750 -o fips -g fips /var/lib/fips-dropbox
+sudo install -m 0755 /tmp/fips-drop-agent /usr/local/bin/fips-drop-agent
+sudo install -d -m 0755 /var/lib/fips-drop
 ```
 
 Use a config shaped like this:
@@ -70,13 +72,20 @@ Run it manually first:
 
 ```bash
 sudo -u fips RUST_LOG="info,fips::discovery::nostr=debug" \
-  /usr/local/bin/fips-dropbox-agent \
+  /usr/local/bin/fips-drop-agent \
   --config /etc/fips/fips.yaml \
-  --storage-root /var/lib/fips-dropbox \
+  --storage-root /var/lib/fips-drop \
   --port 4242
 ```
 
 Keep the Pi4ssd npub from the startup log.
+
+If the normal `fips.service` uses the same config/identity, stop it before
+manual receiver tests:
+
+```bash
+sudo systemctl stop fips
+```
 
 ## Android
 
@@ -99,5 +108,14 @@ In Pushstr:
 Expected:
 
 - Pi4ssd logs a service packet on port `4242`.
-- The blob appears below `/var/lib/fips-dropbox`.
+- The blob appears below `/var/lib/fips-drop`.
 - Android receives an ACK/ERROR response over the FIPS service path.
+
+For the validated 3 MiB video test, the current conservative sender profile
+logs normal service payloads around `796` bytes and stores:
+
+```text
+/var/lib/fips-drop/VID-20260505-WA0003.mp4
+```
+
+See the durable runbook at `docs/pocs/fips-drop-android-pi.md`.

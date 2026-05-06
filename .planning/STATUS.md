@@ -1,6 +1,6 @@
 # STATUS
 
-Local FIPS focus is the Pushstr/FIPS Dropbox product PoC.
+Local FIPS focus is the Pushstr/FIPS Drop product PoC.
 
 Current direction:
 
@@ -24,52 +24,79 @@ Completed Rust slice:
   - `NostrBootstrapOutcome`
 - Proved `request_connect -> BootstrapEvent::Established -> adopt_established_traversal` in-process.
 - Proved the adopted traversal path can establish a normal FIPS session with TUN disabled.
-- Added in-process FSP service ports and a Dropbox-style protocol on reserved port `4242`.
+- Added in-process FSP service ports and a FIPS Drop protocol on reserved port `4242`.
 - Added a Pi4ssd receiver-agent shape as Rust receiver logic:
   - `hello`
   - `put`
   - `put_chunk`
   - `put_done`
-  - hash/status acknowledgements.
-- Added the runnable `fips-dropbox-agent` binary:
+  - hash/status acknowledgements,
+  - binary blob transfer with sparse missing-chunk repair.
+- Added the runnable `fips-drop-agent` receiver binary:
   - loads a normal FIPS config,
   - forces TUN/DNS/control off for embedded operation,
   - registers service port `4242`,
   - writes received blobs under a configured storage root,
   - returns ACK/ERROR replies over FIPS service data.
+- Kept `fips-dropbox-agent` as a compatibility alias for previous manual PoC
+  commands.
 - Added `fips::mobile` as the first Android-facing Rust facade:
   - embedded node lifecycle,
   - Nostr npub connect request,
   - FSP session readiness checks,
-  - Dropbox blob payload generation/send,
+  - FIPS Drop blob payload generation/send,
   - app service-packet receive/status calls.
+- Added `fips-drop-functional` and `testing/realworld/` as the first
+  real-world functional harness:
+  - uses public Nostr relays and public STUN,
+  - starts embedded receiver and mobile-style sender nodes,
+  - sends deterministic files over FIPS Drop service port `4242`,
+  - verifies receiver filesystem hashes.
+- Added same-socket STUN service support for public FIPS UDP nodes:
+  - `node.discovery.nostr.stun_server.mode: auto` enables it for public,
+    Nostr-advertised UDP transports,
+  - public adverts include `stunServices`,
+  - traversal can use the target peer's advertised `stunServices` in addition
+    to configured `stun_servers`.
 - Added Pushstr mobile bridge/UI on branch `feature/fips-dropbox-mobile`:
   - exposes `fips_mobile_*` functions through Pushstr's existing `flutter_rust_bridge` crate,
   - adds drawer entry `FIPS Drop`,
   - starts embedded FIPS from generated YAML,
   - connects to a target npub,
   - picks a local file,
-  - sends it to FIPS Dropbox service port `4242`.
+  - sends it to FIPS Drop service port `4242`.
 - Android native Rust libraries now build with embedded FIPS for:
   - `arm64-v8a`,
   - `armeabi-v7a`.
 - Android debug APK builds at:
   - `/home/tom/code/pushstr/mobile/build/app/outputs/flutter-apk/app-debug.apk`.
 - Pi4/Pi3 arm64 receiver binary builds at:
-  - `/home/tom/code/fips/target/aarch64-unknown-linux-gnu/release/fips-dropbox-agent`.
+  - `/home/tom/code/fips/target/aarch64-unknown-linux-gnu/release/fips-drop-agent`.
 - Bluetooth is now a default feature rather than an unconditional Linux dependency, so UDP/Nostr-only receiver builds can cross-compile without a BlueZ/dbus sysroot.
+
+Physical validation:
+
+1. Phone -> Pi on Wi-Fi works.
+2. Phone -> Pi on 4G works.
+3. A 3 MiB video stored successfully.
+4. The current Android binary blob profile keeps normal service payloads around
+   796 bytes under the observed 1280-byte session MTU and adapts window/pacing
+   from sparse receiver reports.
 
 Immediate priority:
 
-1. Run `fips-dropbox-agent` on Pi4ssd with an advert-enabled FIPS config.
-2. Install the Pushstr debug APK on Android.
-3. Run real Nostr/STUN traversal and one blob upload against Android/Pi4ssd hardware.
-4. Add Blossom/Nostr metadata after raw direct FIPS transfer succeeds.
+1. Use the real-world harness for automated regression during protocol changes.
+2. Test the same-socket STUN advert path on a public VPS listener.
+3. Rebuild/retest the post-hardening `fips-drop-agent` + Android APK.
+4. Add progress reporting and pairing UX.
+5. Add Blossom/Nostr receipt metadata after raw direct FIPS transfer succeeds.
+6. Move from PoC receiver docs to package integration.
 
 Verification from current junction:
 
-- `cargo build --release --bin fips-dropbox-agent --features nostr-discovery`
-- `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --features nostr-discovery --bin fips-dropbox-agent`
+- `cargo build --release --bin fips-drop-agent --features nostr-discovery`
+- `FIPS_REALWORLD=1 testing/realworld/fips-drop-functional.sh`
+- `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --features nostr-discovery --bin fips-drop-agent`
 - `cargo test mobile::tests --lib --features nostr-discovery`
 - `cargo test mobile::tests --lib --no-default-features`
 - `cargo test --features nostr-discovery --all-targets`

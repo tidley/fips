@@ -121,7 +121,10 @@ transports:
 
 What this achieves: the node publishes a single `udp:<public-ip>:2121`
 endpoint to the three default advert relays
-(`wss://relay.damus.io`, `wss://nos.lol`, `wss://offchain.pub`).
+(`wss://relay.damus.io`, `wss://nos.lol`, `wss://offchain.pub`). With
+the default `stun_server.mode: auto`, the same UDP socket also answers
+STUN Binding Requests and the advert includes `stun:<public-ip>:2121`
+as a `stunServices` entry for other FIPS nodes.
 
 What the other side needs: either a static `addresses` entry for this
 peer, or a peer entry with `via_nostr: true` and an empty (or omitted)
@@ -311,7 +314,10 @@ defined in `src/config/node.rs`.
 | `advertise` | bool | `true` | If true, publish this node's own overlay advert. |
 | `advert_relays` | list | `["wss://relay.damus.io", "wss://nos.lol", "wss://offchain.pub"]` | Relays used to publish and fetch overlay adverts (kind 37195). |
 | `dm_relays` | list | same as `advert_relays` | Relays used for encrypted offer/answer signaling (kind 21059). |
-| `stun_servers` | list | `["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478", "stun:global.stun.twilio.com:3478"]` | STUN servers used to observe the local reflexive address before a punch. Peer-advertised STUN values are not used. |
+| `stun_servers` | list | `["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478", "stun:global.stun.twilio.com:3478"]` | Baseline STUN servers used to observe the local reflexive address before a punch. |
+| `stun_server.mode` | enum | `auto` | Same-socket STUN responder mode: `off`, `auto`, or `on`. `auto` enables it for public UDP transports that are advertised on Nostr. |
+| `stun_server.advertise` | bool | `true` | Publish eligible public UDP endpoints as `stunServices` in this node's Nostr advert. |
+| `stun_server.rate_limit_per_ip_per_minute` | u32 | `120` | Per-source-IP rate limit for same-socket STUN Binding Requests. `0` disables this limiter. |
 | `share_local_candidates` | bool | `false` | If true, include this node's RFC 1918 / ULA interface addresses as host candidates in the traversal offer. Off by default — sharing private host candidates is only useful when peers are on the same physical LAN, and tends to cause misleading punch successes when an asymmetric L3 path (corporate VPN, Tailscale subnet route, overlapping address space) makes a peer's private IP one-way reachable. Enable per-node only when same-LAN punching is wanted. |
 | `app` | string | `"fips-overlay-v1"` | Application namespace. Included in the advert identifier; only peers with the same value cross-resolve. |
 | `policy` | enum | `configured_only` | Advert consumption policy: `disabled`, `configured_only`, or `open`. |
@@ -423,14 +429,17 @@ The advert content is a JSON document shaped as `OverlayAdvert`:
     {"transport": "udp", "addr": "nat"}
   ],
   "signalRelays": ["wss://relay.damus.io", "wss://nos.lol"],
-  "stunServers": ["stun:stun.l.google.com:19302"]
+  "stunServers": ["stun:stun.l.google.com:19302"],
+  "stunServices": ["stun:203.0.113.45:2121"]
 }
 ```
 
 `signalRelays` and `stunServers` are only present when at least one
 endpoint is `udp:nat`; for advert shapes that cannot involve punching
 they are omitted to reduce advert size and keep the relay and STUN
-lists private to the nodes that need them.
+lists private to the nodes that need them. `stunServices` is present
+when this node has a public UDP endpoint and its same-socket STUN
+responder is enabled and advertised.
 
 Publication happens on startup, again whenever the set of advertised
 endpoints changes (for example, when a Tor onion hostname first
@@ -616,12 +625,12 @@ semaphore and replay-cache layers downstream.
   traffic. The *contents* of offer and answer events are
   NIP-59/NIP-44 sealed — only the intended recipient decrypts them.
   Adverts are public by design.
-- **STUN servers see the node's public IP and port.** Only the STUN
-  servers listed in the node's own `stun_servers` are ever contacted
-  for reflexive discovery. Peer-advertised STUN values are
-  informational; a malicious peer cannot steer this node to a
-  chosen STUN target. See the doc comment on
-  `node.discovery.nostr.stun_servers`.
+- **STUN servers see the node's public IP and port.** The baseline list
+  comes from this node's own `stun_servers`. Public FIPS nodes can also
+  publish `stunServices`; a dialer uses those only from the specific
+  peer advert it is already trying to contact, not from unrelated cached
+  adverts. Operators who do not want to serve STUN should set
+  `stun_server.mode: off` or `stun_server.advertise: false`.
 - **The FIPS identity key signs adverts.** Compromise of
   `fips.key` is compromise of the node's Nostr identity — an attacker
   can publish adverts on behalf of the node. The recovery path is

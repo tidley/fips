@@ -1,4 +1,4 @@
-# Android FIPS Dropbox PoC
+# Android FIPS Drop PoC
 
 ## Objective
 
@@ -83,17 +83,17 @@ Android embedded FIPS
   2. perform STUN-assisted UDP hole punch to the target node
   3. adopt the punched UDP socket into FIPS
   4. establish the normal FIPS peer/session layer
-  5. send Dropbox app payloads over a reserved FSP service port
+  5. send FIPS Drop app payloads over a reserved FSP service port
 ```
 
 Then layer Blossom/file semantics on that proven direct FIPS path.
 
 ### PoC Protocol v0
 
-Use one reserved FSP service port for Dropbox control/data, for example:
+Use one reserved FSP service port for FIPS Drop control/data, for example:
 
 ```text
-port 4242 = fips-dropbox-v0
+port 4242 = fips-drop-v0
 ```
 
 Message envelope:
@@ -246,11 +246,12 @@ Only after Phase 1-5 prove direct FIPS app messaging:
    - start embedded FIPS with TUN/DNS/control disabled,
    - request Nostr traversal to a known npub,
    - initiate/wait for FSP service sessions,
-   - send a Dropbox blob to service port `4242`,
+   - send a FIPS Drop blob to service port `4242`,
    - receive ACK/status service packets.
-7. Next: bridge `fips::mobile::FipsMobileClient` into Pushstr's Flutter/Rust mobile stack.
-8. Next: install/run `fips-dropbox-agent` on Pi4ssd and send one blob from Android/devbox.
-9. Later: add Blossom/Nostr file metadata once raw direct FIPS transfer works.
+7. Done: bridge `fips::mobile::FipsMobileClient` into Pushstr's Flutter/Rust mobile stack.
+8. Done: install/run `fips-dropbox-agent` on Pi and send a file from Android over both Wi-Fi and 4G.
+9. Done: document the reproducible physical PoC in `docs/pocs/fips-drop-android-pi.md`.
+10. Next: add Blossom/Nostr file metadata now that raw direct FIPS transfer works.
 
 The critical first slice is not UI and not Blossom. It is:
 

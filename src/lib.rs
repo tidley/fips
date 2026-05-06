@@ -8,6 +8,7 @@ pub mod cache;
 pub mod config;
 pub mod control;
 pub mod discovery;
+pub mod drop_agent;
 pub mod dropbox;
 #[cfg(target_os = "linux")]
 pub mod gateway;

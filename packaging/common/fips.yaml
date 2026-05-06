@@ -34,6 +34,11 @@ node:
     #     - "stun:stun.l.google.com:19302"
     #     - "stun:stun.cloudflare.com:3478"
     #     - "stun:global.stun.twilio.com:3478"
+    #   # Same-socket STUN responder for public UDP listeners.
+    #   stun_server:
+    #     mode: auto # off | auto | on
+    #     advertise: true
+    #     rate_limit_per_ip_per_minute: 120
     #   # Private peer-assisted onboarding is disabled by default. `dial_mode`
     #   # controls outgoing use; `helper.enabled` controls serving requests.
     #   # Keep helpers allowlisted in production unless intentionally open.
@@ -72,7 +77,7 @@ transports:
   udp:
     bind_addr: "0.0.0.0:2121"
     # advertise_on_nostr: true
-    # public: false # false => advertise udp:nat; true => advertise bound host:port
+    # public: false # false => advertise udp:nat; true => advertise direct UDP + STUN service
     # peer_assist: false # true lets this private UDP listener act as a helper
 
   tcp:

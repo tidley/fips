@@ -740,7 +740,7 @@ Multiple FIPS daemons remain available for hard isolation, but are no longer req
 - [x] Add an initial Rust facade/skeleton if the hooks are already clean enough.
 - [x] Add and test embedded Nostr bootstrap wrapper.
 - [x] Add and test in-process FSP service ports.
-- [x] Add and test Dropbox-style port `4242` protocol and Pi4ssd receiver logic.
+- [x] Add and test FIPS Drop port `4242` protocol and Pi4ssd receiver logic.
 - [ ] Specify the default peer endpoint observation/punch-back handshake.
 - [ ] Configure Pi4ssd FIPS node and record npub/FIPS IPv6.
 - [ ] Pick and install a Blossom server on Pi4ssd.

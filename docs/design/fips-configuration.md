@@ -196,6 +196,9 @@ without that feature ignore `udp:nat` bootstrap configuration.
 | `node.discovery.nostr.advert_relays` | list[string] | `["wss://relay.damus.io", "wss://nos.lol", "wss://offchain.pub"]` | Relays used for service adverts |
 | `node.discovery.nostr.dm_relays` | list[string] | `["wss://relay.damus.io", "wss://nos.lol", "wss://offchain.pub"]` | Relays used for encrypted signaling events |
 | `node.discovery.nostr.stun_servers` | list[string] | `["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478", "stun:global.stun.twilio.com:3478"]` | STUN servers used for local reflexive address discovery |
+| `node.discovery.nostr.stun_server.mode` | string | `"auto"` | Same-socket STUN responder mode: `off`, `auto`, or `on`. `auto` enables it for public, Nostr-advertised UDP transports |
+| `node.discovery.nostr.stun_server.advertise` | bool | `true` | Include eligible public UDP endpoints as `stunServices` in Nostr adverts |
+| `node.discovery.nostr.stun_server.rate_limit_per_ip_per_minute` | u32 | `120` | Per-source-IP limit for STUN Binding Requests served by the FIPS UDP socket; `0` disables this limiter |
 | `node.discovery.nostr.app` | string | `"fips-overlay-v1"` | Traversal application namespace and advert identifier suffix |
 | `node.discovery.nostr.signal_ttl_secs` | u64 | `120` | Signaling TTL in seconds |
 | `node.discovery.nostr.attempt_timeout_secs` | u64 | `10` | Overall traversal attempt timeout in seconds |
@@ -218,9 +221,10 @@ without that feature ignore `udp:nat` bootstrap configuration.
 
 If `stun_servers` is omitted, the built-in default list above is used. If it is
 specified in YAML, the configured list fully overrides the defaults.
-Initiators use only this local list for outbound STUN queries; peer-advertised
-STUN values are published for diagnostics/interoperability but are not used as
-arbitrary egress targets.
+Initiators use this local list plus `stunServices` from the signed advert of
+the specific peer being dialed. FIPS does not spray STUN probes at unrelated
+cached adverts. A public UDP node can serve those requests from the same socket
+it uses for FIPS traffic; no separate STUN daemon is required.
 These built-in endpoints should be treated as best-effort public defaults that
 operators are expected to review and override for production use.
 Advert freshness is enforced semantically: events with expired NIP-40
@@ -441,7 +445,7 @@ restarting the daemon. Hostnames are case-insensitive.
 | `transports.udp.recv_buf_size` | usize | `2097152` | UDP socket receive buffer size in bytes (2 MB). Linux kernel doubles the requested value internally. Host `net.core.rmem_max` must be >= this value. |
 | `transports.udp.send_buf_size` | usize | `2097152` | UDP socket send buffer size in bytes (2 MB). Host `net.core.wmem_max` must be >= this value. |
 | `transports.udp.advertise_on_nostr` | bool | `false` | Include this UDP transport in Nostr endpoint adverts |
-| `transports.udp.public` | bool | `false` | If advertised: `true` publishes direct `host:port`; `false` publishes `udp:nat` rendezvous |
+| `transports.udp.public` | bool | `false` | If advertised: `true` publishes a direct endpoint and, by default, a same-socket STUN service; `false` publishes `udp:nat` rendezvous |
 
 ### Ethernet (`transports.ethernet.*`)
 

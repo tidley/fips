@@ -8,6 +8,7 @@ use super::{
 };
 mod socket;
 mod stats;
+mod stun;
 use super::resolve_socket_addr;
 use crate::config::UdpConfig;
 use socket::{AsyncUdpSocket, UdpRawSocket};
@@ -16,6 +17,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
+use stun::StunRateLimiter;
+pub use stun::UdpStunServerConfig;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
@@ -48,6 +51,8 @@ pub struct UdpTransport {
     local_addr: Option<SocketAddr>,
     /// Transport statistics.
     stats: Arc<UdpStats>,
+    /// Optional STUN Binding responder served from the same UDP socket.
+    stun_server: UdpStunServerConfig,
     /// DNS resolution cache for hostname addresses.
     dns_cache: StdMutex<HashMap<TransportAddr, (SocketAddr, Instant)>>,
 }
@@ -60,6 +65,23 @@ impl UdpTransport {
         config: UdpConfig,
         packet_tx: PacketTx,
     ) -> Self {
+        Self::new_with_stun_server(
+            transport_id,
+            name,
+            config,
+            packet_tx,
+            UdpStunServerConfig::default(),
+        )
+    }
+
+    /// Create a new UDP transport with an optional same-socket STUN responder.
+    pub fn new_with_stun_server(
+        transport_id: TransportId,
+        name: Option<String>,
+        config: UdpConfig,
+        packet_tx: PacketTx,
+        stun_server: UdpStunServerConfig,
+    ) -> Self {
         Self {
             transport_id,
             name,
@@ -71,6 +93,7 @@ impl UdpTransport {
             recv_task: None,
             local_addr: None,
             stats: Arc::new(UdpStats::new()),
+            stun_server,
             dns_cache: StdMutex::new(HashMap::new()),
         }
     }
@@ -183,9 +206,18 @@ impl UdpTransport {
         let packet_tx = self.packet_tx.clone();
         let mtu = self.config.mtu();
         let stats = self.stats.clone();
+        let stun_server = self.stun_server;
 
         let recv_task = tokio::spawn(async move {
-            udp_receive_loop(async_socket, transport_id, packet_tx, mtu, stats).await;
+            udp_receive_loop(
+                async_socket,
+                transport_id,
+                packet_tx,
+                mtu,
+                stats,
+                stun_server,
+            )
+            .await;
         });
 
         self.recv_task = Some(recv_task);
@@ -243,9 +275,18 @@ impl UdpTransport {
         let packet_tx = self.packet_tx.clone();
         let mtu = self.config.mtu();
         let stats = self.stats.clone();
+        let stun_server = self.stun_server;
 
         let recv_task = tokio::spawn(async move {
-            udp_receive_loop(async_socket, transport_id, packet_tx, mtu, stats).await;
+            udp_receive_loop(
+                async_socket,
+                transport_id,
+                packet_tx,
+                mtu,
+                stats,
+                stun_server,
+            )
+            .await;
         });
 
         self.recv_task = Some(recv_task);
@@ -412,9 +453,11 @@ async fn udp_receive_loop(
     packet_tx: PacketTx,
     mtu: u16,
     stats: Arc<UdpStats>,
+    stun_server: UdpStunServerConfig,
 ) {
     // Buffer with headroom for slightly oversized packets
     let mut buf = vec![0u8; mtu as usize + 100];
+    let mut stun_limiter = StunRateLimiter::new(stun_server.rate_limit_per_ip_per_minute);
 
     debug!(transport_id = %transport_id, "UDP receive loop starting");
 
@@ -423,6 +466,59 @@ async fn udp_receive_loop(
             Ok((len, remote_addr, kernel_drops)) => {
                 stats.record_recv(len);
                 stats.set_kernel_drops(kernel_drops as u64);
+
+                let packet_bytes = &buf[..len];
+                if stun::is_stun_packet(packet_bytes) {
+                    if !stun_server.enabled {
+                        trace!(
+                            transport_id = %transport_id,
+                            remote_addr = %remote_addr,
+                            bytes = len,
+                            "STUN packet ignored because same-socket STUN service is disabled"
+                        );
+                        continue;
+                    }
+
+                    if !stun_limiter.allow(remote_addr.ip()) {
+                        debug!(
+                            transport_id = %transport_id,
+                            remote_addr = %remote_addr,
+                            "STUN Binding Request rate limited"
+                        );
+                        continue;
+                    }
+
+                    if let Some(response) = stun::binding_response_for(packet_bytes, remote_addr) {
+                        match socket.send_to(&response, &remote_addr).await {
+                            Ok(bytes_sent) => {
+                                stats.record_send(bytes_sent);
+                                trace!(
+                                    transport_id = %transport_id,
+                                    remote_addr = %remote_addr,
+                                    bytes = bytes_sent,
+                                    "STUN Binding Success Response sent"
+                                );
+                            }
+                            Err(err) => {
+                                stats.record_send_error();
+                                warn!(
+                                    transport_id = %transport_id,
+                                    remote_addr = %remote_addr,
+                                    error = %err,
+                                    "failed to send STUN Binding Success Response"
+                                );
+                            }
+                        }
+                    } else {
+                        trace!(
+                            transport_id = %transport_id,
+                            remote_addr = %remote_addr,
+                            bytes = len,
+                            "invalid STUN packet ignored"
+                        );
+                    }
+                    continue;
+                }
 
                 let data = buf[..len].to_vec();
                 let addr = TransportAddr::from_string(&remote_addr.to_string());
@@ -479,6 +575,15 @@ mod tests {
             public: None,
             peer_assist: None,
         }
+    }
+
+    fn stun_binding_request() -> Vec<u8> {
+        let mut request = Vec::new();
+        request.extend_from_slice(&0x0001u16.to_be_bytes());
+        request.extend_from_slice(&0u16.to_be_bytes());
+        request.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+        request.extend_from_slice(&[11, 22, 33, 44, 55, 66, 77, 88, 99, 111, 122, 133]);
+        request
     }
 
     #[tokio::test]
@@ -554,6 +659,61 @@ mod tests {
 
         t1.stop_async().await.unwrap();
         t2.stop_async().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_same_socket_stun_binding_request_is_answered_and_not_delivered() {
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport = UdpTransport::new_with_stun_server(
+            TransportId::new(1),
+            None,
+            make_config(0),
+            tx,
+            UdpStunServerConfig {
+                enabled: true,
+                rate_limit_per_ip_per_minute: 120,
+            },
+        );
+        transport.start_async().await.unwrap();
+        let server_addr = transport.local_addr().unwrap();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let request = stun_binding_request();
+        client.send_to(&request, server_addr).await.unwrap();
+
+        let mut buf = [0u8; 128];
+        let (len, _) = timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for STUN response")
+            .expect("receive response");
+        let response = &buf[..len];
+
+        assert_eq!(u16::from_be_bytes([response[0], response[1]]), 0x0101);
+        assert_eq!(&response[8..20], &request[8..20]);
+        assert_eq!(u16::from_be_bytes([response[20], response[21]]), 0x0020);
+        assert_eq!(response[25], 0x01);
+
+        let mapped_port = u16::from_be_bytes([response[26], response[27]]) ^ 0x2112;
+        assert_eq!(mapped_port, client_addr.port());
+
+        let cookie = 0x2112_A442u32.to_be_bytes();
+        let mapped_ip = std::net::Ipv4Addr::new(
+            response[28] ^ cookie[0],
+            response[29] ^ cookie[1],
+            response[30] ^ cookie[2],
+            response[31] ^ cookie[3],
+        );
+        assert_eq!(mapped_ip, std::net::Ipv4Addr::LOCALHOST);
+
+        assert!(
+            timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "STUN packets should be handled by the transport, not delivered as FIPS packets"
+        );
+
+        transport.stop_async().await.unwrap();
     }
 
     #[tokio::test]

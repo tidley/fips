@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/fips-mobile"]
+resolver = "3"
+
 [package]
 name = "fips"
 version = "0.4.0-dev"
@@ -29,6 +33,7 @@ serde_yaml = "0.9"
 dirs = "6.0"
 hex = "0.4"
 clap = { version = "4.5", features = ["derive"] }
+coap-lite = "0.13.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt", "macros", "signal", "sync", "net", "time", "process", "io-util"] }

@@ -114,3 +114,13 @@
 - Updated the root README and docs indexes so the FIPS Drop PoC, receiver
   runbook, protocol spec, real-world harness, and mobile crate are discoverable
   without reading planning notes.
+
+## 2026-05-06 FIPS Drop coverage pass
+- Added deterministic unit coverage for the FIPS Drop receiver CLI, storage-root
+  compatibility helper, host-service disabling, and service-packet reply path.
+- Added deterministic unit coverage for the real-world functional harness CLI,
+  payload generation, mobile-safe Nostr/STUN config, and JSON summary output.
+- Verified with
+  `cargo llvm-cov --workspace --no-default-features --features nostr-discovery --summary-only`:
+  1241 library tests plus bin tests passed, 4 ignored, 0 failed; line coverage
+  was 64.05% overall.

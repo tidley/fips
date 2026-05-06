@@ -536,3 +536,130 @@ fn json_summary(
     })
     .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn args_parse_defaults_and_lists() {
+        let args = Args::try_parse_from(["fips-drop-functional"]).expect("args parse");
+
+        assert_eq!(args.runs, 1);
+        assert_eq!(args.payload_bytes, 192 * 1024);
+        assert_eq!(args.connect_timeout_ms, 90_000);
+        assert_eq!(args.transfer_timeout_ms, 120_000);
+        assert_eq!(args.relays.len(), 3);
+        assert_eq!(args.stun_servers.len(), 3);
+        assert!(args.storage_root.is_none());
+        assert!(!args.keep_artifacts);
+        assert!(!args.no_local_candidates);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn args_parse_overrides() {
+        let args = Args::try_parse_from([
+            "fips-drop-functional",
+            "--runs",
+            "2",
+            "--payload-bytes",
+            "64",
+            "--connect-timeout-ms",
+            "1000",
+            "--transfer-timeout-ms",
+            "2000",
+            "--relays",
+            "wss://a.example,wss://b.example",
+            "--stun-servers",
+            "stun:a.example:3478,stun:b.example:3478",
+            "--app",
+            "test-app",
+            "--storage-root",
+            "/tmp/fips-drop-functional",
+            "--keep-artifacts",
+            "--no-local-candidates",
+            "--json",
+        ])
+        .expect("args parse");
+
+        assert_eq!(args.runs, 2);
+        assert_eq!(args.payload_bytes, 64);
+        assert_eq!(args.connect_timeout_ms, 1000);
+        assert_eq!(args.transfer_timeout_ms, 2000);
+        assert_eq!(args.relays, ["wss://a.example", "wss://b.example"]);
+        assert_eq!(
+            args.stun_servers,
+            ["stun:a.example:3478", "stun:b.example:3478"]
+        );
+        assert_eq!(args.app.as_deref(), Some("test-app"));
+        assert_eq!(
+            args.storage_root.as_deref(),
+            Some(std::path::Path::new("/tmp/fips-drop-functional"))
+        );
+        assert!(args.keep_artifacts);
+        assert!(args.no_local_candidates);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn deterministic_payload_is_stable_and_salted() {
+        assert_eq!(deterministic_payload(0, 0), Vec::<u8>::new());
+        assert_eq!(
+            deterministic_payload(8, 0),
+            vec![11, 42, 73, 104, 135, 166, 197, 228]
+        );
+        assert_eq!(
+            deterministic_payload(8, 1),
+            vec![28, 59, 90, 121, 152, 183, 214, 245]
+        );
+    }
+
+    #[test]
+    fn harness_config_is_mobile_safe_and_nostr_enabled() {
+        let identity = Identity::generate();
+        let peer = Identity::generate().npub();
+        let relays = vec!["wss://relay.example".to_string()];
+        let stun = vec!["stun:stun.example:3478".to_string()];
+
+        let config = harness_config(&identity, Some(&peer), &relays, &stun, "test-app", false);
+
+        assert!(!config.tun.enabled);
+        assert!(!config.dns.enabled);
+        assert!(!config.node.control.enabled);
+        assert_eq!(config.node.discovery.nostr.app, "test-app");
+        assert_eq!(config.node.discovery.nostr.advert_relays, relays);
+        assert_eq!(config.node.discovery.nostr.dm_relays, relays);
+        assert_eq!(config.node.discovery.nostr.stun_servers, stun);
+        assert!(!config.node.discovery.nostr.share_local_candidates);
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].npub, peer);
+        assert!(config.peers[0].via_nostr);
+    }
+
+    #[test]
+    fn json_summary_contains_transfer_outcomes() {
+        let outcomes = vec![RunOutcome {
+            run: 1,
+            file_name: "file.bin".to_string(),
+            bytes: 3,
+            sha256: "abc123".to_string(),
+            path: PathBuf::from("/tmp/file.bin"),
+        }];
+
+        let value: serde_json::Value =
+            serde_json::from_str(&json_summary("app", "receiver", "sender", &outcomes))
+                .expect("json");
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["app"], "app");
+        assert_eq!(value["receiver_npub"], "receiver");
+        assert_eq!(value["sender_npub"], "sender");
+        assert_eq!(value["runs"][0]["run"], 1);
+        assert_eq!(value["runs"][0]["file_name"], "file.bin");
+        assert_eq!(value["runs"][0]["bytes"], 3);
+        assert_eq!(value["runs"][0]["sha256"], "abc123");
+        assert_eq!(value["runs"][0]["path"], "/tmp/file.bin");
+    }
+}

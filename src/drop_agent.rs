@@ -4,6 +4,7 @@
 //! stores incoming files under a configured directory, and sends ACK/ERROR
 //! replies over the same encrypted FIPS service path.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -313,8 +314,11 @@ async fn foreground_shutdown_signal() {
 }
 
 fn default_storage_root_for_binary() -> PathBuf {
-    let is_legacy_binary = std::env::args_os()
-        .next()
+    default_storage_root_for_program_name(std::env::args_os().next().as_deref())
+}
+
+fn default_storage_root_for_program_name(program_name: Option<&OsStr>) -> PathBuf {
+    let is_legacy_binary = program_name
         .and_then(|arg| PathBuf::from(arg).file_stem().map(|stem| stem.to_owned()))
         .and_then(|stem| stem.into_string().ok())
         .is_some_and(|name| name == "fips-dropbox-agent");
@@ -323,5 +327,197 @@ fn default_storage_root_for_binary() -> PathBuf {
         LEGACY_DROPBOX_STORAGE_ROOT.into()
     } else {
         DEFAULT_STORAGE_ROOT.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Identity, ServicePacket};
+    use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn args_parse_receiver_defaults() {
+        let args = Args::try_parse_from(["fips-drop-agent", "--config", "/tmp/fips.yaml"])
+            .expect("args parse");
+
+        assert_eq!(args.config, PathBuf::from("/tmp/fips.yaml"));
+        assert_eq!(args.storage_root, None);
+        assert_eq!(args.port, DROPBOX_SERVICE_PORT);
+        assert_eq!(args.queue_depth, 512);
+    }
+
+    #[test]
+    fn args_parse_receiver_overrides() {
+        let args = Args::try_parse_from([
+            "fips-drop-agent",
+            "--config",
+            "/tmp/fips.yaml",
+            "--storage-root",
+            "/tmp/drop",
+            "--port",
+            "5000",
+            "--queue-depth",
+            "7",
+        ])
+        .expect("args parse");
+
+        assert_eq!(args.storage_root, Some(PathBuf::from("/tmp/drop")));
+        assert_eq!(args.port, 5000);
+        assert_eq!(args.queue_depth, 7);
+    }
+
+    #[test]
+    fn default_storage_root_preserves_legacy_binary_name() {
+        assert_eq!(
+            default_storage_root_for_program_name(Some(OsStr::new("/usr/bin/fips-drop-agent"))),
+            PathBuf::from(DEFAULT_STORAGE_ROOT)
+        );
+        assert_eq!(
+            default_storage_root_for_program_name(Some(OsStr::new("/usr/bin/fips-dropbox-agent"))),
+            PathBuf::from(LEGACY_DROPBOX_STORAGE_ROOT)
+        );
+        assert_eq!(
+            default_storage_root_for_program_name(None),
+            PathBuf::from(DEFAULT_STORAGE_ROOT)
+        );
+    }
+
+    #[test]
+    fn prepare_agent_config_disables_host_services() {
+        let mut config = Config::default();
+        config.tun.enabled = true;
+        config.dns.enabled = true;
+        config.node.control.enabled = true;
+
+        let config = prepare_agent_config(config);
+
+        assert!(!config.tun.enabled);
+        assert!(!config.dns.enabled);
+        assert!(!config.node.control.enabled);
+    }
+
+    #[tokio::test]
+    async fn receiver_task_queues_protocol_reply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (service_tx, service_rx) = tokio::sync::mpsc::channel(1);
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
+        let src_addr = *Identity::generate().node_addr();
+
+        let task = tokio::spawn(run_receiver(
+            service_rx,
+            command_tx,
+            dir.path().to_path_buf(),
+            DROPBOX_SERVICE_PORT,
+        ));
+
+        service_tx
+            .send(ServicePacket {
+                src_addr,
+                src_port: 6000,
+                dst_port: DROPBOX_SERVICE_PORT,
+                payload: DropboxMessage::Hello {
+                    id: "0102030405060708".to_string(),
+                    client: Some("test".to_string()),
+                }
+                .to_payload()
+                .expect("payload"),
+            })
+            .await
+            .expect("service send");
+
+        let command = timeout(Duration::from_secs(1), command_rx.recv())
+            .await
+            .expect("command timeout")
+            .expect("command");
+        match command {
+            EmbeddedNodeCommand::SendServiceData {
+                outbound,
+                respond_to,
+            } => {
+                assert_eq!(outbound.dest_addr, src_addr);
+                assert_eq!(outbound.src_port, DROPBOX_SERVICE_PORT);
+                assert_eq!(outbound.dst_port, 6000);
+                assert_eq!(
+                    DropboxMessage::from_payload(&outbound.payload).expect("reply"),
+                    DropboxMessage::Ack {
+                        id: "0102030405060708".to_string(),
+                        status: "hello".to_string(),
+                        sha256: None,
+                        size: None,
+                        path: None,
+                    }
+                );
+                respond_to
+                    .expect("respond_to")
+                    .send(Ok(()))
+                    .expect("response send");
+            }
+            _ => panic!("unexpected embedded command"),
+        }
+
+        drop(service_tx);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("receiver task timeout")
+            .expect("receiver task join");
+    }
+
+    #[tokio::test]
+    async fn receiver_task_queues_error_reply_for_bad_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (service_tx, service_rx) = tokio::sync::mpsc::channel(1);
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
+        let src_addr = *Identity::generate().node_addr();
+
+        let task = tokio::spawn(run_receiver(
+            service_rx,
+            command_tx,
+            dir.path().to_path_buf(),
+            DROPBOX_SERVICE_PORT,
+        ));
+
+        service_tx
+            .send(ServicePacket {
+                src_addr,
+                src_port: 6001,
+                dst_port: DROPBOX_SERVICE_PORT,
+                payload: vec![0xff, 0x00, 0x01],
+            })
+            .await
+            .expect("service send");
+
+        let command = timeout(Duration::from_secs(1), command_rx.recv())
+            .await
+            .expect("command timeout")
+            .expect("command");
+        match command {
+            EmbeddedNodeCommand::SendServiceData {
+                outbound,
+                respond_to,
+            } => {
+                assert_eq!(outbound.dest_addr, src_addr);
+                assert_eq!(outbound.src_port, DROPBOX_SERVICE_PORT);
+                assert_eq!(outbound.dst_port, 6001);
+                match DropboxMessage::from_payload(&outbound.payload).expect("reply") {
+                    DropboxMessage::Error { id, reason } => {
+                        assert_eq!(id, None);
+                        assert!(reason.contains("payload"));
+                    }
+                    other => panic!("unexpected reply: {other:?}"),
+                }
+                respond_to
+                    .expect("respond_to")
+                    .send(Ok(()))
+                    .expect("response send");
+            }
+            _ => panic!("unexpected embedded command"),
+        }
+
+        drop(service_tx);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("receiver task timeout")
+            .expect("receiver task join");
     }
 }

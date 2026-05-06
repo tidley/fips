@@ -27,6 +27,8 @@ specific topics.
 | [fips-mesh-operation.md](fips-mesh-operation.md) | How the mesh operates: routing, discovery, error recovery |
 | [fips-wire-formats.md](fips-wire-formats.md) | Wire format reference for all message types |
 | [fips-nostr-discovery.md](fips-nostr-discovery.md) | Optional Nostr-mediated peer discovery and UDP NAT hole-punch (behind `nostr-discovery` feature) |
+| [fips-embedded-client.md](fips-embedded-client.md) | In-process app-service API for FIPS-aware applications without TUN/VPN |
+| [fips-mobile-library.md](fips-mobile-library.md) | Mobile crate boundary for Android and future iOS wrappers |
 
 ### Supporting References
 
@@ -34,6 +36,7 @@ specific topics.
 | -------- | ----------- |
 | [fips-spanning-tree.md](fips-spanning-tree.md) | Spanning tree algorithms: root discovery, parent selection, coordinates |
 | [fips-bloom-filters.md](fips-bloom-filters.md) | Bloom filter math: FPR analysis, size classes, split-horizon |
+| [fips-drop-blossom-alignment.md](fips-drop-blossom-alignment.md) | How FIPS Drop can become a private transport under open Nostr/Blossom content metadata |
 
 ### Implementation
 

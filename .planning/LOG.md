@@ -106,3 +106,11 @@
   terminology.
 - Documented Android build/check commands and the iOS target cleanup that still
   needs to happen before claiming iOS support.
+
+## 2026-05-06 Documentation pass
+- Added index pages for `docs/ops`, `docs/pocs`, and `docs/specs`.
+- Added `docs/design/fips-mobile-library.md` to explain the mobile crate
+  boundary, Android build command, iOS caveat, and next binding work.
+- Updated the root README and docs indexes so the FIPS Drop PoC, receiver
+  runbook, protocol spec, real-world harness, and mobile crate are discoverable
+  without reading planning notes.

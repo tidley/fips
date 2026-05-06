@@ -57,6 +57,12 @@ endpoints.
   marking, transport kernel drop detection
 - **Operator visibility** — `fipsctl` CLI and `fipstop` TUI dashboard for
   runtime inspection and runtime peer management
+- **Embedded application services** — FIPS-aware apps can run an in-process
+  node, skip the TUN/VPN path, and exchange encrypted service-port datagrams
+  directly
+- **FIPS Drop PoC** — Android-to-Pi private file drop over Nostr/STUN-assisted
+  FIPS sessions, with binary chunking, sparse repair, and Pi receiver service
+  packaging
 - **Zero configuration** — sensible defaults; a node can start with no config
   file, though peer addresses are needed to join a network
 
@@ -337,6 +343,21 @@ sudo journalctl -u fips -f
 See [testing/](testing/) for Docker-based integration test harnesses
 including static topology tests and stochastic chaos simulation.
 
+Real-world FIPS Drop testing against public relays/STUN is opt-in:
+
+```bash
+FIPS_REALWORLD=1 testing/realworld/fips-drop-functional.sh
+```
+
+The mobile crate can be checked for Android with:
+
+```bash
+cargo ndk -t arm64-v8a check \
+  -p fips-mobile \
+  --no-default-features \
+  --features nostr-discovery
+```
+
 ## Examples
 
 - [examples/sidecar-nostr-relay/](examples/sidecar-nostr-relay/) —
@@ -360,6 +381,13 @@ Protocol design documentation is in [docs/design/](docs/design/), organized as
 a layered protocol specification. Start with
 [fips-intro.md](docs/design/fips-intro.md) for the full protocol overview.
 
+FIPS Drop PoC documentation:
+
+- [docs/design/fips-mobile-library.md](docs/design/fips-mobile-library.md)
+- [docs/specs/fips-drop-v0.md](docs/specs/fips-drop-v0.md)
+- [docs/ops/fips-drop-receiver.md](docs/ops/fips-drop-receiver.md)
+- [docs/pocs/fips-drop-android-pi.md](docs/pocs/fips-drop-android-pi.md)
+
 If you want to contribute, start with:
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
@@ -369,11 +397,15 @@ If you want to contribute, start with:
 ## Project Structure
 
 ```text
-src/          Rust source (library + fips/fipsctl/fipstop/fips-gateway binaries)
+src/          Rust source (library + binaries)
+crates/       Workspace crates such as fips-mobile
 packaging/    Debian, macOS .pkg, Windows ZIP, OpenWrt ipk, AUR, systemd tarball
 examples/     Deployment examples (Nostr relay, K8s sidecar, macOS WireGuard)
-docs/design/  Protocol design specifications
-testing/      Docker-based integration test harnesses
+docs/design/  Protocol design and implementation notes
+docs/specs/   PoC/stable protocol contracts
+docs/ops/     Operational runbooks
+docs/pocs/    Reproducible proof-of-concept runbooks
+testing/      Docker and opt-in real-world test harnesses
 ```
 
 ## Status & Roadmap
@@ -405,15 +437,21 @@ Ethernet, Tor, and Bluetooth (BLE) with a small live mesh of deployed nodes.
   relays, exchange candidates via NIP-59 gift-wrapped offers/answers,
   and establish direct paths through NATs using STUN-assisted
   punching (behind the `nostr-discovery` cargo feature)
+- Public FIPS UDP nodes can optionally answer STUN Binding requests on the same
+  socket and advertise those `stunServices` in signed Nostr overlay adverts.
+- Android-to-Pi FIPS Drop PoC with an embedded app node, `fips-mobile` crate,
+  FIPS Drop receiver service, and binary file-transfer v0 protocol.
 
 ### Near-term priorities
 
-- Native API for FIPS-aware applications (npub:port addressing)
+- Productize the native API for FIPS-aware applications (`npub:port` service
+  addressing, mobile bindings, progress events)
+- FIPS Drop receipt layer aligned with Nostr/Blossom metadata
 - Security audit of cryptographic protocols
 
 ### Longer-term
 
-- Mobile platform support
+- iOS/mobile dependency cleanup and binding generation
 - Bandwidth-aware routing and QoS
 - Protocol stability and versioned wire format
 - Published crate

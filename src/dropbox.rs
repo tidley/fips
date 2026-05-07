@@ -6,7 +6,9 @@
 //! The older CoAP Block1 codec remains as a compatibility parser.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -43,6 +45,13 @@ const DROPBOX_BLOB_ACK: u8 = 3;
 const DROPBOX_BLOB_DONE: u8 = 4;
 const DROPBOX_BLOB_STORED: u8 = 5;
 const DROPBOX_BLOB_ERROR: u8 = 6;
+const DROPBOX_QUIC_MAGIC: &[u8; 4] = b"FDQ1";
+const DROPBOX_QUIC_UPLOAD: u8 = 1;
+const DROPBOX_QUIC_LIST: u8 = 2;
+const DROPBOX_QUIC_GET: u8 = 3;
+const DROPBOX_QUIC_LIST_RESPONSE: u8 = 4;
+const DROPBOX_QUIC_FILE_RESPONSE: u8 = 5;
+const DROPBOX_QUIC_ERROR: u8 = 6;
 
 /// Result type for the FIPS Drop service protocol.
 pub type DropboxResult<T> = Result<T, DropboxError>;
@@ -187,6 +196,33 @@ pub struct DropboxOutbound {
     pub src_port: u16,
     pub dst_port: u16,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FipsDropFileEntry {
+    pub name: String,
+    pub size: u64,
+    pub modified_unix_secs: Option<u64>,
+    pub sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FipsDropDownloadedFile {
+    pub name: String,
+    pub mime: Option<String>,
+    pub sha256: String,
+    pub size: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DropboxQuicUpload {
+    id: String,
+    name: String,
+    mime: Option<String>,
+    sha256: String,
+    size: u64,
+    data: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -390,6 +426,238 @@ fn blob_message_from_payload(payload: &[u8]) -> DropboxResult<DropboxMessage> {
     }
 }
 
+/// Build the primary QUIC upload frame for a complete FIPS Drop file.
+pub fn build_quic_upload_payload(
+    name: &str,
+    mime: Option<String>,
+    data: &[u8],
+) -> DropboxResult<Vec<u8>> {
+    validate_filename(name)?;
+    validate_short_text("name", name, u16::MAX as usize)?;
+    if let Some(mime) = &mime {
+        validate_short_text("mime", mime, u16::MAX as usize)?;
+    }
+
+    let id = new_quic_transfer_id(data);
+    let sha256 = sha256_hex(data);
+    let size = data.len() as u64;
+    let mut payload = Vec::with_capacity(
+        DROPBOX_QUIC_MAGIC.len() + 1 + 1 + id.len() + 2 + name.len() + 2 + data.len() + 80,
+    );
+    payload.extend_from_slice(DROPBOX_QUIC_MAGIC);
+    payload.push(DROPBOX_QUIC_UPLOAD);
+    put_u8_len_prefixed(&mut payload, id.as_bytes())?;
+    put_u16_len_prefixed(&mut payload, name.as_bytes())?;
+    put_u16_len_prefixed(&mut payload, mime.as_deref().unwrap_or("").as_bytes())?;
+    put_u8_len_prefixed(&mut payload, sha256.as_bytes())?;
+    payload.extend_from_slice(&size.to_le_bytes());
+    payload.extend_from_slice(data);
+    Ok(payload)
+}
+
+/// Build a QUIC request frame asking the receiver to list stored files.
+pub fn build_quic_list_payload() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(DROPBOX_QUIC_MAGIC.len() + 1);
+    payload.extend_from_slice(DROPBOX_QUIC_MAGIC);
+    payload.push(DROPBOX_QUIC_LIST);
+    payload
+}
+
+/// Build a QUIC request frame asking the receiver to return one stored file.
+pub fn build_quic_get_payload(name: &str) -> DropboxResult<Vec<u8>> {
+    validate_filename(name)?;
+    validate_short_text("name", name, u16::MAX as usize)?;
+    let mut payload = Vec::with_capacity(DROPBOX_QUIC_MAGIC.len() + 1 + 2 + name.len());
+    payload.extend_from_slice(DROPBOX_QUIC_MAGIC);
+    payload.push(DROPBOX_QUIC_GET);
+    put_u16_len_prefixed(&mut payload, name.as_bytes())?;
+    Ok(payload)
+}
+
+pub fn parse_quic_list_response(payload: &[u8]) -> DropboxResult<Vec<FipsDropFileEntry>> {
+    return_quic_error(payload)?;
+    let mut cursor = quic_cursor(payload, DROPBOX_QUIC_LIST_RESPONSE)?;
+    let count = cursor.take_u32()? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = cursor.take_utf8_u16()?;
+        let size = cursor.take_u64()?;
+        let modified = cursor.take_u64()?;
+        let sha256 = empty_to_none(cursor.take_utf8_u8()?);
+        entries.push(FipsDropFileEntry {
+            name,
+            size,
+            modified_unix_secs: (modified != u64::MAX).then_some(modified),
+            sha256,
+        });
+    }
+    cursor.finish()?;
+    Ok(entries)
+}
+
+pub fn parse_quic_file_response(payload: &[u8]) -> DropboxResult<FipsDropDownloadedFile> {
+    return_quic_error(payload)?;
+    let mut cursor = quic_cursor(payload, DROPBOX_QUIC_FILE_RESPONSE)?;
+    let name = cursor.take_utf8_u16()?;
+    let mime = empty_to_none(cursor.take_utf8_u16()?);
+    let sha256 = cursor.take_utf8_u8()?;
+    let size = cursor.take_u64()?;
+    let data = cursor.take_remaining().to_vec();
+    validate_filename(&name)?;
+    validate_size(Some(size), data.len())?;
+    validate_hash(Some(&sha256), &sha256_hex(&data))?;
+    Ok(FipsDropDownloadedFile {
+        name,
+        mime,
+        sha256,
+        size,
+        data,
+    })
+}
+
+fn quic_upload_from_payload(payload: &[u8]) -> DropboxResult<DropboxQuicUpload> {
+    let mut cursor = quic_cursor(payload, DROPBOX_QUIC_UPLOAD)?;
+    let id = cursor.take_utf8_u8()?;
+    let name = cursor.take_utf8_u16()?;
+    let mime = empty_to_none(cursor.take_utf8_u16()?);
+    let sha256 = cursor.take_utf8_u8()?;
+    let size = cursor.take_u64()?;
+    let data = cursor.take_remaining().to_vec();
+    cursor.finish()?;
+
+    Ok(DropboxQuicUpload {
+        id,
+        name,
+        mime,
+        sha256,
+        size,
+        data,
+    })
+}
+
+fn quic_get_from_payload(payload: &[u8]) -> DropboxResult<String> {
+    let mut cursor = quic_cursor(payload, DROPBOX_QUIC_GET)?;
+    let name = cursor.take_utf8_u16()?;
+    cursor.finish()?;
+    validate_filename(&name)?;
+    Ok(name)
+}
+
+fn quic_message_type(payload: &[u8]) -> DropboxResult<u8> {
+    let mut cursor = BlobCursor::new(payload);
+    let magic = cursor.take_bytes(DROPBOX_QUIC_MAGIC.len())?;
+    if magic != DROPBOX_QUIC_MAGIC {
+        return Err(DropboxError::Protocol(
+            "invalid FIPS Drop QUIC magic".to_string(),
+        ));
+    }
+    cursor.take_u8()
+}
+
+fn quic_cursor(payload: &[u8], expected_type: u8) -> DropboxResult<BlobCursor<'_>> {
+    let mut cursor = BlobCursor::new(payload);
+    let magic = cursor.take_bytes(DROPBOX_QUIC_MAGIC.len())?;
+    if magic != DROPBOX_QUIC_MAGIC {
+        return Err(DropboxError::Protocol(
+            "invalid FIPS Drop QUIC magic".to_string(),
+        ));
+    }
+    let message_type = cursor.take_u8()?;
+    if message_type != expected_type {
+        return Err(DropboxError::Protocol(format!(
+            "unexpected FIPS Drop QUIC message type {message_type}; expected {expected_type}"
+        )));
+    }
+    Ok(cursor)
+}
+
+fn build_quic_list_response_payload(entries: &[FipsDropFileEntry]) -> DropboxResult<Vec<u8>> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(DROPBOX_QUIC_MAGIC);
+    payload.push(DROPBOX_QUIC_LIST_RESPONSE);
+    payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        validate_filename(&entry.name)?;
+        validate_short_text("name", &entry.name, u16::MAX as usize)?;
+        if let Some(sha256) = &entry.sha256 {
+            validate_short_text("sha256", sha256, u8::MAX as usize)?;
+        }
+        put_u16_len_prefixed(&mut payload, entry.name.as_bytes())?;
+        payload.extend_from_slice(&entry.size.to_le_bytes());
+        payload.extend_from_slice(&entry.modified_unix_secs.unwrap_or(u64::MAX).to_le_bytes());
+        put_u8_len_prefixed(
+            &mut payload,
+            entry.sha256.as_deref().unwrap_or("").as_bytes(),
+        )?;
+    }
+    Ok(payload)
+}
+
+fn build_quic_file_response_payload(file: &FipsDropDownloadedFile) -> DropboxResult<Vec<u8>> {
+    validate_filename(&file.name)?;
+    validate_short_text("name", &file.name, u16::MAX as usize)?;
+    if let Some(mime) = &file.mime {
+        validate_short_text("mime", mime, u16::MAX as usize)?;
+    }
+    validate_short_text("sha256", &file.sha256, u8::MAX as usize)?;
+    validate_size(Some(file.size), file.data.len())?;
+    validate_hash(Some(&file.sha256), &sha256_hex(&file.data))?;
+
+    let mut payload = Vec::with_capacity(
+        DROPBOX_QUIC_MAGIC.len()
+            + 1
+            + 2
+            + file.name.len()
+            + 2
+            + file.mime.as_ref().map_or(0, |mime| mime.len())
+            + 1
+            + file.sha256.len()
+            + 8
+            + file.data.len(),
+    );
+    payload.extend_from_slice(DROPBOX_QUIC_MAGIC);
+    payload.push(DROPBOX_QUIC_FILE_RESPONSE);
+    put_u16_len_prefixed(&mut payload, file.name.as_bytes())?;
+    put_u16_len_prefixed(&mut payload, file.mime.as_deref().unwrap_or("").as_bytes())?;
+    put_u8_len_prefixed(&mut payload, file.sha256.as_bytes())?;
+    payload.extend_from_slice(&file.size.to_le_bytes());
+    payload.extend_from_slice(&file.data);
+    Ok(payload)
+}
+
+fn build_quic_error_payload(reason: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(DROPBOX_QUIC_MAGIC);
+    payload.push(DROPBOX_QUIC_ERROR);
+    let reason = reason.as_bytes();
+    let len = reason.len().min(u16::MAX as usize);
+    payload.extend_from_slice(&(len as u16).to_le_bytes());
+    payload.extend_from_slice(&reason[..len]);
+    payload
+}
+
+fn return_quic_error(payload: &[u8]) -> DropboxResult<()> {
+    if quic_message_type(payload).ok() == Some(DROPBOX_QUIC_ERROR) {
+        let mut cursor = quic_cursor(payload, DROPBOX_QUIC_ERROR)?;
+        let reason = cursor.take_utf8_u16()?;
+        cursor.finish()?;
+        return Err(DropboxError::Protocol(reason));
+    }
+    Ok(())
+}
+
+fn new_quic_transfer_id(data: &[u8]) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut hasher = Sha256::new();
+    hasher.update(now.to_le_bytes());
+    hasher.update(data);
+    let digest = hasher.finalize();
+    hex::encode(&digest[..8])
+}
+
 fn put_u8_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) -> DropboxResult<()> {
     if bytes.len() > u8::MAX as usize {
         return Err(DropboxError::Protocol(format!(
@@ -508,6 +776,12 @@ impl<'a> BlobCursor<'a> {
             )));
         }
         Ok(())
+    }
+
+    fn take_remaining(&mut self) -> &'a [u8] {
+        let bytes = &self.bytes[self.offset..];
+        self.offset = self.bytes.len();
+        bytes
     }
 }
 
@@ -1046,6 +1320,116 @@ impl DropboxReceiver {
         }
     }
 
+    /// Handle one complete FIPS Drop upload carried over a QUIC stream.
+    pub fn handle_quic_upload_payload(&mut self, payload: &[u8]) -> DropboxResult<DropboxMessage> {
+        let upload = quic_upload_from_payload(payload)?;
+        validate_filename(&upload.name)?;
+        validate_size(Some(upload.size), upload.data.len())?;
+        let actual_hash = sha256_hex(&upload.data);
+        validate_hash(Some(&upload.sha256), &actual_hash)?;
+        let path = self.write_file(&upload.name, &upload.data)?;
+        info!(
+            id = %upload.id,
+            name = %upload.name,
+            mime = ?upload.mime,
+            size = upload.data.len(),
+            path = %path,
+            stored_path = %self.stored_path_display(&path),
+            "FIPS Drop QUIC file stored"
+        );
+        Ok(DropboxMessage::Ack {
+            id: upload.id,
+            status: "stored".to_string(),
+            sha256: Some(actual_hash),
+            size: Some(upload.data.len() as u64),
+            path: Some(path),
+        })
+    }
+
+    /// Handle one complete FIPS Drop request carried over a QUIC stream.
+    pub fn handle_quic_request_payload(&mut self, payload: &[u8]) -> DropboxResult<Vec<u8>> {
+        match quic_message_type(payload)? {
+            DROPBOX_QUIC_UPLOAD => Ok(self.handle_quic_upload_payload(payload)?.to_payload()?),
+            DROPBOX_QUIC_LIST => {
+                let entries = self.list_files()?;
+                info!(count = entries.len(), "FIPS Drop QUIC list served");
+                build_quic_list_response_payload(&entries)
+            }
+            DROPBOX_QUIC_GET => {
+                let name = quic_get_from_payload(payload)?;
+                let file = self.read_file(&name)?;
+                info!(
+                    name = %file.name,
+                    mime = ?file.mime,
+                    size = file.size,
+                    "FIPS Drop QUIC file served"
+                );
+                build_quic_file_response_payload(&file)
+            }
+            other => Err(DropboxError::Protocol(format!(
+                "unknown FIPS Drop QUIC request type {other}"
+            ))),
+        }
+    }
+
+    /// Build an error response for a failed QUIC request.
+    pub fn quic_error_payload(error: impl ToString) -> Vec<u8> {
+        build_quic_error_payload(&error.to_string())
+    }
+
+    pub fn list_files(&self) -> DropboxResult<Vec<FipsDropFileEntry>> {
+        fs::create_dir_all(&self.root)?;
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if !metadata.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if validate_filename(&name).is_err() {
+                continue;
+            }
+            let modified_unix_secs = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs());
+            entries.push(FipsDropFileEntry {
+                name,
+                size: metadata.len(),
+                modified_unix_secs,
+                sha256: None,
+            });
+        }
+        entries.sort_by(|a, b| {
+            b.modified_unix_secs
+                .cmp(&a.modified_unix_secs)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(entries)
+    }
+
+    pub fn read_file(&self, name: &str) -> DropboxResult<FipsDropDownloadedFile> {
+        validate_filename(name)?;
+        let path = self.root.join(name);
+        let metadata = fs::metadata(&path)?;
+        if !metadata.is_file() {
+            return Err(DropboxError::InvalidFilename(name.to_string()));
+        }
+        let data = fs::read(&path)?;
+        let sha256 = sha256_hex(&data);
+        Ok(FipsDropDownloadedFile {
+            name: name.to_string(),
+            mime: guess_mime_from_name(name),
+            sha256,
+            size: data.len() as u64,
+            data,
+        })
+    }
+
     fn start_blob_upload(
         &mut self,
         id: String,
@@ -1325,6 +1709,29 @@ fn validate_filename(name: &str) -> DropboxResult<()> {
     Ok(())
 }
 
+fn guess_mime_from_name(name: &str) -> Option<String> {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())?;
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "pdf" => "application/pdf",
+        "txt" | "log" => "text/plain",
+        "json" => "application/json",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1383,6 +1790,67 @@ mod tests {
             assert_eq!(&payload[..4], DROPBOX_BLOB_MAGIC);
             assert_eq!(DropboxMessage::from_payload(&payload).unwrap(), message);
         }
+    }
+
+    #[test]
+    fn quic_upload_payload_stores_file_and_returns_stored_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut receiver = DropboxReceiver::new(dir.path());
+        let data = b"quic upload bytes";
+        let payload = build_quic_upload_payload("photo.jpg", Some("image/jpeg".into()), data)
+            .expect("quic upload payload builds");
+
+        let reply = receiver
+            .handle_quic_upload_payload(&payload)
+            .expect("quic payload stores");
+
+        assert_eq!(std::fs::read(dir.path().join("photo.jpg")).unwrap(), data);
+        match reply {
+            DropboxMessage::Ack {
+                status,
+                sha256,
+                size,
+                path,
+                ..
+            } => {
+                assert_eq!(status, "stored");
+                assert_eq!(sha256.as_deref(), Some(sha256_hex(data).as_str()));
+                assert_eq!(size, Some(data.len() as u64));
+                assert_eq!(path.as_deref(), Some("photo.jpg"));
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quic_list_and_get_payloads_round_trip_stored_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut receiver = DropboxReceiver::new(dir.path());
+        std::fs::write(dir.path().join("photo.jpg"), b"jpeg bytes").unwrap();
+        std::fs::write(dir.path().join("note.txt"), b"hello").unwrap();
+
+        let list_reply = receiver
+            .handle_quic_request_payload(&build_quic_list_payload())
+            .expect("list request succeeds");
+        let list = parse_quic_list_response(&list_reply).expect("list response parses");
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().any(|entry| entry.name == "photo.jpg"));
+        assert!(list.iter().any(|entry| entry.name == "note.txt"));
+
+        let get_reply = receiver
+            .handle_quic_request_payload(&build_quic_get_payload("photo.jpg").unwrap())
+            .expect("get request succeeds");
+        let file = parse_quic_file_response(&get_reply).expect("file response parses");
+        assert_eq!(file.name, "photo.jpg");
+        assert_eq!(file.mime.as_deref(), Some("image/jpeg"));
+        assert_eq!(file.sha256, sha256_hex(b"jpeg bytes"));
+        assert_eq!(file.size, 10);
+        assert_eq!(file.data, b"jpeg bytes");
+    }
+
+    #[test]
+    fn quic_get_rejects_path_traversal() {
+        assert!(build_quic_get_payload("../secret").is_err());
     }
 
     #[test]

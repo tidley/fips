@@ -42,6 +42,10 @@ simple-dns = "0.11.2"
 socket2 = { version = "0.6.2", features = ["all"] }
 tokio-socks = "0.5"
 portable-atomic = { version = "1", features = ["std"] }
+quinn = { version = "0.11.9", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+x509-parser = "0.18"
 
 nostr = { version = "0.44", features = ["std", "nip59"], optional = true }
 nostr-sdk = { version = "0.44", optional = true }

@@ -6,11 +6,16 @@
 //! aliases for FIPS Drop so new bindings do not need to learn the older
 //! dropbox terminology.
 
+pub mod quic;
+
 pub use fips::mobile::{
     DROPBOX_BLOB_REPAIR_BATCH_SIZE, DROPBOX_BLOB_WINDOW_SIZE, DROPBOX_CHUNK_DATA_BYTES,
     DROPBOX_CHUNK_WINDOW_SIZE, DROPBOX_INLINE_PAYLOAD_BYTES, DROPBOX_MAX_FILE_BYTES,
-    DROPBOX_MAX_SEND_ATTEMPTS, FipsMobileClient, FipsMobileConfig, FipsMobileError,
-    MOBILE_RESPONSE_PORT, build_dropbox_put_message,
+    DROPBOX_MAX_SEND_ATTEMPTS, FIPS_DROP_BLOB_REPAIR_BATCH_SIZE, FIPS_DROP_BLOB_WINDOW_SIZE,
+    FIPS_DROP_CHUNK_DATA_BYTES, FIPS_DROP_CHUNK_WINDOW_SIZE, FIPS_DROP_INLINE_PAYLOAD_BYTES,
+    FIPS_DROP_MAX_FILE_BYTES, FIPS_DROP_MAX_SEND_ATTEMPTS, FipsMobileClient, FipsMobileConfig,
+    FipsMobileError, FipsPushstrMessage, MOBILE_RESPONSE_PORT, PUSHSTR_SERVICE_PORT,
+    build_dropbox_put_message,
 };
 
 pub use fips::{
@@ -26,34 +31,13 @@ pub use fips::dropbox::{
     encode_b64 as encode_fips_drop_b64, sha256_hex as fips_drop_sha256_hex,
 };
 
-/// Maximum serialized FIPS Drop payload to send as a single service packet.
-pub const FIPS_DROP_INLINE_PAYLOAD_BYTES: usize = DROPBOX_INLINE_PAYLOAD_BYTES;
-
-/// Raw file bytes per FIPS Drop binary blob chunk used by the mobile sender.
-pub const FIPS_DROP_CHUNK_DATA_BYTES: usize = DROPBOX_CHUNK_DATA_BYTES;
-
-/// Mobile PoC maximum FIPS Drop file size.
-pub const FIPS_DROP_MAX_FILE_BYTES: usize = DROPBOX_MAX_FILE_BYTES;
-
-/// Number of legacy chunk messages sent before waiting for ACKs.
-pub const FIPS_DROP_CHUNK_WINDOW_SIZE: usize = DROPBOX_CHUNK_WINDOW_SIZE;
-
-/// Number of binary blob chunks sent before asking for a sparse repair report.
-pub const FIPS_DROP_BLOB_WINDOW_SIZE: usize = DROPBOX_BLOB_WINDOW_SIZE;
-
-/// Number of missing binary blob chunks to repair before asking for a fresh report.
-pub const FIPS_DROP_BLOB_REPAIR_BATCH_SIZE: usize = DROPBOX_BLOB_REPAIR_BATCH_SIZE;
-
-/// Number of times to retry missing FIPS Drop chunks.
-pub const FIPS_DROP_MAX_SEND_ATTEMPTS: usize = DROPBOX_MAX_SEND_ATTEMPTS;
-
 /// Product-name alias for building a single-payload FIPS Drop message.
 pub fn build_fips_drop_put_message(
     name: &str,
     mime: Option<String>,
     data: &[u8],
 ) -> FipsDropResult<FipsDropMessage> {
-    build_dropbox_put_message(name, mime, data)
+    fips::mobile::build_fips_drop_put_message(name, mime, data)
 }
 
 #[cfg(test)]
@@ -63,6 +47,7 @@ mod tests {
     #[test]
     fn fips_drop_aliases_match_embedded_client_defaults() {
         assert_eq!(MOBILE_RESPONSE_PORT, 49_152);
+        assert_eq!(PUSHSTR_SERVICE_PORT, 49_153);
         assert_eq!(FIPS_DROP_SERVICE_PORT, 4_242);
         assert_eq!(FIPS_DROP_CHUNK_DATA_BYTES, FIPS_DROP_BLOB_CHUNK_DATA_BYTES);
         assert_eq!(FIPS_DROP_BLOB_WINDOW_SIZE, DROPBOX_BLOB_WINDOW_SIZE);

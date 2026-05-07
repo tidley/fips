@@ -77,13 +77,21 @@ kept out of pure app-service builds.
 
 The working PoC still has internal `dropbox` symbols for source compatibility.
 New APIs should use FIPS Drop naming. The mobile crate already provides
-product-name aliases for the protocol constants and message helper.
+product-name aliases for the protocol constants, message helper, and blob send
+method. The old `dropbox` names remain compatibility aliases so the FIPS Drop v0
+wire protocol stays stable while bridge/API names move forward.
 
 ## Next Binding Work
 
-1. Point the Android native bridge at `crates/fips-mobile`.
-2. Regenerate the Flutter/Rust bridge against FIPS Drop names.
-3. Add transfer progress callbacks or an event stream.
-4. Add resume/repair status events that do not expose raw missing-chunk lists to
+1. Add transfer progress callbacks or an event stream.
+2. Add resume/repair status events that do not expose raw missing-chunk lists to
    the UI.
-5. Split host-only dependencies behind features before adding iOS CI.
+3. Split host-only dependencies behind features before adding iOS CI.
+
+## Android Bridge Status
+
+The Pushstr Android bridge now depends on
+`../../fips/crates/fips-mobile` instead of the root daemon package. Its generated
+Flutter Rust Bridge API exposes `fipsMobileSendFipsDropBlob`; the old
+`fipsMobileSendDropboxBlob` function remains available as a compatibility
+wrapper.

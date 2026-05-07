@@ -124,3 +124,38 @@
   `cargo llvm-cov --workspace --no-default-features --features nostr-discovery --summary-only`:
   1241 library tests plus bin tests passed, 4 ignored, 0 failed; line coverage
   was 64.05% overall.
+
+## 2026-05-06 Android bridge switched to fips-mobile
+- Added product-named FIPS Drop aliases on the mobile client facade, including
+  `send_fips_drop_blob_to_npub` and `build_fips_drop_put_message`.
+- Kept the older `dropbox` method/function names as compatibility wrappers so
+  the working FIPS Drop v0 protocol and existing callers remain stable.
+- Pointed the Pushstr Android Rust bridge at `crates/fips-mobile` instead of the
+  root `fips` daemon package.
+- Regenerated Flutter Rust Bridge bindings and updated the Dart FIPS Drop UI to
+  call `fipsMobileSendFipsDropBlob`, leaving `fipsMobileSendDropboxBlob` as a
+  generated compatibility alias.
+
+## 2026-05-06 Planning advanced after bridge switch
+- Updated `.planning/NEXT.md`, `.planning/STATUS.md`, and
+  `.planning/FIPS-DROP-NEXT-PHASES.md` so the Android bridge switch is recorded
+  as done rather than future work.
+- Expanded the next execution phases around commit hygiene, real-world
+  regression, public-node STUN validation, mobile UX hardening, receiver
+  deployment, protocol hardening, and Nostr/Blossom receipts.
+- Refreshed risk notes to distinguish solved PoC blockers from remaining
+  product risks.
+
+## 2026-05-07 Pushstr over FIPS path
+- Investigated the regular Pushstr "no npub available" report and confirmed the
+  current Android app derives the selected Pushstr profile npub from the active
+  nsec, then passes that identity into the embedded FIPS mobile runtime.
+- Added a Pushstr app-service channel on FIPS service port `49153` for direct
+  mobile-to-mobile messages over Nostr/STUN-discovered FIPS sessions.
+- Added Pushstr bridge calls for sending and polling FIPS-delivered Pushstr
+  messages, regenerated Flutter Rust Bridge bindings, and wired the regular
+  Pushstr send path to try FIPS first before falling back to Nostr DMs.
+- Confirmed public, Nostr-advertised FIPS UDP nodes already have same-socket
+  STUN service config and signed `stunServices` adverts for open-port nodes.
+- Archived stale scratch planning files under
+  `.planning/archive/2026-05-07-cleanup/`.

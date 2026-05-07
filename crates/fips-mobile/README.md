@@ -14,6 +14,11 @@ It currently re-exports the proven embedded client from the root `fips` crate:
 The crate also provides product-name FIPS Drop aliases while preserving the
 older `dropbox` function names for PoC compatibility.
 
+The current Android bridge in the Pushstr app depends on this crate and exposes
+`fipsMobileSendFipsDropBlob` as the product-named send API. The older
+`fipsMobileSendDropboxBlob` bridge call remains as a wrapper so existing builds
+do not break while the Dart/UI layer finishes moving to FIPS Drop terminology.
+
 ## Android Build
 
 ```bash

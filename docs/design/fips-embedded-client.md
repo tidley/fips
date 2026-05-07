@@ -91,8 +91,10 @@ cargo ndk -t arm64-v8a build \
 ```
 
 This crate deliberately keeps the current PoC API compatible while adding
-FIPS Drop product-name aliases. A later binding pass can rename the remaining
-`dropbox` methods once the Flutter/Rust bridge is regenerated.
+FIPS Drop product-name aliases. The Pushstr Flutter/Rust bridge now depends on
+this crate and exposes a product-named `fipsMobileSendFipsDropBlob` binding.
+The older `dropbox` binding remains as a wrapper until downstream callers no
+longer need it.
 
 ## Pushstr Shape
 

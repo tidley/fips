@@ -13,18 +13,23 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{PeerConfig, TransportInstances, UdpConfig};
 use crate::dropbox::{
-    DROPBOX_BLOB_CHUNK_DATA_BYTES, DROPBOX_SERVICE_PORT, DropboxMessage, DropboxResult, encode_b64,
+    DROPBOX_BLOB_CHUNK_DATA_BYTES, DROPBOX_SERVICE_PORT, DropboxMessage, DropboxResult,
+    FipsDropDownloadedFile, FipsDropFileEntry, build_quic_get_payload, build_quic_list_payload,
+    build_quic_upload_payload, encode_b64, parse_quic_file_response, parse_quic_list_response,
     sha256_hex,
 };
 use crate::{
-    Config, EmbeddedNodeCommand, EmbeddedNodeStatus, Node, NodeAddr, NodeError, PeerIdentity,
-    ServiceOutbound, ServicePacket,
+    Config, EmbeddedNodeCommand, EmbeddedNodeStatus, Identity, Node, NodeAddr, NodeError,
+    PeerIdentity, ServiceOutbound, ServicePacket,
 };
 
 /// Default mobile reply port for app-owned FSP service traffic.
 pub const MOBILE_RESPONSE_PORT: u16 = 49_152;
 
-/// Maximum serialized Dropbox payload to send as a single service packet.
+/// Mobile Pushstr direct-message service port.
+pub const PUSHSTR_SERVICE_PORT: u16 = 49_153;
+
+/// Maximum serialized FIPS Drop payload to send as a single service packet.
 pub const DROPBOX_INLINE_PAYLOAD_BYTES: usize = 1_024;
 
 /// Raw file bytes per binary blob chunk. Keeps each FIPS service payload well under MTU.
@@ -56,6 +61,27 @@ const DROPBOX_BLOB_CLEAN_WINDOWS_BEFORE_GROW: u8 = 3;
 /// Number of times to retry missing FIPS Drop chunks.
 pub const DROPBOX_MAX_SEND_ATTEMPTS: usize = 10;
 
+/// Product-name alias for `DROPBOX_INLINE_PAYLOAD_BYTES`.
+pub const FIPS_DROP_INLINE_PAYLOAD_BYTES: usize = DROPBOX_INLINE_PAYLOAD_BYTES;
+
+/// Product-name alias for `DROPBOX_CHUNK_DATA_BYTES`.
+pub const FIPS_DROP_CHUNK_DATA_BYTES: usize = DROPBOX_CHUNK_DATA_BYTES;
+
+/// Product-name alias for `DROPBOX_MAX_FILE_BYTES`.
+pub const FIPS_DROP_MAX_FILE_BYTES: usize = DROPBOX_MAX_FILE_BYTES;
+
+/// Product-name alias for `DROPBOX_CHUNK_WINDOW_SIZE`.
+pub const FIPS_DROP_CHUNK_WINDOW_SIZE: usize = DROPBOX_CHUNK_WINDOW_SIZE;
+
+/// Product-name alias for `DROPBOX_BLOB_WINDOW_SIZE`.
+pub const FIPS_DROP_BLOB_WINDOW_SIZE: usize = DROPBOX_BLOB_WINDOW_SIZE;
+
+/// Product-name alias for `DROPBOX_BLOB_REPAIR_BATCH_SIZE`.
+pub const FIPS_DROP_BLOB_REPAIR_BATCH_SIZE: usize = DROPBOX_BLOB_REPAIR_BATCH_SIZE;
+
+/// Product-name alias for `DROPBOX_MAX_SEND_ATTEMPTS`.
+pub const FIPS_DROP_MAX_SEND_ATTEMPTS: usize = DROPBOX_MAX_SEND_ATTEMPTS;
+
 /// Mobile runtime configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FipsMobileConfig {
@@ -81,8 +107,12 @@ impl FipsMobileConfig {
 pub struct FipsMobileClient {
     command_tx: mpsc::Sender<EmbeddedNodeCommand>,
     inbound_rx: mpsc::Receiver<ServicePacket>,
+    pushstr_rx: mpsc::Receiver<ServicePacket>,
     join: tokio::task::JoinHandle<Result<(), NodeError>>,
     response_port: u16,
+    identity: Identity,
+    #[cfg(feature = "nostr-discovery")]
+    nostr_discovery_config: crate::config::NostrDiscoveryConfig,
 }
 
 #[derive(Debug, Error)]
@@ -117,6 +147,10 @@ pub enum FipsMobileError {
     DropboxAckTimeout { id: String, missing: Vec<String> },
     #[error("file receiver error for transfer {id:?}: {reason}")]
     DropboxRemoteError { id: Option<String>, reason: String },
+    #[error("QUIC transport error: {0}")]
+    Quic(#[from] crate::quic::FipsQuicError),
+    #[error("Pushstr service payload error: {0}")]
+    PushstrProtocol(String),
     #[error("mobile node task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
     #[error("FIPS connection to {npub} was not ready after {timeout_ms}ms. {detail}")]
@@ -127,15 +161,28 @@ pub enum FipsMobileError {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FipsPushstrMessage {
+    pub id: String,
+    pub from_npub: String,
+    pub to_npub: String,
+    pub content: String,
+    pub created_at: u64,
+}
+
 impl FipsMobileClient {
     /// Start an in-process FIPS node for a mobile runtime.
     pub async fn start(config: FipsMobileConfig) -> Result<Self, FipsMobileError> {
         let node_config = prepare_mobile_config(config.config);
         let response_port = config.response_port;
         let queue_depth = config.queue_depth;
+        #[cfg(feature = "nostr-discovery")]
+        let nostr_discovery_config = node_config.node.discovery.nostr.clone();
 
         let mut node = Node::new(node_config)?;
+        let identity = Identity::from_keypair(node.identity().keypair());
         let inbound_rx = node.register_service_port(response_port, queue_depth)?;
+        let pushstr_rx = node.register_service_port(PUSHSTR_SERVICE_PORT, queue_depth)?;
         node.start().await?;
 
         let (command_tx, command_rx) = mpsc::channel(queue_depth.max(8));
@@ -152,8 +199,12 @@ impl FipsMobileClient {
         Ok(Self {
             command_tx,
             inbound_rx,
+            pushstr_rx,
             join,
             response_port,
+            identity,
+            #[cfg(feature = "nostr-discovery")]
+            nostr_discovery_config,
         })
     }
 
@@ -291,7 +342,7 @@ impl FipsMobileClient {
     }
 
     /// Send one FIPS Drop blob to a remote node's port 4242 receiver.
-    pub async fn send_dropbox_blob_to_npub(
+    pub async fn send_fips_drop_blob_to_npub(
         &mut self,
         npub: &str,
         name: &str,
@@ -299,6 +350,13 @@ impl FipsMobileClient {
         data: &[u8],
     ) -> Result<(), FipsMobileError> {
         validate_dropbox_file_size(data.len())?;
+        #[cfg(feature = "nostr-discovery")]
+        if self.nostr_discovery_config.enabled {
+            return self
+                .send_fips_drop_blob_to_npub_quic(npub, name, mime, data)
+                .await;
+        }
+
         let peer_identity = PeerIdentity::from_npub(npub)?;
         let messages = build_dropbox_messages_for_blob(name, mime, data)?;
         let dest_addr = *peer_identity.node_addr();
@@ -312,6 +370,198 @@ impl FipsMobileClient {
         self.send_dropbox_messages_to_addr(dest_addr, messages)
             .await
             .map_err(|err| err.with_route_context(npub, dest_addr))
+    }
+
+    /// Send one Pushstr message through an established/direct FIPS service session.
+    pub async fn send_pushstr_message_to_npub(
+        &self,
+        npub: &str,
+        id: Option<String>,
+        content: String,
+        timeout: Duration,
+    ) -> Result<FipsPushstrMessage, FipsMobileError> {
+        let peer_identity = PeerIdentity::from_npub(npub)?;
+        self.wait_for_session_npub(npub, timeout).await?;
+
+        let message = FipsPushstrMessage {
+            id: id.unwrap_or_else(new_pushstr_message_id),
+            from_npub: self.identity.npub(),
+            to_npub: npub.to_string(),
+            content,
+            created_at: now_secs(),
+        };
+        let outbound = ServiceOutbound {
+            dest_addr: *peer_identity.node_addr(),
+            src_port: PUSHSTR_SERVICE_PORT,
+            dst_port: PUSHSTR_SERVICE_PORT,
+            payload: serde_json::to_vec(&message)
+                .map_err(|err| FipsMobileError::PushstrProtocol(err.to_string()))?,
+        };
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(EmbeddedNodeCommand::SendServiceData {
+                outbound,
+                respond_to: Some(tx),
+            })
+            .await
+            .map_err(|_| FipsMobileError::CommandLoopClosed)?;
+        rx.await
+            .map_err(|_| FipsMobileError::ResponseDropped)?
+            .map_err(FipsMobileError::Command)?;
+
+        Ok(message)
+    }
+
+    /// Compatibility alias for callers that still use the old PoC name.
+    pub async fn send_dropbox_blob_to_npub(
+        &mut self,
+        npub: &str,
+        name: &str,
+        mime: Option<String>,
+        data: &[u8],
+    ) -> Result<(), FipsMobileError> {
+        self.send_fips_drop_blob_to_npub(npub, name, mime, data)
+            .await
+    }
+
+    #[cfg(feature = "nostr-discovery")]
+    async fn send_fips_drop_blob_to_npub_quic(
+        &self,
+        npub: &str,
+        name: &str,
+        mime: Option<String>,
+        data: &[u8],
+    ) -> Result<(), FipsMobileError> {
+        let _ = PeerIdentity::from_npub(npub)?;
+        let payload = build_quic_upload_payload(name, mime, data)?;
+        let response = crate::quic::connect_one_stream_via_nostr_stun(
+            &self.identity,
+            self.nostr_discovery_config.clone(),
+            npub.to_string(),
+            &payload,
+            crate::quic::FipsQuicOptions {
+                timeout: Duration::from_secs(60),
+                max_stream_bytes: 64 * 1024,
+            },
+        )
+        .await?;
+
+        match DropboxMessage::from_payload(&response.response)? {
+            DropboxMessage::Ack {
+                status,
+                id: _,
+                sha256: _,
+                size: _,
+                path: _,
+            } if status == DROPBOX_ACK_STORED => Ok(()),
+            DropboxMessage::Error { id, reason } => {
+                Err(FipsMobileError::DropboxRemoteError { id, reason })
+            }
+            other => Err(FipsMobileError::Dropbox(
+                crate::dropbox::DropboxError::Protocol(format!(
+                    "unexpected FIPS Drop QUIC response: {other:?}"
+                )),
+            )),
+        }
+    }
+
+    /// List files currently stored by a FIPS Drop receiver.
+    pub async fn list_fips_drop_files_from_npub(
+        &self,
+        npub: &str,
+    ) -> Result<Vec<FipsDropFileEntry>, FipsMobileError> {
+        #[cfg(feature = "nostr-discovery")]
+        {
+            let response = self
+                .send_fips_drop_quic_request(npub, build_quic_list_payload(), 512 * 1024)
+                .await?;
+            return Ok(parse_quic_list_response(&response.response)?);
+        }
+
+        #[cfg(not(feature = "nostr-discovery"))]
+        {
+            let _ = npub;
+            Err(FipsMobileError::Command(
+                "FIPS Drop list requires nostr-discovery".to_string(),
+            ))
+        }
+    }
+
+    /// Fetch one file from a FIPS Drop receiver.
+    pub async fn get_fips_drop_file_from_npub(
+        &self,
+        npub: &str,
+        name: &str,
+    ) -> Result<FipsDropDownloadedFile, FipsMobileError> {
+        #[cfg(feature = "nostr-discovery")]
+        {
+            let payload = build_quic_get_payload(name)?;
+            let response = self
+                .send_fips_drop_quic_request(npub, payload, DROPBOX_MAX_FILE_BYTES + 64 * 1024)
+                .await?;
+            let file = parse_quic_file_response(&response.response)?;
+            validate_dropbox_file_size(file.data.len())?;
+            return Ok(file);
+        }
+
+        #[cfg(not(feature = "nostr-discovery"))]
+        {
+            let _ = (npub, name);
+            Err(FipsMobileError::Command(
+                "FIPS Drop get requires nostr-discovery".to_string(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "nostr-discovery")]
+    async fn send_fips_drop_quic_request(
+        &self,
+        npub: &str,
+        payload: Vec<u8>,
+        max_response_bytes: usize,
+    ) -> Result<crate::quic::FipsQuicStreamResponse, FipsMobileError> {
+        let _ = PeerIdentity::from_npub(npub)?;
+        let options = crate::quic::FipsQuicOptions {
+            timeout: Duration::from_secs(60),
+            max_stream_bytes: max_response_bytes,
+        };
+        let mut last_error = None;
+        for attempt in 0..2 {
+            match crate::quic::connect_one_stream_via_nostr_stun(
+                &self.identity,
+                self.nostr_discovery_config.clone(),
+                npub.to_string(),
+                &payload,
+                options.clone(),
+            )
+            .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) if attempt == 0 && Self::is_retryable_quic_request_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(750)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(last_error
+            .expect("retry loop records an error before continuing")
+            .into())
+    }
+
+    #[cfg(feature = "nostr-discovery")]
+    fn is_retryable_quic_request_error(error: &crate::quic::FipsQuicError) -> bool {
+        match error {
+            crate::quic::FipsQuicError::Connect(_) | crate::quic::FipsQuicError::Connection(_) => {
+                true
+            }
+            crate::quic::FipsQuicError::Timeout { operation, .. } => {
+                *operation == "quic client stream" || *operation == "nostr/stun traversal"
+            }
+            crate::quic::FipsQuicError::NostrDiscovery(reason) => reason.contains("timed out"),
+            _ => false,
+        }
     }
 
     async fn send_dropbox_messages_to_addr(
@@ -823,6 +1073,38 @@ impl FipsMobileClient {
         self.inbound_rx.recv().await
     }
 
+    /// Receive the next Pushstr message delivered over FIPS service data.
+    pub async fn recv_pushstr_message(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<FipsPushstrMessage>, FipsMobileError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let packet = match tokio::time::timeout(deadline - now, self.pushstr_rx.recv()).await {
+                Ok(Some(packet)) => packet,
+                Ok(None) => return Ok(None),
+                Err(_) => return Ok(None),
+            };
+            if packet.dst_port != PUSHSTR_SERVICE_PORT || packet.src_port != PUSHSTR_SERVICE_PORT {
+                continue;
+            }
+            let message: FipsPushstrMessage = serde_json::from_slice(&packet.payload)
+                .map_err(|err| FipsMobileError::PushstrProtocol(err.to_string()))?;
+            let from = PeerIdentity::from_npub(&message.from_npub)?;
+            if *from.node_addr() != packet.src_addr {
+                return Err(FipsMobileError::PushstrProtocol(format!(
+                    "sender npub {} does not match packet source {}",
+                    message.from_npub, packet.src_addr
+                )));
+            }
+            return Ok(Some(message));
+        }
+    }
+
     /// Return a compact status snapshot.
     pub async fn status(&self) -> Result<EmbeddedNodeStatus, FipsMobileError> {
         let (tx, rx) = oneshot::channel();
@@ -892,13 +1174,22 @@ impl FipsMobileError {
     }
 }
 
-/// Build the single-payload Dropbox message used by the Android PoC.
-pub fn build_dropbox_put_message(
+/// Build the single-payload FIPS Drop message used by the Android PoC.
+pub fn build_fips_drop_put_message(
     name: &str,
     mime: Option<String>,
     data: &[u8],
 ) -> DropboxResult<DropboxMessage> {
     build_dropbox_put_message_with_id(&new_dropbox_transfer_id(), name, mime, data)
+}
+
+/// Compatibility alias for callers that still use the old PoC name.
+pub fn build_dropbox_put_message(
+    name: &str,
+    mime: Option<String>,
+    data: &[u8],
+) -> DropboxResult<DropboxMessage> {
+    build_fips_drop_put_message(name, mime, data)
 }
 
 fn build_dropbox_messages_for_blob(
@@ -1210,6 +1501,17 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn new_pushstr_message_id() -> String {
+    format!("fips_{:016x}", now_millis() as u64)
 }
 
 #[cfg(test)]
@@ -1664,5 +1966,21 @@ dns:
 
         assert!(result.is_err());
         client.stop().await.unwrap();
+    }
+
+    #[test]
+    fn pushstr_message_round_trips_as_json() {
+        let message = FipsPushstrMessage {
+            id: "fips_1".to_string(),
+            from_npub: peer_npub(),
+            to_npub: peer_npub(),
+            content: "hello over fips".to_string(),
+            created_at: 1,
+        };
+
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let decoded: FipsPushstrMessage = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded, message);
     }
 }

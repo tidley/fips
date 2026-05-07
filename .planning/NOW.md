@@ -15,6 +15,7 @@
   - Rust `fips::mobile` facade for Android/Flutter wrappers,
   - Pushstr `flutter_rust_bridge` integration,
   - Android `FIPS Drop` UI,
+  - direct Pushstr message send/poll over embedded FIPS service port `49153`,
   - rebuilt Android native libs and debug APK.
 - Physical integration now works:
   - Android -> Pi over Wi-Fi,
@@ -28,6 +29,7 @@
 - Next work is turning the validated PoC into the product path:
   - preserve the reproducible runbook in `docs/pocs/fips-drop-android-pi.md`,
   - follow `.planning/FIPS-DROP-NEXT-PHASES.md`,
+  - test phone-to-phone Pushstr messaging over FIPS/Nostr/STUN traversal,
   - add progress/pairing UX,
   - add Blossom/Nostr receipt metadata,
   - move receiver systemd material into package integration.

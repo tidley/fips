@@ -4,10 +4,18 @@
 
 ## Android FIPS mobile via Nostr UDP holepunch blockers
 
-- Android build compatibility is unproven for the current `fips` crate. The target must compile with daemon/TUN/gateway-only pieces disabled or gated.
-- Current embedded API gap: no single library surface wraps Nostr discovery -> traversal event -> `adopt_established_traversal` -> session readiness.
-- App-service API gap: `send_session_data` is internal and inbound non-IPv6 service ports are dropped instead of delivered to app callbacks/queues.
+- Android build compatibility is now proven through `crates/fips-mobile` and the
+  Pushstr bridge, but native-library packaging must stay aligned with generated
+  Flutter Rust Bridge bindings.
+- The embedded API now wraps Nostr discovery -> traversal adoption -> session
+  readiness; remaining risk is lifecycle cleanup during mobile network changes
+  and app backgrounding.
+- App-service send/receive exists for FSP service ports; remaining risk is
+  backpressure, progress reporting, and resumability for larger transfers.
 - Mobile runtime constraints: app lifecycle, Doze/background limits, network switching, and UDP socket lifetime may interrupt traversal/session state.
 - NAT reality: Nostr/STUN UDP punching is proven but not universal; carrier-grade/symmetric NAT or restricted mobile networks may require peer-assist/helper fallback.
-- Pushstr bridge/package gap: no Flutter Rust bridge bindings or Android NDK build pipeline exists for embedded FIPS yet.
-- Pi node readiness: target nodes need stable identity, Nostr advert/signaling config, STUN/relay config, and receiver-agent/service-port handling.
+- Pushstr bridge/package gap is reduced: bindings and Android NDK builds exist,
+  but dirty local app changes need clean commit boundaries and repeatable
+  release packaging.
+- Pi node readiness is proven manually; remaining risk is packaging,
+  authorization/quota policy, and stable operator defaults.

@@ -59,12 +59,23 @@ Completed Rust slice:
   - traversal can use the target peer's advertised `stunServices` in addition
     to configured `stun_servers`.
 - Added Pushstr mobile bridge/UI on branch `feature/fips-dropbox-mobile`:
+  - depends on `../../fips/crates/fips-mobile` rather than the root daemon crate,
   - exposes `fips_mobile_*` functions through Pushstr's existing `flutter_rust_bridge` crate,
+  - exposes the product-named `fipsMobileSendFipsDropBlob` binding,
+  - keeps `fipsMobileSendDropboxBlob` as a compatibility wrapper,
   - adds drawer entry `FIPS Drop`,
   - starts embedded FIPS from generated YAML,
   - connects to a target npub,
   - picks a local file,
   - sends it to FIPS Drop service port `4242`.
+- Added the first regular Pushstr-over-FIPS path:
+  - starts the embedded FIPS runtime from the selected Pushstr profile nsec,
+  - advertises/listens with the same selected Pushstr npub,
+  - sends direct Pushstr messages over FIPS service port `49153`,
+  - polls inbound FIPS Pushstr messages and merges them into the existing
+    local message/contact store,
+  - falls back to the existing Nostr DM path if FIPS session setup or send
+    fails.
 - Android native Rust libraries now build with embedded FIPS for:
   - `arm64-v8a`,
   - `armeabi-v7a`.
@@ -85,12 +96,15 @@ Physical validation:
 
 Immediate priority:
 
-1. Use the real-world harness for automated regression during protocol changes.
-2. Test the same-socket STUN advert path on a public VPS listener.
-3. Rebuild/retest the post-hardening `fips-drop-agent` + Android APK.
-4. Add progress reporting and pairing UX.
-5. Add Blossom/Nostr receipt metadata after raw direct FIPS transfer succeeds.
-6. Move from PoC receiver docs to package integration.
+1. Physically test phone-to-phone Pushstr messaging over FIPS/Nostr/STUN.
+2. Split and commit the current FIPS and Pushstr bridge changes cleanly.
+3. Use the real-world harness for automated regression during protocol changes.
+4. Test the same-socket STUN advert path on a public VPS listener.
+5. Rebuild/retest the current `fips-drop-agent` + Android APK baseline.
+6. Add progress reporting and pairing UX.
+7. Add receiver authorization/quota policy.
+8. Add Blossom/Nostr receipt metadata after raw direct FIPS transfer succeeds.
+9. Move from PoC receiver docs to package integration.
 
 Verification from current junction:
 
@@ -106,6 +120,7 @@ Verification from current junction:
 - Pushstr `flutter test`
 - Pushstr `cargo ndk` Android library builds for `arm64-v8a` and `armeabi-v7a`
 - Pushstr `flutter build apk --debug`
+- Pushstr physical phone-to-phone FIPS message test
 
 Worktree caution:
 

@@ -287,6 +287,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_fpr` and returns `Option<f64>`, returning `None` for
   saturated filters; this propagates through `compute_mesh_size`
   into `estimated_mesh_size` (already `Option<u64>`)
+- The `docs/` tree is reorganised so readers can find content by
+  what they're trying to do: tutorials for new users, how-to guides
+  for specific tasks, reference material for configuration and
+  protocol details, and design discussion for architectural
+  background. New top-level `getting-started.md` and per-section
+  landing pages anchor the entry points. Content was reconciled
+  against current source: protocol layer details, wire-format
+  diagrams, configuration knobs, and CLI references were brought
+  back into agreement with the implementation. Gateway feature-set
+  documentation was rewritten end-to-end.
+- Test coverage was substantially expanded for the new release
+  surface (discovery state machine, control-socket query handlers,
+  decrypt-failure thresholds, STUN parser, gateway, NAT traversal,
+  packaging install paths) alongside CI-side hardening for the new
+  Windows and macOS platforms.
 
 ### Fixed
 
@@ -450,14 +465,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tree specification. The receive path now verifies that the
   ancestry is structurally consistent with the signed parent
   declaration before mutating tree state.
-- Make the tree ancestry acceptance unit test deterministic.
-  `test_tree_announce_validate_semantics_accepts_valid_non_root`
-  generated a random signing identity while pinning the fixed root
-  to `node_addr[0] = 0x01`; about 2 in 256 random identities were
-  numerically smaller than the claimed root, triggering
-  `AncestryRootNotMinimum`. The test now regenerates the identity
-  until its `node_addr` is strictly larger than both the fixed
-  parent and root.
+- Spanning-tree updates that change only the internal path between
+  root and leaf — without changing the root or the depth — now
+  propagate to leaves correctly. Previously a leaf could continue
+  routing against a stale internal path until the parent or depth
+  also changed.
 
 ## [0.2.0] - 2026-03-22
 

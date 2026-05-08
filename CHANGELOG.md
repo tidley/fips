@@ -290,6 +290,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Default control-socket path resolution: daemon and client tools now
+  use a shared resolver, eliminating a divergence where `fipsctl` /
+  `fipstop` could connect to a socket the daemon never bound (notably
+  on dev runs with `XDG_RUNTIME_DIR` set, or after a prior packaged
+  install left a root-owned `/run/fips` behind). Canonical order is
+  `/run/fips` → `$XDG_RUNTIME_DIR/fips/` → `/tmp/fips-<name>`, with
+  writability of `/run/fips` probed via tempfile create (ACL- and
+  group-aware) and `XDG_RUNTIME_DIR` validated as an existing
+  directory before being used. The deployed fleet is unaffected:
+  packaged configs set `node.control.socket_path` explicitly.
 - UDP transport with `advertise_on_nostr: true` + `public: true` +
   a wildcard `bind_addr` (e.g. `0.0.0.0:2121`) is now advertised
   with its STUN-discovered public IPv4 instead of being silently

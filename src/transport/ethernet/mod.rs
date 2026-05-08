@@ -49,7 +49,9 @@ pub struct EthernetTransport {
     local_mac: Option<[u8; 6]>,
     /// Interface name (from config).
     interface: String,
-    /// Effective MTU (interface MTU - 1 for frame type prefix).
+    /// Effective payload MTU: interface MTU minus 3 bytes of frame header
+    /// (`[type:1][length:2 LE][payload]`). The 2-byte length field is required
+    /// to trim NIC minimum-frame padding before AEAD verification.
     effective_mtu: u16,
     /// Discovery buffer for discovered peers.
     discovery_buffer: Arc<DiscoveryBuffer>,

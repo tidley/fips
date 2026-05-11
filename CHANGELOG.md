@@ -204,9 +204,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Packaging and Deployment
 
-- Linux release artifact workflow: builds x86_64 and aarch64 tarballs
-  and `.deb` packages on `v*` tag push, with SHA-256 checksums
-- AUR publish workflow for tagged stable releases
 - Arch Linux AUR packaging for `fips` (release) and `fips-git`
   (development) packages with sysusers.d/tmpfiles.d integration
   ([#21](https://github.com/jmcorgan/fips/pull/21),
@@ -352,16 +349,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`backoff_base_secs`/`backoff_max_secs` now both `0`); operators
   with chatty apps generating repeat lookups against unreachable
   destinations can opt back in
-- Validate bloom filter fill ratio on FilterAnnounce ingress.
-  Inbound FilterAnnounce messages whose derived false-positive
-  rate exceeds `node.bloom.max_inbound_fpr` (new config field,
-  default 0.05) are rejected silently on the wire, logged at WARN,
-  and counted in a new `bloom.fill_exceeded` counter. A
-  rate-limited WARN also fires if our own outgoing filter's FPR
-  exceeds the cap. `BloomFilter::estimated_count` now takes
-  `max_fpr` and returns `Option<f64>`, returning `None` for
-  saturated filters; this propagates through `compute_mesh_size`
-  into `estimated_mesh_size` (already `Option<u64>`)
 - The `docs/` tree is reorganised so readers can find content by
   what they're trying to do: tutorials for new users, how-to guides
   for specific tasks, reference material for configuration and
@@ -583,22 +570,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching the Tor `HiddenServicePort` convention) controls the
   advertised port; operators with non-default virtual ports can
   override.
-- Control socket path detection in fipsctl and fipstop now checks for
-  the `/run/fips/` directory instead of the socket file inside it, so
-  users not yet in the `fips` group get a clear "Permission denied"
-  error instead of a misleading "No such file" fallback to
-  `$XDG_RUNTIME_DIR` ([#30](https://github.com/jmcorgan/fips/issues/30),
-  reported by [@Sebastix](https://github.com/Sebastix))
-- OpenWrt ipk build excluded BLE feature that requires D-Bus, which is
-  unavailable on OpenWrt targets
-- IPv6 routing policy rule added at TUN setup to protect `fd00::/8`
-  from interception by Tailscale's table 52 default route
-- Bloom filter routing no longer swallows traffic when no bloom
-  candidate is strictly closer than the current node. `find_next_hop`
-  now falls through to greedy tree routing in that case instead of
-  returning `NoRoute`, which previously caused dropped packets in
-  topologies where the tree parent was closer but not a bloom
-  candidate
 - TCP-over-FIPS reliability on mesh paths with mixed transport
   MTUs (e.g. a UDP-1280 hop in the picker set) improved. Three
   interlocking changes: `Node::transport_mtu()` is now deterministic
@@ -636,6 +607,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the cooldown window are silent. New `protocol_mismatch_cooldown_secs`
   config field under `node.discovery.nostr` (default 86400 = 24h),
   separate from the transient-failure `extended_cooldown_secs`.
+- `fipstop` now uses `ratatui::try_init()` instead of `ratatui::init()`,
+  so terminal initialization failures (e.g. Docker on macOS Sequoia,
+  or environments without a usable tty) produce a clean error message
+  instead of a hard crash
+- Spanning-tree updates that change only the internal path between
+  root and leaf — without changing the root or the depth — now
+  propagate to leaves correctly. Previously a leaf could continue
+  routing against a stale internal path until the parent or depth
+  also changed.
+
+## [0.2.1] - 2026-05-11
+
+### Added
+
+- Linux release artifact workflow: builds x86_64 and aarch64 tarballs
+  and `.deb` packages on `v*` tag push, with SHA-256 checksums
+- AUR publish workflow for tagged stable releases
+
+### Changed
+
+- Validate bloom filter fill ratio on FilterAnnounce ingress.
+  Inbound FilterAnnounce messages whose derived false-positive
+  rate exceeds `node.bloom.max_inbound_fpr` (new config field,
+  default 0.05) are rejected silently on the wire, logged at WARN,
+  and counted in a new `bloom.fill_exceeded` counter. A
+  rate-limited WARN also fires if our own outgoing filter's FPR
+  exceeds the cap. `BloomFilter::estimated_count` now takes
+  `max_fpr` and returns `Option<f64>`, returning `None` for
+  saturated filters; this propagates through `compute_mesh_size`
+  into `estimated_mesh_size` (already `Option<u64>`)
+
+### Fixed
+
+- Control socket path detection in fipsctl and fipstop now checks for
+  the `/run/fips/` directory instead of the socket file inside it, so
+  users not yet in the `fips` group get a clear "Permission denied"
+  error instead of a misleading "No such file" fallback to
+  `$XDG_RUNTIME_DIR` ([#30](https://github.com/jmcorgan/fips/issues/30),
+  reported by [@Sebastix](https://github.com/Sebastix))
+- OpenWrt ipk build excluded BLE feature that requires D-Bus, which is
+  unavailable on OpenWrt targets
+- IPv6 routing policy rule added at TUN setup to protect `fd00::/8`
+  from interception by Tailscale's table 52 default route
+- Bloom filter routing no longer swallows traffic when no bloom
+  candidate is strictly closer than the current node. `find_next_hop`
+  now falls through to greedy tree routing in that case instead of
+  returning `NoRoute`, which previously caused dropped packets in
+  topologies where the tree parent was closer but not a bloom
+  candidate
 - Auto-connect peers now reconnect after a graceful `Disconnect`
   notification from the remote side. `handle_disconnect` previously
   removed the peer without scheduling a reconnect, orphaning the
@@ -649,19 +669,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bind with `EAFNOSUPPORT`
   ([#61](https://github.com/jmcorgan/fips/issues/61),
   reported by [@SwapMarket](https://github.com/SwapMarket))
-- `fipstop` now uses `ratatui::try_init()` instead of `ratatui::init()`,
-  so terminal initialization failures (e.g. Docker on macOS Sequoia,
-  or environments without a usable tty) produce a clean error message
-  instead of a hard crash
 - Tighten TreeAnnounce ancestry validation to match the spanning
   tree specification. The receive path now verifies that the
   ancestry is structurally consistent with the signed parent
   declaration before mutating tree state.
-- Spanning-tree updates that change only the internal path between
-  root and leaf — without changing the root or the depth — now
-  propagate to leaves correctly. Previously a leaf could continue
-  routing against a stale internal path until the parent or depth
-  also changed.
+- Make the tree ancestry acceptance unit test deterministic.
+  `test_tree_announce_validate_semantics_accepts_valid_non_root`
+  generated a random signing identity while pinning the fixed root
+  to `node_addr[0] = 0x01`; about 2 in 256 random identities were
+  numerically smaller than the claimed root, triggering
+  `AncestryRootNotMinimum`. The test now regenerates the identity
+  until its `node_addr` is strictly larger than both the fixed
+  parent and root.
 
 ## [0.2.0] - 2026-03-22
 

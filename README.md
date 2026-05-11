@@ -3,7 +3,7 @@
 ![banner](docs/logos/fips_banner.png)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.2.0-green.svg)](#status--roadmap)
+[![Status](https://img.shields.io/badge/status-v0.2.1-green.svg)](#status--roadmap)
 
 A distributed, decentralized network routing protocol for mesh nodes
 connecting over arbitrary transports.
@@ -239,7 +239,7 @@ testing/      Docker-based integration test harnesses
 
 ## Status & Roadmap
 
-FIPS is at **v0.2.0**. The core protocol works end-to-end over UDP, TCP,
+FIPS is at **v0.2.1**. The core protocol works end-to-end over UDP, TCP,
 Ethernet, and Tor with a small live mesh of deployed nodes.
 
 ### What works today

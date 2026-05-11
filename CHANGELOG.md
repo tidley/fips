@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-05-11
 
 ### Added
 
@@ -237,9 +237,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Documentation
 
-- Pre-implementation proposal for NAT traversal using Nostr relays
-  as the signaling channel and STUN for reflexive address discovery
-  (`docs/proposals/`)
+- `docs/design/port-advertisement-and-nat-traversal.md` documents
+  how nodes find each other through Nostr relays and the
+  STUN-assisted UDP hole punch
 
 ### Changed
 

@@ -3,7 +3,7 @@
 ![banner](docs/logos/fips_banner.png)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.3.0--dev-green.svg)](#status--roadmap)
+[![Status](https://img.shields.io/badge/status-v0.3.0-green.svg)](#status--roadmap)
 
 A self-organizing encrypted mesh network built on Nostr identities,
 capable of operating over arbitrary transports without central
@@ -183,7 +183,7 @@ testing/      Docker-based integration test harnesses + chaos simulation
 
 ## Status & roadmap
 
-FIPS is at **v0.3.0-dev**. The core protocol works end-to-end over
+FIPS is at **v0.3.0**. The core protocol works end-to-end over
 UDP, TCP, Ethernet, Tor, and Bluetooth on a small live mesh of
 deployed nodes. v0.3.0 is the testing-and-polishing track for
 everything accumulated since v0.2.0 on the v0.2.x wire format —

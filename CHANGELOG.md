@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Apply ±15s symmetric jitter per session to the FMP and FSP rekey
+  timer trigger. Eliminates the steady-state dual-initiation race
+  in symmetric-start meshes; previously the smaller-NodeAddr
+  tie-breaker resolved correctness after every cycle's collision.
+  `node.rekey.after_secs` becomes the nominal interval rather than
+  a floor; mean is preserved.
 - Rekey integration test (`testing/static/scripts/rekey-test.sh`):
   bumped Phase 1 baseline-convergence headroom from 36s to 60s.
   Eliminates the intermittent GitHub-runner Phase 1 timeout that

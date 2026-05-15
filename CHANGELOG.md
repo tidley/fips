@@ -77,6 +77,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the test's previous one-shot grep gave up, producing a
   pre-existing flake on next-branch CI. Success-path cost is
   unchanged — the helper returns as soon as the pattern appears.
+- Nostr-discovered NAT-traversal events (`BootstrapEvent::Established`
+  and `BootstrapEvent::Failed`) for peers that are already connected
+  or actively handshaking are now short-circuited at the
+  `poll_nostr_discovery` dispatch sites before any cooldown
+  bookkeeping or fallback retry scheduling runs. Stale `Failed` events
+  previously poisoned the per-peer failure-state cooldown of healthy
+  peers and could trigger redundant retraversal attempts via
+  `schedule_retry` / `try_peer_addresses`; stale `Established`
+  handoffs could attempt to adopt a second socket against a live
+  connection. A defense-in-depth guard was added to
+  `adopt_established_traversal` so the same invariant holds if a
+  future caller bypasses the outer dispatch check. As a side benefit,
+  narrows a cooldown-poisoning vector previously available to an
+  attacker injecting stale failure events for an active peer.
 
 ## [0.3.0] - 2026-05-11
 

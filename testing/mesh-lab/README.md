@@ -53,8 +53,15 @@ Initial target set:
 - `rekey`, `rekey-accept-off`, `rekey-outbound-only` — rekey-suite
   Phase 5 post-second-rekey connectivity flake class.
 - `nat-lan` — two-node NAT-traversal handshake-completion flake class.
-- `bloom-storm` — chaos scenario; logged for future opportunistic
-  checks, not in the initial active scope.
+- `bloom-storm` — chaos scenario; covers the
+  [ISSUE-2026-0026](../../../prj/fips/issues/ISSUE-2026-0026.md)
+  `bloom_send_rate` per-node ceiling exceedance class. Note that
+  chaos uses its own python sim runner (not docker-compose), so the
+  mesh-lab `compose-resource-limits.yml` and `compose-trace.yml`
+  overrides do not apply to this suite; per-rep evidence comes from
+  the captured `test-output.log` and the parsed `signature.json`
+  (which extracts the `bloom_send_rate` and `min_parent_switches`
+  assertion outcomes plus per-node delta distribution).
 
 Adding more is straightforward — see the `dispatch_suite` function in
 [run-loop.sh](run-loop.sh).
@@ -99,6 +106,15 @@ each rep does, set them in the invoking shell:
   K-bit flip), not per-datagram forwarding decisions, which makes
   evidence collection for routing-state stalls effectively
   impossible.
+
+- **`FIPS_BLOOM_STORM_CPUSET`** — comma-separated CPU set for the
+  bloom-storm dispatch's container-pinning sidecar (default
+  `0,1`). The sidecar polls for `fips-*` containers as the chaos
+  sim spawns them and applies `docker update --cpuset-cpus <set>`
+  to each, mimicking the 2-core constraint of a GHA
+  `ubuntu-latest` runner. Set to a wider set (e.g. `0,1,2,3`) to
+  relax, or to the empty string to disable the sidecar entirely.
+  Only applies to the `bloom-storm` suite; other suites ignore it.
 
 - **`FIPS_MESH_LAB_RUNS_DIR`** — root directory for harness output
   (the `runs/<timestamp>/` tree). When unset, the harness falls back

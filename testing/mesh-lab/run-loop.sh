@@ -376,6 +376,172 @@ mechanism_match_nat_lan() {
     fi
 }
 
+# ── bloom-storm ──────────────────────────────────────────────────────
+# The bloom-storm chaos scenario (see
+# testing/chaos/scenarios/bloom-storm.yaml) drives a six-node mesh
+# with an induced n04 parent-flap and asserts a per-node ceiling
+# on `stats.bloom.sent` deltas over the trailing 30s window of the
+# 180s run. The flake class tracked here is a single node spiking
+# above the ceiling while peers stay well under (asymmetric
+# distribution), seen on master CI as ISSUE-2026-0026.
+#
+# Unlike rekey and nat-lan, chaos doesn't use docker-compose — the
+# python sim runner under `python3 -m sim` owns the container
+# lifecycle. So the dispatch is a thin wrapper: invoke chaos.sh,
+# capture stdout/stderr, and parse the assertion outcomes from the
+# captured log. Per-container docker logs aren't separately exposed
+# by the sim, so the test-output.log is the primary evidence stream.
+
+run_bloom_storm() {
+    local REP_DIR="$1"
+    local rc=0
+
+    # Optional CPU-pinning sidecar. Chaos spawns containers under
+    # `python3 -m sim`, not docker-compose, so the mesh-lab
+    # `compose-resource-limits.yml` override does not apply. The
+    # cheapest way to constrain the actual daemon containers' CPU
+    # allocation is to poll for `fips-*` containers as the sim
+    # spawns them and apply `docker update --cpuset-cpus <set>` to
+    # each. Pinning is idempotent — re-applying the same cpuset to
+    # a container that already has it is a no-op. The default
+    # `0,1` mimics a GHA 2-core runner constraint; set the env var
+    # to a wider set (e.g. `0,1,2,3`) to relax, or to the empty
+    # string to disable the sidecar and run with the host's full
+    # CPU set.
+    local cpuset="${FIPS_BLOOM_STORM_CPUSET-0,1}"
+    local pinning_pid=""
+    if [ -n "$cpuset" ]; then
+        (
+            while true; do
+                for c in $(docker ps --filter "name=fips-" --format '{{.Names}}' 2>/dev/null); do
+                    docker update --cpuset-cpus "$cpuset" "$c" >/dev/null 2>&1 || true
+                done
+                sleep 0.5
+            done
+        ) &
+        pinning_pid=$!
+        echo "bloom-storm: cpu-pinning sidecar PID $pinning_pid (cpuset=$cpuset)" \
+            >"$REP_DIR/setup.log"
+    fi
+
+    (
+        cd "$REPO_ROOT" || exit 1
+        bash testing/chaos/scripts/chaos.sh bloom-storm
+    ) >"$REP_DIR/test-output.log" 2>&1 || rc=$?
+
+    if [ -n "$pinning_pid" ]; then
+        kill "$pinning_pid" 2>/dev/null || true
+        wait "$pinning_pid" 2>/dev/null || true
+    fi
+
+    return "$rc"
+}
+
+parse_bloom_storm() {
+    local REP_DIR="$1"
+    local log="$REP_DIR/test-output.log"
+
+    # bloom_send_rate assertion. The sim runner emits the assertion
+    # in two forms — once through the python logger (prefixed with
+    # `HH:MM:SS INFO  sim.runner: `) and once as a bare summary line
+    # at end-of-run. Anchor on `^(PASS|FAIL)` so we always read the
+    # bare line, not the timestamped logger line. Output shapes
+    # (testing/chaos/sim/assertions.py):
+    #   PASS  bloom_send_rate: max per-node delta N <= ceiling M over trailing Ss (per-node: n01=X, ...)
+    #   FAIL  bloom_send_rate: K node(s) exceeded ceiling of M bloom_sent over trailing Ss — offenders: nXX=Y, ... (all per-node deltas: ...)
+    local bsr_line
+    bsr_line=$(grep -E '^(PASS|FAIL) bloom_send_rate:' "$log" | head -1 || true)
+
+    local bsr_result="unknown"
+    local bsr_offenders=""
+    local bsr_deltas=""
+    local bsr_ceiling=""
+    local bsr_max_obs=""
+    if [[ -n "$bsr_line" ]]; then
+        if [[ "$bsr_line" == FAIL* ]]; then
+            bsr_result="fail"
+            bsr_offenders=$(echo "$bsr_line" \
+                | sed -n 's/.*offenders: \(.*\) (all per-node.*/\1/p' \
+                | sed 's/^ *//;s/ *$//')
+            bsr_deltas=$(echo "$bsr_line" \
+                | sed -n 's/.*all per-node deltas: \([^)]*\).*/\1/p' \
+                | sed 's/^ *//;s/ *$//')
+            bsr_ceiling=$(echo "$bsr_line" \
+                | grep -oE 'ceiling of [0-9]+' | grep -oE '[0-9]+' | head -1)
+        elif [[ "$bsr_line" == PASS* ]]; then
+            bsr_result="pass"
+            bsr_deltas=$(echo "$bsr_line" \
+                | sed -n 's/.*(per-node: \([^)]*\)).*/\1/p' \
+                | sed 's/^ *//;s/ *$//')
+            bsr_ceiling=$(echo "$bsr_line" \
+                | grep -oE 'ceiling [0-9]+' | grep -oE '[0-9]+' | head -1)
+            bsr_max_obs=$(echo "$bsr_line" \
+                | grep -oE 'max per-node delta [0-9]+' | grep -oE '[0-9]+' | head -1)
+        fi
+    fi
+
+    # Companion assertion (always present in bloom-storm scenario).
+    # Same `^(PASS|FAIL)` anchoring as bloom_send_rate above.
+    local mps_line
+    mps_line=$(grep -E '^(PASS|FAIL) min_parent_switches:' "$log" | head -1 || true)
+    local mps_result="unknown"
+    if [[ "$mps_line" == PASS* ]]; then
+        mps_result="pass"
+    elif [[ "$mps_line" == FAIL* ]]; then
+        mps_result="fail"
+    fi
+
+    # Global negative checks. Use `grep | wc -l` instead of `grep -c`:
+    # grep -c returns exit 1 on zero matches, which makes `|| echo 0`
+    # fire alongside grep's own `0` stdout, emitting `0\n0` and
+    # corrupting the JSON. `grep | wc -l` exits 0 either way and
+    # emits exactly one number.
+    local panics errors
+    panics=$(grep -cE 'PANIC|panicked' "$log" 2>/dev/null; true)
+    [[ -z "$panics" ]] && panics=0
+    errors=$(grep -cE '\bERROR\b' "$log" 2>/dev/null; true)
+    [[ -z "$errors" ]] && errors=0
+
+    # JSON-safe: shell-quote any field that could embed special chars
+    # by writing as JSON strings; the per-node delta string can have
+    # commas but no quotes/backslashes (sim runner output).
+    cat <<EOF >"$REP_DIR/signature.json"
+{
+  "suite": "bloom-storm",
+  "bloom_send_rate": {
+    "result": "$bsr_result",
+    "ceiling": "$bsr_ceiling",
+    "max_observed": "$bsr_max_obs",
+    "offenders": "$bsr_offenders",
+    "per_node_deltas": "$bsr_deltas"
+  },
+  "min_parent_switches": {
+    "result": "$mps_result"
+  },
+  "panics": $panics,
+  "errors": $errors
+}
+EOF
+}
+
+mechanism_match_bloom_storm() {
+    local REP_DIR="$1"
+    local log="$REP_DIR/test-output.log"
+    # The ISSUE-2026-0026 mechanism is a bloom_send_rate FAIL with
+    # at least one named offender (i.e., not the "failed to sample
+    # window endpoints" sub-failure mode, which is harness rather
+    # than mechanism). The asymmetric-distribution check (one node
+    # spiking while peers stay under) is implicit in the FAIL
+    # shape: the assertion only fires when at least one node is
+    # over while at least one other is at or under the ceiling.
+    if grep -qE '^FAIL bloom_send_rate:' "$log" 2>/dev/null \
+        && grep -qE 'offenders: [a-z][0-9]+=[0-9]+' "$log" 2>/dev/null; then
+        echo "true"
+    else
+        echo "false"
+    fi
+}
+
 # Dispatch — returns rc of suite, side-effects signature.json
 dispatch_suite() {
     local REP_DIR="$1"
@@ -390,9 +556,14 @@ dispatch_suite() {
             run_nat_lan "$REP_DIR" || rc=$?
             parse_nat_lan "$REP_DIR"
             return "$rc" ;;
+        bloom-storm)
+            local rc=0
+            run_bloom_storm "$REP_DIR" || rc=$?
+            parse_bloom_storm "$REP_DIR"
+            return "$rc" ;;
         *)
             echo "ERROR: unsupported suite '$SUITE' in this lab harness (initial scaffolding)" >&2
-            echo "Supported: rekey, rekey-accept-off, rekey-outbound-only, nat-lan" >&2
+            echo "Supported: rekey, rekey-accept-off, rekey-outbound-only, nat-lan, bloom-storm" >&2
             return 99 ;;
     esac
 }
@@ -405,6 +576,8 @@ dispatch_mechanism_match() {
             mechanism_match_rekey "$REP_DIR" ;;
         nat-lan)
             mechanism_match_nat_lan "$REP_DIR" ;;
+        bloom-storm)
+            mechanism_match_bloom_storm "$REP_DIR" ;;
         *)
             echo "unknown" ;;
     esac

@@ -25,6 +25,14 @@
 #                           of the base + resource-limits stack to
 #                           bump RUST_LOG to trace on rekey/handshake/
 #                           forwarding/session/encrypted/mmp modules.
+#   FIPS_MESH_LAB_TRACE_TREE
+#                           when set, layers compose-trace-tree.yml to
+#                           bump RUST_LOG to trace on tree/mmp/handshake
+#                           modules. Targeted at tree-partition race
+#                           investigation during multi-peer startup.
+#                           Mutually exclusive with FIPS_MESH_LAB_TRACE in
+#                           practice — both apply but the second overlay
+#                           replaces the first's per-service environment.
 #   FIPS_MESH_LAB_NO_RESOURCE_LIMITS
 #                           when set, omits the compose-resource-limits.yml
 #                           overlay for rekey-family runs. Use for
@@ -186,6 +194,9 @@ run_rekey_family() {
     fi
     if [ -n "${FIPS_MESH_LAB_TRACE:-}" ]; then
         compose_args+=(-f testing/mesh-lab/compose-trace.yml)
+    fi
+    if [ -n "${FIPS_MESH_LAB_TRACE_TREE:-}" ]; then
+        compose_args+=(-f testing/mesh-lab/compose-trace-tree.yml)
     fi
     compose_args+=(--profile "$compose_profile")
 
@@ -361,16 +372,20 @@ mechanism_match_rekey() {
         echo "false"
         return
     fi
-    local pairs phase6 p1_status p1_passed
+    local pairs phase6 p1_status
     pairs=$(jq -r '.phase5_failing_pairs' "$sig")
     phase6=$(jq -r '.phase6_log_analysis' "$sig")
     p1_status=$(jq -r '.phase1_status' "$sig")
-    p1_passed=$(jq -r '.phase1_baseline_passed' "$sig")
     if [ -n "$pairs" ] && [ "$phase6" = "all-green" ]; then
         echo "true"
         return
     fi
-    if [ "$p1_status" = "timeout" ] && [ "$p1_passed" = "12" ]; then
+    # Any Phase 1 baseline-convergence timeout — the tree-partition
+    # surfaces with a variable count of failing multi-hop pairs depending
+    # on which node misses its parent re-evaluation (e.g., node-c orphan
+    # → 12/20 PASS, node-b orphan → 14/20). The exact count remains in
+    # signature.json for cross-rep analysis.
+    if [ "$p1_status" = "timeout" ]; then
         echo "true"
         return
     fi

@@ -135,6 +135,18 @@ each rep does, set them in the invoking shell:
   containers; the sidecar fills that gap. Only applies to the
   `nat-lan` suite; other suites ignore it.
 
+- **`FIPS_MESH_LAB_TRACE_TREE`** — when set to any non-empty value,
+  layers `compose-trace-tree.yml` over the rekey-family compose stack
+  to bump `RUST_LOG` to trace level on `fips::node::tree`,
+  `fips::tree`, `fips::node::handlers::mmp`, and
+  `fips::node::handlers::handshake`. Distinct from
+  `FIPS_MESH_LAB_TRACE` (rekey/forwarding/session/encrypted at trace);
+  targeted at tree-partition race investigation during multi-peer
+  startup. Mutually exclusive with `FIPS_MESH_LAB_TRACE` in practice —
+  both env vars layer their overlay, but the second one's per-service
+  environment replaces the first's. Only applies to the rekey-family
+  suites.
+
 - **`FIPS_MESH_LAB_NO_RESOURCE_LIMITS`** — when set to any non-empty
   value, omits the `compose-resource-limits.yml` overlay for rekey-family
   runs. Default behaviour keeps the overlay engaged so rekey-family lab

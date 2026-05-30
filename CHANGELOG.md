@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed `RejectReason` classification for receive-path silent-rejection
+  sites across the node. Each rejection-and-return path now passes a
+  typed reason to `NodeStats::record_reject`, which routes it to a
+  per-subsystem counter, so operators can see what is being rejected
+  through stats counters rather than by scraping debug logs. New
+  `HandshakeStats`, `SessionStats`, and `MmpStats` sub-stats join the
+  existing `TreeStats`, `BloomStats`, `DiscoveryStats`, and
+  `ForwardingStats`, and `TreeStats::ancestry_invalid` is now
+  incremented from the `TreeAnnounce::validate_semantics` rejection
+  site that was previously silent. Several handshake, MMP, tree, and
+  discovery rejection paths that had no counter at all are now counted,
+  including the `send_lookup_response` no-route drop
+  (`DiscoveryStats::resp_no_route`). Existing
+  direct counters at the bloom / discovery / forwarding sites are
+  retained alongside the new dispatch while the rollout is in progress;
+  a later change collapses the duplicate increment.
 - `Node::update_peers` for runtime peer-list refresh, returning an
   `UpdatePeersOutcome` summarizing added, removed, and retained peers.
   Re-derives active peer connections from a new peer configuration

@@ -5,6 +5,7 @@
 //! bloom filter contains the target. TTL and request_id dedup provide
 //! safety bounds.
 
+use crate::node::reject::{DiscoveryReject, RejectReason};
 use crate::node::{Node, RecentRequest};
 use crate::protocol::{LookupRequest, LookupResponse};
 use crate::transport::{TransportAddr, TransportId};
@@ -30,6 +31,8 @@ impl Node {
             Ok(req) => req,
             Err(e) => {
                 self.stats_mut().discovery.req_decode_error += 1;
+                self.stats_mut()
+                    .record_reject(RejectReason::Discovery(DiscoveryReject::ReqDecodeError));
                 debug!(from = %self.peer_display_name(from), error = %e, "Malformed LookupRequest");
                 return;
             }
@@ -43,6 +46,8 @@ impl Node {
         // but request_id dedup catches edge cases during tree restructuring.
         if self.recent_requests.contains_key(&request.request_id) {
             self.stats_mut().discovery.req_duplicate += 1;
+            self.stats_mut()
+                .record_reject(RejectReason::Discovery(DiscoveryReject::ReqDuplicate));
             debug!(
                 request_id = request.request_id,
                 from = %self.peer_display_name(from),
@@ -52,6 +57,8 @@ impl Node {
         }
 
         if self.recent_requests.len() >= MAX_RECENT_DISCOVERY_REQUESTS {
+            self.stats_mut()
+                .record_reject(RejectReason::Discovery(DiscoveryReject::ReqDedupCacheFull));
             debug!(
                 request_id = request.request_id,
                 from = %self.peer_display_name(from),
@@ -98,6 +105,8 @@ impl Node {
             self.forward_lookup_request(request).await;
         } else {
             self.stats_mut().discovery.req_ttl_exhausted += 1;
+            self.stats_mut()
+                .record_reject(RejectReason::Discovery(DiscoveryReject::ReqTtlExhausted));
             debug!(
                 request_id = request.request_id,
                 target = %self.peer_display_name(&request.target),
@@ -124,6 +133,8 @@ impl Node {
             Ok(resp) => resp,
             Err(e) => {
                 self.stats_mut().discovery.resp_decode_error += 1;
+                self.stats_mut()
+                    .record_reject(RejectReason::Discovery(DiscoveryReject::RespDecodeError));
                 debug!(from = %self.peer_display_name(from), error = %e, "Malformed LookupResponse");
                 return;
             }
@@ -180,6 +191,8 @@ impl Node {
                 Some((_addr, pubkey)) => pubkey,
                 None => {
                     self.stats_mut().discovery.resp_identity_miss += 1;
+                    self.stats_mut()
+                        .record_reject(RejectReason::Discovery(DiscoveryReject::RespIdentityMiss));
                     warn!(
                         request_id = response.request_id,
                         target = %self.peer_display_name(&target),
@@ -196,6 +209,8 @@ impl Node {
                 LookupResponse::proof_bytes(response.request_id, &target, &response.target_coords);
             if !peer_id.verify(&proof_data, &response.proof) {
                 self.stats_mut().discovery.resp_proof_failed += 1;
+                self.stats_mut()
+                    .record_reject(RejectReason::Discovery(DiscoveryReject::RespProofFailed));
                 warn!(
                     request_id = response.request_id,
                     target = %self.peer_display_name(&target),
@@ -300,6 +315,8 @@ impl Node {
                         origin = %self.peer_display_name(&request.origin),
                         "Cannot route LookupResponse: no reverse path or tree route to origin"
                     );
+                    self.stats_mut()
+                        .record_reject(RejectReason::Discovery(DiscoveryReject::RespNoRoute));
                     return;
                 }
             }

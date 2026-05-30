@@ -11,6 +11,7 @@
       "req_backoff_suppressed": 0,
       "req_bloom_miss": 0,
       "req_decode_error": 0,
+      "req_dedup_cache_full": 0,
       "req_deduplicated": 0,
       "req_duplicate": 0,
       "req_fallback_forwarded": 0,
@@ -25,6 +26,7 @@
       "resp_decode_error": 0,
       "resp_forwarded": 0,
       "resp_identity_miss": 0,
+      "resp_no_route": 0,
       "resp_proof_failed": 0,
       "resp_received": 0,
       "resp_timed_out": 0

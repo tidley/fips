@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Node::update_peers` for runtime peer-list refresh, returning an
+  `UpdatePeersOutcome` summarizing added, removed, and retained peers.
+  Re-derives active peer connections from a new peer configuration
+  without dropping links to peers that remain in the set.
+  `PeerAddress` gains a `seen_at_ms` recency field (with
+  `with_seen_at_ms`) used to prefer more recently observed addresses.
 - `pool_inbound` and `pool_outbound` counters on the TCP and Tor
   transport stats (`TcpStats`, `TorStats`). Per-direction accounting
   is updated at every pool-insert and receive-loop-exit site, plus on
@@ -25,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `complete_rekey_msg2` now returns the remote peer's startup epoch
+  alongside the new Noise session, so the rekey path can detect a peer
+  restart and clear stale session state.
+- Active-peer path selection now sorts address candidates by recency
+  (`seen_at_ms`), preferring the most recently observed address when
+  racing concurrent path probes.
+- Per-tick work budgets bound the connection churn done in a single
+  node tick: `MAX_DISCOVERY_CONNECTS_PER_TICK`,
+  `MAX_RETRY_CONNECTIONS_PER_TICK`, and
+  `MAX_PARALLEL_PATH_CANDIDATES_PER_PEER`. Work beyond a tick's budget
+  is deferred to the next tick rather than discarded.
 - Nostr discovery startup is now non-blocking. `Node::start` no
   longer waits for relay connect, subscribe, or initial advert
   publish before returning. A slow or unreachable relay no longer
@@ -138,6 +155,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A stale FSP (session-layer) session is now cleared when a peer
+  restart is detected during FMP rekey or cross-connection promotion.
+  Previously the old session could linger after the peer came back
+  with a new startup epoch, leaving the session-layer map out of sync
+  with the freshly promoted peer.
 - TCP and Tor `max_inbound_connections` admission cap is now compared
   against the per-direction inbound count (`pool_inbound`) rather than
   the combined pool size. Outbound connect-on-send connections share

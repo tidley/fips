@@ -57,6 +57,8 @@ impl Node {
         }
 
         if self.recent_requests.len() >= MAX_RECENT_DISCOVERY_REQUESTS {
+            self.stats_mut()
+                .record_reject(RejectReason::Discovery(DiscoveryReject::ReqDedupCacheFull));
             debug!(
                 request_id = request.request_id,
                 from = %self.peer_display_name(from),

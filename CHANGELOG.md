@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without dropping links to peers that remain in the set.
   `PeerAddress` gains a `seen_at_ms` recency field (with
   `with_seen_at_ms`) used to prefer more recently observed addresses.
+- Opt-in mDNS / DNS-SD LAN discovery for sub-second pairing of peers on
+  the same local link, without a relay or NAT-traversal roundtrip.
+  Disabled by default; operators enable it with
+  `node.discovery.lan.enabled: true`. Configurable service type and an
+  optional `node.discovery.lan.scope` that isolates discovery to peers
+  sharing the same private-network scope. The advertised UDP port is
+  chosen from a non-bootstrap operational UDP transport using a stable
+  selector, so it is deterministic across restarts.
 - `pool_inbound` and `pool_outbound` counters on the TCP and Tor
   transport stats (`TcpStats`, `TorStats`). Per-direction accounting
   is updated at every pool-insert and receive-loop-exit site, plus on

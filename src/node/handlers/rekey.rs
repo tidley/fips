@@ -196,7 +196,7 @@ impl Node {
         // Create IK initiator handshake directly (no PeerConnection)
         let our_keypair = self.identity().keypair();
         let mut hs = HandshakeState::new_initiator(our_keypair, peer_pubkey);
-        hs.set_local_epoch(self.startup_epoch);
+        hs.set_local_epoch(self.startup_epoch());
 
         let noise_msg1 = match hs.write_message_1() {
             Ok(msg) => msg,
@@ -529,7 +529,7 @@ impl Node {
         // Create Noise XK initiator handshake
         let our_keypair = self.identity().keypair();
         let mut handshake = HandshakeState::new_xk_initiator(our_keypair, dest_pubkey);
-        handshake.set_local_epoch(self.startup_epoch);
+        handshake.set_local_epoch(self.startup_epoch());
 
         let msg1 = match handshake.write_xk_message_1() {
             Ok(m) => m,

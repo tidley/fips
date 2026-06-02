@@ -181,7 +181,7 @@ impl Node {
         let noise_msg1 = &packet.data[header.noise_msg1_offset..];
         let msg2_response = match conn.receive_handshake_init(
             our_keypair,
-            self.startup_epoch,
+            self.startup_epoch(),
             noise_msg1,
             packet.timestamp_ms,
         ) {
@@ -227,7 +227,7 @@ impl Node {
         // handshake whose data frames subsequently fail decryption here).
         // The late cap check inside promote_connection() is intentionally
         // left in place as defense-in-depth.
-        if self.max_peers > 0 && self.peers.len() >= self.max_peers {
+        if self.max_peers() > 0 && self.peers.len() >= self.max_peers() {
             let is_known_active = self.peers.contains_key(&peer_node_addr);
             let is_pending_outbound = self.connections.iter().any(|(_, conn)| {
                 conn.expected_identity()
@@ -237,7 +237,7 @@ impl Node {
             if !is_known_active && !is_pending_outbound {
                 debug!(
                     peer = %self.peer_display_name(&peer_node_addr),
-                    max = self.max_peers,
+                    max = self.max_peers(),
                     "Silent-dropping Msg1 at max_peers cap (early gate; no Msg2 sent)"
                 );
                 // `link_id` was allocated above but `conn` is still a local
@@ -1244,10 +1244,10 @@ impl Node {
             }
 
             // Normal promotion
-            if self.max_peers > 0 && self.peers.len() >= self.max_peers {
+            if self.max_peers() > 0 && self.peers.len() >= self.max_peers() {
                 let _ = self.index_allocator.free(our_index);
                 return Err(NodeError::MaxPeersExceeded {
-                    max: self.max_peers,
+                    max: self.max_peers(),
                 });
             }
 

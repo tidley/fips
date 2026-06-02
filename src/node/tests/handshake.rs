@@ -49,7 +49,7 @@ async fn test_two_node_handshake_udp() {
     // === Phase 1: Node A initiates handshake to Node B ===
 
     // Create peer identity for B (must use full key for ECDH parity)
-    let peer_b_identity = PeerIdentity::from_pubkey_full(node_b.identity.pubkey_full());
+    let peer_b_identity = PeerIdentity::from_pubkey_full(node_b.identity().pubkey_full());
     let peer_b_node_addr = *peer_b_identity.node_addr();
 
     let link_id_a = node_a.allocate_link_id();
@@ -59,9 +59,9 @@ async fn test_two_node_handshake_udp() {
     let our_index_a = node_a.index_allocator.allocate().unwrap();
 
     // Start handshake (generates Noise IK msg1)
-    let our_keypair_a = node_a.identity.keypair();
+    let our_keypair_a = node_a.identity().keypair();
     let noise_msg1 = conn_a
-        .start_handshake(our_keypair_a, node_a.startup_epoch, 1000)
+        .start_handshake(our_keypair_a, node_a.startup_epoch(), 1000)
         .unwrap();
     conn_a.set_our_index(our_index_a);
     conn_a.set_transport_id(transport_id_a);
@@ -101,7 +101,7 @@ async fn test_two_node_handshake_udp() {
 
     // Verify B promoted the inbound connection
     let peer_a_node_addr =
-        *PeerIdentity::from_pubkey_full(node_a.identity.pubkey_full()).node_addr();
+        *PeerIdentity::from_pubkey_full(node_a.identity().pubkey_full()).node_addr();
     assert_eq!(
         node_b.peer_count(),
         1,
@@ -290,16 +290,16 @@ async fn test_run_rx_loop_handshake() {
 
     // === Phase 1: Node A initiates handshake to Node B ===
 
-    let peer_b_identity = PeerIdentity::from_pubkey_full(node_b.identity.pubkey_full());
+    let peer_b_identity = PeerIdentity::from_pubkey_full(node_b.identity().pubkey_full());
     let peer_b_node_addr = *peer_b_identity.node_addr();
 
     let link_id_a = node_a.allocate_link_id();
     let mut conn_a = PeerConnection::outbound(link_id_a, peer_b_identity, 1000);
 
     let our_index_a = node_a.index_allocator.allocate().unwrap();
-    let our_keypair_a = node_a.identity.keypair();
+    let our_keypair_a = node_a.identity().keypair();
     let noise_msg1 = conn_a
-        .start_handshake(our_keypair_a, node_a.startup_epoch, 1000)
+        .start_handshake(our_keypair_a, node_a.startup_epoch(), 1000)
         .unwrap();
     conn_a.set_our_index(our_index_a);
     conn_a.set_transport_id(transport_id_a);
@@ -347,7 +347,7 @@ async fn test_run_rx_loop_handshake() {
 
     // Verify Node B promoted the inbound connection via rx loop dispatch
     let peer_a_node_addr =
-        *PeerIdentity::from_pubkey_full(node_a.identity.pubkey_full()).node_addr();
+        *PeerIdentity::from_pubkey_full(node_a.identity().pubkey_full()).node_addr();
 
     assert_eq!(
         node_b.peer_count(),
@@ -474,9 +474,9 @@ async fn test_cross_connection_both_initiate() {
         .insert(transport_id_b, TransportHandle::Udp(transport_b));
 
     // Peer identities (must use full key for ECDH parity)
-    let peer_b_identity = PeerIdentity::from_pubkey_full(node_b.identity.pubkey_full());
+    let peer_b_identity = PeerIdentity::from_pubkey_full(node_b.identity().pubkey_full());
     let peer_b_node_addr = *peer_b_identity.node_addr();
-    let peer_a_identity = PeerIdentity::from_pubkey_full(node_a.identity.pubkey_full());
+    let peer_a_identity = PeerIdentity::from_pubkey_full(node_a.identity().pubkey_full());
     let peer_a_node_addr = *peer_a_identity.node_addr();
 
     // === Phase 1: Both nodes initiate handshakes (simulate auto_connect) ===
@@ -485,9 +485,9 @@ async fn test_cross_connection_both_initiate() {
     let link_id_a_out = node_a.allocate_link_id();
     let mut conn_a = PeerConnection::outbound(link_id_a_out, peer_b_identity, 1000);
     let our_index_a = node_a.index_allocator.allocate().unwrap();
-    let our_keypair_a = node_a.identity.keypair();
+    let our_keypair_a = node_a.identity().keypair();
     let noise_msg1_a = conn_a
-        .start_handshake(our_keypair_a, node_a.startup_epoch, 1000)
+        .start_handshake(our_keypair_a, node_a.startup_epoch(), 1000)
         .unwrap();
     conn_a.set_our_index(our_index_a);
     conn_a.set_transport_id(transport_id_a);
@@ -515,9 +515,9 @@ async fn test_cross_connection_both_initiate() {
     let link_id_b_out = node_b.allocate_link_id();
     let mut conn_b = PeerConnection::outbound(link_id_b_out, peer_a_identity, 1000);
     let our_index_b = node_b.index_allocator.allocate().unwrap();
-    let our_keypair_b = node_b.identity.keypair();
+    let our_keypair_b = node_b.identity().keypair();
     let noise_msg1_b = conn_b
-        .start_handshake(our_keypair_b, node_b.startup_epoch, 1000)
+        .start_handshake(our_keypair_b, node_b.startup_epoch(), 1000)
         .unwrap();
     conn_b.set_our_index(our_index_b);
     conn_b.set_transport_id(transport_id_b);
@@ -666,9 +666,9 @@ async fn test_stale_connection_cleanup() {
 
     // Allocate session index and set transport info
     let our_index = node.index_allocator.allocate().unwrap();
-    let our_keypair = node.identity.keypair();
+    let our_keypair = node.identity().keypair();
     let _noise_msg1 = conn
-        .start_handshake(our_keypair, node.startup_epoch, past_time_ms)
+        .start_handshake(our_keypair, node.startup_epoch(), past_time_ms)
         .unwrap();
     conn.set_our_index(our_index);
     conn.set_transport_id(transport_id);
@@ -744,9 +744,9 @@ async fn test_failed_connection_cleanup() {
     let mut conn = PeerConnection::outbound(link_id, peer_identity, now_ms);
 
     let our_index = node.index_allocator.allocate().unwrap();
-    let our_keypair = node.identity.keypair();
+    let our_keypair = node.identity().keypair();
     let _noise_msg1 = conn
-        .start_handshake(our_keypair, node.startup_epoch, now_ms)
+        .start_handshake(our_keypair, node.startup_epoch(), now_ms)
         .unwrap();
     conn.set_our_index(our_index);
     conn.set_transport_id(transport_id);
@@ -804,9 +804,9 @@ async fn test_msg1_stored_for_resend() {
     let mut conn = PeerConnection::outbound(link_id, peer_identity, now_ms);
 
     let our_index = node.index_allocator.allocate().unwrap();
-    let our_keypair = node.identity.keypair();
+    let our_keypair = node.identity().keypair();
     let noise_msg1 = conn
-        .start_handshake(our_keypair, node.startup_epoch, now_ms)
+        .start_handshake(our_keypair, node.startup_epoch(), now_ms)
         .unwrap();
     conn.set_our_index(our_index);
     conn.set_transport_id(transport_id);
@@ -814,7 +814,7 @@ async fn test_msg1_stored_for_resend() {
 
     // Build wire msg1 and store it (as initiate_peer_connection does)
     let wire_msg1 = build_msg1(our_index, &noise_msg1);
-    let resend_interval = node.config.node.rate_limit.handshake_resend_interval_ms;
+    let resend_interval = node.config().node.rate_limit.handshake_resend_interval_ms;
     conn.set_handshake_msg1(wire_msg1.clone(), now_ms + resend_interval);
 
     // Verify stored msg1 matches what was built
@@ -837,9 +837,9 @@ async fn test_resend_scheduling() {
     let mut conn = PeerConnection::outbound(link_id, peer_identity, now_ms);
 
     let our_index = node.index_allocator.allocate().unwrap();
-    let our_keypair = node.identity.keypair();
+    let our_keypair = node.identity().keypair();
     let noise_msg1 = conn
-        .start_handshake(our_keypair, node.startup_epoch, now_ms)
+        .start_handshake(our_keypair, node.startup_epoch(), now_ms)
         .unwrap();
     conn.set_our_index(our_index);
     conn.set_transport_id(transport_id);

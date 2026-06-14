@@ -115,6 +115,7 @@ table below lists every command currently registered.
 | `show_identity_cache` | — | `entries[]`, `count`, `max_entries`. Each entry: `node_addr`, `npub`, `display_name`, `ipv6_addr`, `last_seen_ms`, `age_ms`. |
 | `show_listening_sockets` | — | `fips0_addr`, `firewall_active` (bool — `inet fips` table loaded), `sockets[]`. Each entry: `proto` (`tcp` / `udp`), `local_addr` (`::` or the node's fd00::/8 address), `port`, `pid` (nullable), `process` (nullable), `wildcard_bind` (bool — `local_addr == ::`), `filter` (`accept` / `drop` / `unknown` / `no_firewall`). Linux-only; returns an empty `sockets[]` on other platforms. |
 | `show_stats_list` | — | `metrics[]` (each with `name`, `unit`, `scope`), `fast_ring_seconds`, `slow_ring_minutes`, `peer_retention_seconds`. |
+| `show_metrics` | — | Flat snapshot of every counter family in the metrics registry: `forwarding`, `discovery`, `tree`, `bloom`, `congestion`, `errors`. Each value is that family's counter snapshot object. Counter-only — gauges/histograms that need the live node are excluded. Served off the main loop. |
 | `show_stats_history` | `metric` (req), `peer` (req for per-peer metrics), `window` (`<N>s` / `<N>m` / `<N>h`, default `10m`), `granularity` (`1s` / `1m`, default `1s`) | A single `Series`: `metric`, `unit`, `granularity_seconds`, `values[]`. |
 | `show_stats_all_history` | `peer` (optional npub), `window`, `granularity` | `granularity_seconds`, `window_seconds`, `peer`, `series[]` (one per metric). |
 | `show_stats_peers` | — | `peers[]`, `count`. Each entry: `npub`, `node_addr`, `display_name`, `is_active`, `first_seen_secs_ago`, `last_contact_secs_ago`. |
@@ -128,7 +129,7 @@ fixtures.
 
 | Command | Required params | Behaviour |
 | ------- | --------------- | --------- |
-| `connect` | `npub` (bech32), `address` (transport endpoint), `transport` (`udp`, `tcp`, `tor`, `ethernet`) | Asks the node to dial the peer over the named transport. Returns the API result on success or an error string on failure. |
+| `connect` | `npub` (bech32), `address` (transport endpoint), `transport` (`udp`, `tcp`, `tor`, `nym`, `ethernet`) | Asks the node to dial the peer over the named transport. The named transport must be configured and running. Returns the API result on success or an error string on failure. |
 | `disconnect` | `npub` (bech32) | Asks the node to drop the link to the named peer. |
 
 Both commands run on the daemon's main task and may block briefly

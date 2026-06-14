@@ -901,9 +901,9 @@ impl Node {
         }
     }
 
-    /// Drain mDNS-discovered peers and initiate Noise XX handshakes.
+    /// Drain mDNS-discovered peers and initiate Noise IK handshakes.
     /// The handshake itself is the authentication — a spoofed mDNS advert
-    /// with someone else's npub fails the XX exchange and is dropped.
+    /// with someone else's npub fails the IK exchange and is dropped.
     pub(super) async fn poll_lan_discovery(&mut self) {
         let Some(runtime) = self.lan_discovery.clone() else {
             return;
